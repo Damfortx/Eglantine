@@ -146,8 +146,23 @@ void TextureCache<P>::RunGarbageCollector() {
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
+    // Costly images (ASTC decoded and re-compressed) cost far more to bring back than cheap ones,
+    // and on an 8 GB card the aggressive pass ran every few frames, evicting them 10 frames after
+    // their last use and decoding them again (title 1: up to ~1,100 per 600 frames). Under the
+    // critical line the cheap ones go first; costly ones only once unused for
+    // EDEN_NX2_TC_COSTLY_AGE frames (default 300), or at any age past critical + 512 MiB.
+    // EDEN_NX2_TC_PROTECT_COSTLY=0 restores the single pass.
+    static const bool protect_costly_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_PROTECT_COSTLY");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const u64 costly_age = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_COSTLY_AGE");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 300ULL;
+    }();
+    bool protect_costly = false;
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly](ImageId image_id) {
+                          &evict_old_costly, &protect_costly](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -157,7 +172,8 @@ void TextureCache<P>::RunGarbageCollector() {
             return false;
         }
         const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-        if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
+        if (((!aggressive_mode || protect_costly) && !evict_old_costly &&
+             True(image.flags & ImageFlagBits::CostlyLoad)) ||
             (!high_priority_mode && must_download)) {
             return false;
         }
@@ -175,7 +191,7 @@ void TextureCache<P>::RunGarbageCollector() {
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        if (aggressive_mode && total_used_memory + AggressiveHysteresis < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
         } else if (high_priority_mode && total_used_memory < expected_memory) {
@@ -248,7 +264,20 @@ void TextureCache<P>::RunGarbageCollector() {
     Collect();
     if (total_used_memory >= critical_memory) {
         Configure(true);
-        Collect();
+        if (protect_costly_enabled) {
+            protect_costly = true;
+            Collect();
+            protect_costly = false;
+            if (total_used_memory >= critical_memory) {
+                Configure(true);
+                if (total_used_memory < critical_memory + 512_MiB) {
+                    ticks_to_destroy = (std::max)(ticks_to_destroy, costly_age);
+                }
+                Collect();
+            }
+        } else {
+            Collect();
+        }
     }
 }
 
