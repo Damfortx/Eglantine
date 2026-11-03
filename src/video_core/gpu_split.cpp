@@ -365,6 +365,7 @@ size_t GpuSplit::Execute(const u64* entry) {
     }
     case Kind::Call: {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
+        Nx2Profile::Scope deferred_scope{Nx2Profile::Zone::Deferred};
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
     }
