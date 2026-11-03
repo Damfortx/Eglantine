@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <string>
+#include <fmt/format.h>
 #include <cstdlib>
 #include <thread>
 
@@ -196,17 +200,54 @@ void GpuSplit::Publish() {
     }
 }
 
-void GpuSplit::Drain() {
+void GpuSplit::Drain(DrainReason reason) {
+    // Front thread only: waits per reason, logged every 10 s with EDEN_NX2_GPU_PROFILE.
+    static std::array<u64, static_cast<size_t>(DrainReason::Count)> waits{}, wait_ns{}, calls{};
+    static u64 window_start{};
+    const auto index = static_cast<size_t>(reason);
+    ++calls[index];
+    if (Nx2Profile::Enabled()) {
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count());
+        if (window_start == 0) {
+            window_start = now;
+        } else if (now - window_start >= 10'000'000'000ULL) {
+            static constexpr std::array<const char*, static_cast<size_t>(DrainReason::Count)>
+                names{"other", "sync", "gpu-written commands", "front state", "dma read",
+                      "verify", "puller"};
+            const double seconds = static_cast<double>(now - window_start) / 1e9;
+            std::string line;
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (calls[i] != 0) {
+                    line += fmt::format(" | {} {:.0f}/s ({:.0f} waited, {:.1f} ms)", names[i],
+                                        static_cast<double>(calls[i]) / seconds,
+                                        static_cast<double>(waits[i]) / seconds,
+                                        static_cast<double>(wait_ns[i]) / 1e6 / seconds);
+                }
+            }
+            LOG_INFO(HW_GPU, "GPU split drains per second:{}", line);
+            waits = {};
+            wait_ns = {};
+            calls = {};
+            window_start = now;
+        }
+    }
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const auto begin = std::chrono::steady_clock::now();
+    ++waits[index];
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            wait_ns[index] += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - begin)
+                                                   .count());
             return;
         }
         if (spins < 16384) {

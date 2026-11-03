@@ -118,7 +118,18 @@ public:
     /// Makes what was sent visible to the back.
     void Publish();
     /// Waits until the back executed everything sent so far.
-    void Drain();
+    /// Why the front waits for the back (counted with EDEN_NX2_GPU_PROFILE).
+    enum class DrainReason : u32 {
+        Other,
+        Sync,                ///< sync_memory_operations fence
+        GpuWrittenCommands,  ///< command list on GPU-written pages
+        FrontState,          ///< first macro on the front
+        DmaRead,             ///< MME DMA read (indirect arguments)
+        Verify,              ///< EDEN_NX2_SPLIT_VERIFY
+        Puller,              ///< semaphores, syncpoints, puller reads
+        Count,
+    };
+    void Drain(DrainReason reason = DrainReason::Other);
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
