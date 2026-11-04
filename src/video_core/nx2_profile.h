@@ -89,7 +89,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 10> counters{}; ///< See Counter
+    std::array<u64, 11> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -141,6 +141,7 @@ enum class Counter : u32 {
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
     InvalidatedBytes,   ///< CPU-written bytes invalidated in the caches at fences
     InvalidatedRegions, ///< Regions those bytes came in, after merging adjacent ones
+    PreflushMarks,      ///< Pages marked Preflushable after a CPU read of GPU-written data
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -204,6 +205,8 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | invalidated {:.0f} KiB in {:.0f} regions",
                         static_cast<double>(data.counters[8]) * 1e9 / 1024.0 / window,
                         static_cast<double>(data.counters[9]) * 1e9 / window);
+    line += fmt::format(" | preflush marks {:.0f} pages",
+                        static_cast<double>(data.counters[10]) * 1e9 / window);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;

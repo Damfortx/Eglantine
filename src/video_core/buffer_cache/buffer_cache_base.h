@@ -645,6 +645,7 @@ private:
     }
 
     Common::RangeSet<DAddr> read_trapped_ranges;
+    u64 preflush_decay_frames{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 

@@ -126,6 +126,28 @@ void BufferCache<P>::TickFrame() {
         LOG_INFO(HW_GPU, "Buffer cache: {} buffers {} MiB; largest {}", count, total >> 20,
                  fmt::join(largest.begin(), largest.begin() + std::min<size_t>(6, largest.size()), ", "));
     }
+    // A page the CPU read once stayed Preflushable for the session, downloaded at every fence
+    // after each GPU write: title 1 reads different pages as it goes, and ~100,000 downloads a
+    // second piled up. Every EDEN_NX2_PREFLUSH_DECAY frames (e.g. 600; 0, the default, never) the marks are
+    // dropped; GPU writes arm read traps again, and pages still read are marked at their next
+    // read (one flush each). Off by default until it has been checked in play: one attract demo
+    // run froze before read_trapped_ranges was cleared with the marks.
+    if constexpr (!IS_OPENGL) {
+        static const u64 decay = [] {
+            const char* value = std::getenv("EDEN_NX2_PREFLUSH_DECAY");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+        }();
+        if (decay != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+            ++preflush_decay_frames >= decay) {
+            preflush_decay_frames = 0;
+            // A trap that fired stays in read_trapped_ranges, which would keep ArmReadTraps from
+            // arming it again: the CPU then read stale data (title 1 froze waiting on it).
+            for (const auto [buffer_id, buffer] : slot_buffers) {
+                memory_tracker.UnmarkRegionAsPreflushable(buffer->CpuAddr(), buffer->SizeBytes());
+                read_trapped_ranges.Subtract(buffer->CpuAddr(), buffer->SizeBytes());
+            }
+        }
+    }
 
     // Calculate hits and shots and move hit bits to the right
     const u32 hits = std::reduce(channel_state->uniform_cache_hits.begin(),
@@ -251,6 +273,8 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     // Mark only data that the GPU wrote. A mark stays for the session and sends later GPU writes
     // in the range to a download at each fence.
     if (!area->preemtive) {
+        Nx2Profile::Add(Nx2Profile::Counter::PreflushMarks,
+                        (device_addr_end_aligned - device_addr_start_aligned) / Core::DEVICE_PAGESIZE);
         memory_tracker.MarkRegionAsPreflushable(device_addr_start_aligned,
                                                 device_addr_end_aligned - device_addr_start_aligned);
     } else {
