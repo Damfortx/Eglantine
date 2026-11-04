@@ -97,6 +97,16 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     if (!wanted || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         return;
     }
+    // EDEN_NX2_SPLIT_STATE=alt: turn the state blocks on and off every 20 s (A/B in one scene).
+    if (active && state_alternate) [[unlikely]] {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - state_toggled >= std::chrono::seconds{20}) {
+            FlushState();
+            state_blocks = !state_blocks;
+            state_toggled = now;
+            LOG_INFO(HW_GPU, "GPU split state blocks: {}", state_blocks ? "on" : "off");
+        }
+    }
     // The front reads command lists straight from guest memory; a read that flushes the caches
     // first (safe DMA, accurate GPU) would touch back-owned state. The settings can change
     // mid-game: hand the engines back to the front (and start again when they allow it).
@@ -123,8 +133,15 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
 #endif
-    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
-             front_macros ? ", macros on the first" : "");
+    // EDEN_NX2_SPLIT_STATE=1: send state writes as blocks of final values (=alt: switch every
+    // 20 s). Off by default: in title 1 it cut the back's entries by ~35% but not its time.
+    const char* state = std::getenv("EDEN_NX2_SPLIT_STATE");
+    state_blocks = front_macros && state != nullptr && (state[0] == '1' || state[0] == 'a');
+    state_alternate = state_blocks && state != nullptr && state[0] == 'a';
+    state_toggled = std::chrono::steady_clock::now();
+    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}",
+             front_macros ? ", macros on the first" : "",
+             state_blocks ? ", state writes in blocks" : "");
 }
 
 void GpuSplit::Stop() {
@@ -149,6 +166,9 @@ void GpuSplit::Stop() {
     front_engine = nullptr;
     back_engine = nullptr;
     front_macros = false;
+    state_blocks = false;
+    state_engine = nullptr;
+    state_count = 0;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
@@ -188,6 +208,7 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    FlushState();
     if (published_local == write_position) {
         return;
     }
@@ -206,6 +227,7 @@ void GpuSplit::Drain(DrainReason reason) {
     static u64 window_start{};
     const auto index = static_cast<size_t>(reason);
     ++calls[index];
+    FlushState();
     if (Nx2Profile::Enabled()) {
         const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                              std::chrono::steady_clock::now().time_since_epoch())
@@ -259,6 +281,7 @@ void GpuSplit::Drain(DrainReason reason) {
 }
 
 bool GpuSplit::WaitForWriters() {
+    FlushState();
     const u64 target = std::min(last_writer_position, write_position);
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
@@ -288,8 +311,24 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
     Commit(2);
 }
 
+void GpuSplit::FlushStateSlow() {
+    const size_t count = state_count;
+    // Cleared first: Commit may publish, which flushes the state again.
+    state_count = 0;
+    if (++state_current == 0) {
+        state_generation.fill(0);
+        state_current = 1;
+    }
+    SelectEngine(state_engine);
+    u64* const entry = Reserve(1 + count);
+    entry[0] = static_cast<u64>(Kind::State) | (state_track ? IsLast : 0) | (u64{count} << 32);
+    std::memcpy(entry + 1, state_pairs.data(), count * sizeof(u64));
+    Commit(1 + count);
+}
+
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                            u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+    FlushState();
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -362,6 +401,12 @@ size_t GpuSplit::Execute(const u64* entry) {
         engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
                                 amount, static_cast<u32>(entry[1]));
         return data + (amount + 1) / 2;
+    }
+    case Kind::State: {
+        const u32 count = static_cast<u32>(head >> 32);
+        Nx2Profile::Scope state_scope{Nx2Profile::Zone::StateApply};
+        back_engine->ApplyState(*system, entry + 1, count, (head & IsLast) != 0);
+        return 1 + count;
     }
     case Kind::Call: {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);

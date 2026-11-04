@@ -338,6 +338,32 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     method_sink.clear();
 }
 
+void Maxwell3D::ApplyState(Core::System& system, const u64* pairs, u32 count, bool track_shadow) {
+    // What CallMethod does for each write of the block (none is executable or an instance loop
+    // method), with the front's shadow RAM already applied; only each register's last value.
+    ConsumeSink(system);
+    const bool skip_same = SkipSameValueWrites();
+    bool drew = false;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(pairs[i]);
+        const u32 value = static_cast<u32>(pairs[i] >> 32);
+        if (track_shadow) {
+            shadow_state.reg_array[method] = value;
+        }
+        if (skip_same && regs.reg_array[method] == value) {
+            continue;
+        }
+        if (!drew && draw_manager.HasDeferredDraw()) [[unlikely]] {
+            draw_manager.DrawDeferred(*this, true);
+            drew = true;
+        }
+        regs.reg_array[method] = value;
+        for (auto const& table : dirty.tables) {
+            dirty.flags[table[method]] = true;
+        }
+    }
+}
+
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     // The instances after the first are drawn together once their loop ends, and they must see
     // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
@@ -952,6 +978,14 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             return;
         }
         fs.regs[method] = value;
+        // Instance loop methods keep their own entries: the back issues a deferred instanced
+        // draw at the first other method, so their order against it matters.
+        if (fs.skip_same && split.StateBlocks() && !DrawManager::IsInstanceLoopMethod(method)) {
+            split.StateWrite(this, method, value,
+                             fs.control == Regs::ShadowRamControl::Track ||
+                                 fs.control == Regs::ShadowRamControl::TrackWithFilter);
+            return;
+        }
     } else {
         fs.regs[method] = value;
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);

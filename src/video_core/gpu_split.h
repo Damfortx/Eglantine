@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -46,6 +48,11 @@ public:
         return front_macros;
     }
 
+    /// Whether state writes are sent as blocks of final values (EDEN_NX2_SPLIT_STATE, front only).
+    [[nodiscard]] bool StateBlocks() const {
+        return state_blocks;
+    }
+
     /// Whether the calling thread is the back.
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
@@ -75,6 +82,7 @@ public:
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
                 const GPUVAddr* segment) {
+        FlushState();
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -90,6 +98,7 @@ public:
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        FlushState();
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
@@ -102,6 +111,7 @@ public:
     void Defer(const Func& func) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        FlushState();
         u64* const entry = Reserve(2 + payload);
         entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
@@ -109,6 +119,34 @@ public:
         Commit(2 + payload);
     }
     void DeferFunction(std::function<void()>&& func);
+
+    /// A write to a register that is not executable (state only), with the shadow RAM already
+    /// applied by the front: `value` is what the register will hold, and `track_shadow` whether
+    /// the shadow copy takes it too. Writes are gathered until the next entry of another kind and
+    /// sent as one block holding each register's last value, so the back applies the state
+    /// instead of running every write through the engine (~3 million a second in title 1).
+    void StateWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value,
+                    bool track_shadow) {
+        if (engine != state_engine || track_shadow != state_track) [[unlikely]] {
+            FlushState();
+            state_engine = engine;
+            state_track = track_shadow;
+        }
+        const u64 pair = u64{method} | (u64{value} << 32);
+        if (state_generation[method] == state_current) {
+            state_pairs[state_slot[method]] = pair;
+        } else {
+            state_generation[method] = state_current;
+            state_slot[method] = static_cast<u16>(state_count);
+            state_pairs[state_count++] = pair;
+        }
+    }
+    /// Sends the gathered state writes (before any other entry, publish or wait).
+    void FlushState() {
+        if (state_count != 0) {
+            FlushStateSlow();
+        }
+    }
 
     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
     /// using back-owned state (the Vulkan scheduler) while the back runs entries.
@@ -146,6 +184,7 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        State,  ///< Bits 32-63 count; flag IsLast: the shadow RAM tracks; then (method | value << 32)
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
@@ -184,6 +223,7 @@ private:
         }
     }
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
+    void FlushStateSlow();
 
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
@@ -201,6 +241,19 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+
+    // Front side: the state block being gathered (StateWrite).
+    static constexpr size_t MaxStateRegisters = 0x1000;
+    bool state_blocks{};
+    bool state_alternate{};
+    std::chrono::steady_clock::time_point state_toggled{};
+    bool state_track{};
+    Tegra::Engines::EngineInterface* state_engine{};
+    size_t state_count{};
+    u32 state_current{1};
+    std::array<u64, MaxStateRegisters> state_pairs{};
+    std::array<u16, MaxStateRegisters> state_slot{};
+    std::array<u32, MaxStateRegisters> state_generation{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

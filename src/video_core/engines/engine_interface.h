@@ -37,6 +37,16 @@ public:
     /// Write multiple values to the register identified by method.
     virtual void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) = 0;
 
+    /// A block of state writes from the split GPU thread's front (GpuSplit::StateWrite): each
+    /// `method | value << 32`, the value as the register will hold it.
+    virtual void ApplyState(Core::System& system, const u64* pairs, u32 count, bool track_shadow) {
+        (void)track_shadow;
+        ConsumeSink(system);
+        for (u32 i = 0; i < count; ++i) {
+            CallMethod(system, static_cast<u32>(pairs[i]), static_cast<u32>(pairs[i] >> 32), true);
+        }
+    }
+
     void ConsumeSink(Core::System& system) {
         if (!method_sink.empty()) {
             ConsumeSinkImpl(system);
