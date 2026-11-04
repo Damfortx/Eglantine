@@ -1275,6 +1275,35 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     pipeline_cache.InvalidateRegion(addr, size);
 }
 
+void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, std::size_t>> regions) {
+    // What OnCacheInvalidation does for each region, with each cache's lock taken once.
+    namespace Profile = VideoCommon::Nx2Profile;
+    if (Profile::Enabled()) [[unlikely]] {
+        u64 bytes = 0;
+        for (const auto& region : regions) {
+            bytes += region.second;
+        }
+        Profile::Add(Profile::Counter::InvalidatedBytes, bytes);
+        Profile::Add(Profile::Counter::InvalidatedRegions, regions.size());
+    }
+    {
+        Profile::Scope scope{Profile::Zone::InvalidateTexture};
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : regions) {
+            texture_cache.WriteMemory(addr, size);
+        }
+    }
+    {
+        Profile::Scope scope{Profile::Zone::InvalidateBuffer};
+        std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& [addr, size] : regions) {
+            buffer_cache.WriteMemory(addr, size);
+        }
+    }
+    Profile::Scope scope{Profile::Zone::InvalidatePipeline};
+    pipeline_cache.InvalidateRegions(regions);
+}
+
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) return true;
     {

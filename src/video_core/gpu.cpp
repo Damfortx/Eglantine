@@ -7,6 +7,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <vector>
 #include <condition_variable>
 #include <list>
 #include <memory>
@@ -21,6 +23,7 @@
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
+#include "video_core/nx2.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -113,10 +116,113 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
-            renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
+        // The CPU's writes since the last fence come in 64-byte runs within 2 KiB pages, and each
+        // run locked and searched the texture and buffer caches on its own: ~63 us a fence in
+        // title 1, after ~2,300 fences a second. Adjacent runs are merged and each cache is
+        // locked once. EDEN_NX2_BATCH_INVALIDATE=0 restores one call a run (=alt: switch every
+        // 20 s, for A/B in one scene).
+        static const char mode = [] {
+            const char* value = std::getenv("EDEN_NX2_BATCH_INVALIDATE");
+            return value != nullptr ? value[0] : '1';
+        }();
+        bool batch = mode != '0';
+        static const bool keep_alternate = [] {
+            const char* value = std::getenv("EDEN_NX2_KEEP_PAGE_GPU_DATA");
+            return value != nullptr && value[0] == 'a';
+        }();
+        static const bool preflush_alternate = [] {
+            const char* value = std::getenv("EDEN_NX2_PREFLUSH_DOWNLOADS");
+            return value != nullptr && value[0] == 'a';
+        }();
+        if (preflush_alternate) [[unlikely]] {
+            static std::atomic<s64> preflush_toggled{};
+            const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+            s64 last = preflush_toggled.load(std::memory_order_relaxed);
+            if (last == 0) {
+                preflush_toggled.compare_exchange_strong(last, now);
+            } else if (now - last >= 20 && preflush_toggled.compare_exchange_strong(last, now)) {
+                const bool on = !Tegra::g_nx2_preflush_downloads.load(std::memory_order_relaxed);
+                Tegra::g_nx2_preflush_downloads.store(on, std::memory_order_relaxed);
+                LOG_INFO(HW_GPU, "Preflushable downloads at fences: {}", on ? "on" : "off");
+            }
+        }
+        static const bool pages_alternate = [] {
+            const char* value = std::getenv("EDEN_NX2_PREFLUSH_PAGES");
+            if (value != nullptr && value[0] == '0') {
+                Tegra::g_nx2_preflush_pages_only = false;
+            }
+            return value != nullptr && value[0] == 'a';
+        }();
+        if (pages_alternate) [[unlikely]] {
+            static std::atomic<s64> pages_toggled{};
+            const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+            s64 last = pages_toggled.load(std::memory_order_relaxed);
+            if (last == 0) {
+                pages_toggled.compare_exchange_strong(last, now);
+            } else if (now - last >= 20 && pages_toggled.compare_exchange_strong(last, now)) {
+                const bool on = !Tegra::g_nx2_preflush_pages_only.load(std::memory_order_relaxed);
+                Tegra::g_nx2_preflush_pages_only.store(on, std::memory_order_relaxed);
+                LOG_INFO(HW_GPU, "Preflushable downloads only for read pages: {}", on ? "on" : "off");
+            }
+        }
+        if (keep_alternate) [[unlikely]] {
+            static std::atomic<s64> keep_toggled{};
+            const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+            s64 last = keep_toggled.load(std::memory_order_relaxed);
+            if (last == 0) {
+                keep_toggled.compare_exchange_strong(last, now);
+            } else if (now - last >= 20 && keep_toggled.compare_exchange_strong(last, now)) {
+                const bool on = !Tegra::g_nx2_keep_page_gpu_data.load(std::memory_order_relaxed);
+                Tegra::g_nx2_keep_page_gpu_data.store(on, std::memory_order_relaxed);
+                LOG_INFO(HW_GPU, "Page GPU data downloads on CPU writes: {}", on ? "on" : "off");
+            }
+        }
+        if (mode == 'a') [[unlikely]] {
+            static std::atomic<bool> alternate_on{true};
+            static std::atomic<s64> toggled{};
+            const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+            s64 last = toggled.load(std::memory_order_relaxed);
+            if (last == 0) {
+                toggled.compare_exchange_strong(last, now);
+            } else if (now - last >= 20 && toggled.compare_exchange_strong(last, now)) {
+                const bool on = !alternate_on.load(std::memory_order_relaxed);
+                alternate_on.store(on, std::memory_order_relaxed);
+                LOG_INFO(HW_GPU, "Batched GPU cache invalidation: {}", on ? "on" : "off");
+            }
+            batch = alternate_on.load(std::memory_order_relaxed);
+        }
+        auto* const rasterizer = renderer->ReadRasterizer();
+        if (!batch) {
+            std::function<void(PAddr, size_t)> callback_writes([rasterizer](PAddr address, size_t size) {
+                rasterizer->OnCacheInvalidation(address, size);
+            });
+            system.GatherGPUDirtyMemory(callback_writes);
+            return;
+        }
+        thread_local std::vector<std::pair<DAddr, std::size_t>> regions;
+        regions.clear();
+        std::function<void(PAddr, size_t)> callback_writes([](PAddr address, size_t size) {
+            if (address == 0 || size == 0) {
+                return;
+            }
+            if (!regions.empty() && regions.back().first + regions.back().second == address) {
+                regions.back().second += size;
+            } else {
+                regions.emplace_back(address, size);
+            }
         });
         system.GatherGPUDirtyMemory(callback_writes);
+        if (!regions.empty()) {
+            rasterizer->OnCacheInvalidations(regions);
+        }
     }
 
     /// Signal the ending of command list.

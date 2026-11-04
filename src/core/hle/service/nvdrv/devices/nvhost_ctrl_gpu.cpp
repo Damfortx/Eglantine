@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include "common/game_presets.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "core/core.h"
@@ -346,6 +347,13 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
         nx2_caller = true;
         g_nx2_driver = true;
         Tegra::g_nx2_ampere = true;
+        {
+            const char* keep = std::getenv("EDEN_NX2_KEEP_PAGE_GPU_DATA");
+            Tegra::g_nx2_keep_page_gpu_data =
+                keep != nullptr ? keep[0] != '0'
+                                : system.GetApplicationProcessProgramID() !=
+                                      Settings::MarioKartWorldProgramId;
+        }
         ApplyNx2Characteristics(params.gc);
         params.gpu_characteristics_buf_size = Nx2CharacteristicsSize;
         LOG_WARNING(Service_NVDRV, "Switch 2 caller, reporting Ampere chip 0x17E");

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <optional>
 #include <algorithm>
 #include <condition_variable>
 #include <cstdlib>
@@ -85,8 +86,10 @@ public:
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
+        std::optional<Nx2Profile::Scope> phase{std::in_place, Nx2Profile::Zone::FenceCommit};
         auto [should_flush, committed_flushes] = CommitCacheFlushes();
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
+            phase.reset();
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
             rasterizer.InvalidateGPUCache();
@@ -95,6 +98,7 @@ public:
         skipped_fences = 0;
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
+        phase.emplace(Nx2Profile::Zone::FenceCreate);
         TFence new_fence = CreateFence(!should_flush);
         if constexpr (can_async_check) {
             guard.lock();
@@ -114,12 +118,14 @@ public:
         }
         fences.push(std::move(new_fence));
         if (should_flush) {
+            phase.emplace(Nx2Profile::Zone::FenceSubmit);
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
             guard.unlock();
             cv.notify_all();
         }
+        phase.emplace(Nx2Profile::Zone::FenceInvalidate);
         rasterizer.InvalidateGPUCache();
     }
 

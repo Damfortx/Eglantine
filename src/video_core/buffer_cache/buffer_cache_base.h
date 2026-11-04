@@ -32,6 +32,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "video_core/nx2.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -586,7 +587,45 @@ private:
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
     /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
     bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
-        return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
+        return AsyncBufferDownloads() ||
+               (Tegra::g_nx2_preflush_downloads.load(std::memory_order_relaxed) &&
+                memory_tracker.IsRegionPreflushable(device_addr, size));
+    }
+
+    /// A GPU write to the next fence's downloads, or read traps for it. Title 1's compute
+    /// dispatches rewrite buffers of several MiB of which the CPU reads a few pages (collision
+    /// data): with the whole write downloaded once any page was Preflushable, 9-17 GB/s came back
+    /// and the GPU thread drew a third as many draws. Only the Preflushable pages are downloaded;
+    /// the rest of the write keeps its read traps.
+    void QueueFenceDownload(DAddr device_addr, u64 size) {
+        if (AsyncBufferDownloads()) {
+            uncommitted_gpu_modified_ranges.Add(device_addr, size);
+            return;
+        }
+        if (!Tegra::g_nx2_preflush_downloads.load(std::memory_order_relaxed)) {
+            ArmReadTraps(device_addr, size);
+            return;
+        }
+        if (!Tegra::g_nx2_preflush_pages_only.load(std::memory_order_relaxed)) {
+            if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+                uncommitted_gpu_modified_ranges.Add(device_addr, size);
+            } else {
+                ArmReadTraps(device_addr, size);
+            }
+            return;
+        }
+        bool whole = false;
+        memory_tracker.ForEachPreflushableRange(device_addr, size, [&](u64 begin, u64 length) {
+            const DAddr lower = (std::max<DAddr>)(begin, device_addr);
+            const DAddr upper = (std::min<DAddr>)(begin + length, device_addr + size);
+            if (lower < upper) {
+                uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
+                whole |= lower == device_addr && upper == device_addr + size;
+            }
+        });
+        if (!whole) {
+            ArmReadTraps(device_addr, size);
+        }
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
