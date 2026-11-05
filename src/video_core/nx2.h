@@ -19,10 +19,13 @@ namespace Tegra {
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
-/// A CPU write first downloads GPU-written bytes elsewhere on its pages (BufferCache::WriteMemory).
-/// Off for Mario Kart World, which never needs it and paid a GPU wait on most fences for it
-/// (EDEN_NX2_KEEP_PAGE_GPU_DATA=1/0 forces it, =alt switches it every 20 s).
-inline std::atomic<bool> g_nx2_keep_page_gpu_data{true};
+/// How a CPU write keeps GPU-written bytes elsewhere on its pages (BufferCache::WriteMemory):
+/// 1 downloads them first (a GPU wait), 2 uploads only the written bytes into the buffer and
+/// leaves the page's other bytes to the GPU, 0 does neither (the next upload of the page sends the
+/// stale guest copy over them: Mario Kart World's shadows came out too dark). Mario Kart World
+/// uses 2, the rest 1 (EDEN_NX2_KEEP_PAGE_GPU_DATA=0/1/2 forces it, =alt switches 1 and 0).
+enum class Nx2KeepPageGpuData : u32 { None, Download, Inline };
+inline std::atomic<Nx2KeepPageGpuData> g_nx2_keep_page_gpu_data{Nx2KeepPageGpuData::Download};
 /// Measurement only (EDEN_NX2_PREFLUSH_DOWNLOADS=alt): when false, GPU writes to ranges the CPU
 /// has read are not copied back at fences (the CPU may then read stale data).
 inline std::atomic<bool> g_nx2_preflush_downloads{true};

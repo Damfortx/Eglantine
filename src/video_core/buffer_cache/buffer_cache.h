@@ -213,8 +213,16 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // above, so they aren't overwritten).
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && Tegra::g_nx2_keep_page_gpu_data.load(std::memory_order_relaxed) &&
+    const auto keep = Tegra::g_nx2_keep_page_gpu_data.load(std::memory_order_relaxed);
+    if (keep_page_gpu_data && keep != Tegra::Nx2KeepPageGpuData::None &&
         gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+        if (keep == Tegra::Nx2KeepPageGpuData::Inline) {
+            // The written bytes go into the buffer; the page stays as the GPU left it.
+            tmp_buffer.resize_destructive(size);
+            device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
+            InlineMemoryImplementation(device_addr, size, tmp_buffer);
+            return;
+        }
         DownloadMemory(page_begin, page_end - page_begin);
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);

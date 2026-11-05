@@ -178,8 +178,11 @@ struct GPU::Impl {
             if (last == 0) {
                 keep_toggled.compare_exchange_strong(last, now);
             } else if (now - last >= 20 && keep_toggled.compare_exchange_strong(last, now)) {
-                const bool on = !Tegra::g_nx2_keep_page_gpu_data.load(std::memory_order_relaxed);
-                Tegra::g_nx2_keep_page_gpu_data.store(on, std::memory_order_relaxed);
+                using Keep = Tegra::Nx2KeepPageGpuData;
+                const bool on =
+                    Tegra::g_nx2_keep_page_gpu_data.load(std::memory_order_relaxed) == Keep::None;
+                Tegra::g_nx2_keep_page_gpu_data.store(on ? Keep::Download : Keep::None,
+                                                      std::memory_order_relaxed);
                 LOG_INFO(HW_GPU, "Page GPU data downloads on CPU writes: {}", on ? "on" : "off");
             }
         }
