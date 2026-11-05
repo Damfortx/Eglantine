@@ -58,6 +58,7 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     big_page_table_dev.ResizeAndClear(big_page_table_size);
     big_entries.resize(big_page_table_size / 32, 0);
     big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
+    big_next_contiguous.resize((big_page_table_size + 63) / 64, 0);
     entries.resize(page_table_size / 32, 0);
 }
 
@@ -213,6 +214,13 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
             SetBigPageContinuous(index, is_continuous);
         }
         remaining_size -= big_page_size;
+    }
+    if (size != 0) {
+        const size_t first = PageEntryIndex(gpu_addr, true);
+        const size_t last = PageEntryIndex(gpu_addr + size - 1, true);
+        for (size_t index = first == 0 ? 0 : first - 1; index <= last; ++index) {
+            RefreshBigNextContiguous(index);
+        }
     }
     flush_modified();
     {
@@ -650,7 +658,63 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
     return result;
 }
 
+void MemoryManager::RefreshBigNextContiguous(size_t index) {
+    if (index + 1 >= big_entries.size() * 32) {
+        return;
+    }
+    const bool contiguous =
+        GetEntry(GPUVAddr{index} << big_page_bits, true) == EntryType::Mapped &&
+        GetEntry(GPUVAddr{index + 1} << big_page_bits, true) == EntryType::Mapped &&
+        u64{big_page_table_dev[index + 1]} ==
+            u64{big_page_table_dev[index]} + (big_page_size >> cpu_page_bits);
+    const u64 bit = u64{1} << (index % 64);
+    big_next_contiguous[index / 64] = contiguous ? big_next_contiguous[index / 64] | bit
+                                                 : big_next_contiguous[index / 64] & ~bit;
+}
+
 size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
+    // From big pages: follow the next-contiguous bits (the walk below cost ~13% of the GPU back
+    // thread in title 1, binding native storage buffers of up to 8 MiB). Anything else, such as a
+    // big page split into small ones, takes the walk. EDEN_NX2_FAST_RANGE=0 always walks, =verify
+    // compares both.
+    static const char fast_mode = [] {
+        const char* value = std::getenv("EDEN_NX2_FAST_RANGE");
+        return value != nullptr ? value[0] : '1';
+    }();
+    if (fast_mode != '0' && size != 0 && GetEntry(gpu_addr, true) == EntryType::Mapped) {
+        size_t index = gpu_addr >> big_page_bits;
+        size_t available = big_page_size - (gpu_addr & big_page_mask);
+        bool walk = false;
+        while (available < size) {
+            if (!IsBigNextContiguous(index)) {
+                // A mapped big page at a different device address ends the range, as in the walk.
+                walk = index + 1 >= big_entries.size() * 32 ||
+                       GetEntry(GPUVAddr{index + 1} << big_page_bits, true) != EntryType::Mapped;
+                break;
+            }
+            ++index;
+            available += big_page_size;
+        }
+        if (!walk) {
+            const size_t fast = (std::min)(available, size);
+            if (fast_mode != 'v') [[likely]] {
+                return fast;
+            }
+            const size_t slow = MaxContinuousRangeWalk(gpu_addr, size);
+            if (slow != fast) {
+                static std::atomic<u32> reported{};
+                if (reported.fetch_add(1) < 16) {
+                    LOG_WARNING(HW_GPU, "Fast range {:#x}+{:#x}: {:#x}, walk {:#x}", gpu_addr, size,
+                                fast, slow);
+                }
+            }
+            return slow;
+        }
+    }
+    return MaxContinuousRangeWalk(gpu_addr, size);
+}
+
+size_t MemoryManager::MaxContinuousRangeWalk(GPUVAddr gpu_addr, size_t size) const {
     std::optional<DAddr> old_page_addr{};
     size_t range_so_far = 0;
     bool result{false};

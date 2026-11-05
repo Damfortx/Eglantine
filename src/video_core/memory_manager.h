@@ -158,6 +158,7 @@ public:
 
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
+    size_t MaxContinuousRangeWalk(GPUVAddr gpu_addr, size_t size) const;
 
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
@@ -242,6 +243,13 @@ private:
     Common::SparseLargeVector<u32> big_page_table_dev;
 
     std::vector<u64> big_page_continuous;
+    /// Per big page: the next big page is mapped too, at the next device address
+    /// (MaxContinuousRange answers from these bits instead of walking the page table).
+    std::vector<u64> big_next_contiguous;
+    void RefreshBigNextContiguous(size_t big_page_index);
+    bool IsBigNextContiguous(size_t big_page_index) const {
+        return ((big_next_contiguous[big_page_index / 64] >> (big_page_index % 64)) & 1) != 0;
+    }
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash{};
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
