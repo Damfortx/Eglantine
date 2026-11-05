@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 
@@ -179,9 +180,25 @@ bool DmaPusher::Step() {
         bool gpu_written =
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+            !IsKnownCpuCommandList(dma_state.dma_get, size_t{header.size} * sizeof(u32)) &&
             VideoCommon::GpuSplit::Get().WaitForWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            // EDEN_NX2_GPU_PROFILE: how often waiting for the writers found a GPU-written list.
+            static u64 waited{}, found{};
+            static auto window = std::chrono::steady_clock::now();
+            ++waited;
+            found += gpu_written ? 1 : 0;
+            if (!gpu_written) {
+                NoteCpuCommandList(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            }
+            if (VideoCommon::Nx2Profile::Enabled() &&
+                std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
+                LOG_INFO(HW_GPU, "Writer waits: {} in 10 s, {} found GPU-written words", waited, found);
+                waited = 0;
+                found = 0;
+                window = std::chrono::steady_clock::now();
+            }
         }
         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
         // safe read below would flush (with the split, the front can't tell: it reads memory
@@ -572,6 +589,63 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
         }
     }
     return false;
+}
+
+// Every entry not on GPU-written pages waited for the compute and copy work queued before it, in
+// case that work writes the entry's pages for the first time (Fast Fusion's culling lists). Title
+// 1 waited ~6,000 times a second and never found GPU-written words. With EDEN_NX2_WRITER_WAIT=0
+// pages already read as CPU command lists after such a wait skip it (=alt switches every 20 s).
+// Off by default: skipping the waits did not change the draw rate there.
+bool DmaPusher::IsKnownCpuCommandList(GPUVAddr address, size_t size) {
+    static const char mode = [] {
+        const char* value = std::getenv("EDEN_NX2_WRITER_WAIT");
+        return value != nullptr ? value[0] : '1';
+    }();
+    if (mode == '1') {
+        return false;
+    }
+    if (mode == 'a') {
+        static bool skip = true;
+        static auto toggled = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - toggled >= std::chrono::seconds{20}) {
+            skip = !skip;
+            toggled = now;
+            LOG_INFO(HW_GPU, "Writer wait skip for known CPU command lists: {}", skip ? "on" : "off");
+        }
+        if (!skip) {
+            return false;
+        }
+    }
+    if (known_cpu_list_pages.empty()) {
+        return false;
+    }
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        if (!device) {
+            return false;
+        }
+        const u64 index = *device >> 12;
+        if (index / 64 >= known_cpu_list_pages.size() ||
+            ((known_cpu_list_pages[index / 64] >> (index % 64)) & 1) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void DmaPusher::NoteCpuCommandList(GPUVAddr address, size_t size) {
+    if (known_cpu_list_pages.empty()) {
+        known_cpu_list_pages.resize((u64{1} << (36 - 12)) / 64);
+    }
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+            const u64 index = *device >> 12;
+            if (index / 64 < known_cpu_list_pages.size()) {
+                known_cpu_list_pages[index / 64] |= u64{1} << (index % 64);
+            }
+        }
+    }
 }
 
 bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {

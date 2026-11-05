@@ -204,6 +204,11 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// Whether every page of the entry was read before as a CPU command list (no writer wait).
+    bool IsKnownCpuCommandList(GPUVAddr address, size_t size);
+    void NoteCpuCommandList(GPUVAddr address, size_t size);
+    /// Device pages (4 KiB) read as CPU command lists after waiting for the writers.
+    std::vector<u64> known_cpu_list_pages;
     /// Copies the list's words from memory again, as of suspension count `now`.
     void RefreshSnapshot(CommandList& list, u64 now);
 

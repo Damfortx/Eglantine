@@ -157,6 +157,7 @@ public:
                        VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
 
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
+    size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
@@ -246,6 +247,9 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
+    /// Bumped at the start and the end of every page table change: MaxContinuousRange and
+    /// GetMemoryLayoutSize results computed under one value stay valid while it holds.
+    std::atomic<u64> layout_generation{1};
 
     static constexpr size_t continuous_bits = 64;
 

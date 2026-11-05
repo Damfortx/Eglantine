@@ -4,8 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <chrono>
+#include <array>
 #include <algorithm>
 
+#include "common/scope_exit.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
@@ -116,6 +120,10 @@ inline void MemoryManager::SetBigPageContinuous(size_t big_page_index, bool valu
 }
 
 GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
+    layout_generation.fetch_add(1, std::memory_order_acq_rel);
+    SCOPE_EXIT {
+        layout_generation.fetch_add(1, std::memory_order_release);
+    };
     [[maybe_unused]] u64 remaining_size{size};
     if (entry_type == EntryType::Mapped) {
         page_table.ReserveRange(gpu_addr, size);
@@ -156,6 +164,10 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
 }
 
 GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
+    layout_generation.fetch_add(1, std::memory_order_acq_rel);
+    SCOPE_EXIT {
+        layout_generation.fetch_add(1, std::memory_order_release);
+    };
     [[maybe_unused]] u64 remaining_size{size};
     GPUVAddr modified_start{};
     u64 modified_size{};
@@ -579,7 +591,66 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
     return result;
 }
 
+namespace {
+// MaxContinuousRange and GetMemoryLayoutSize walk the page table (and take a lock) for every
+// storage buffer bound: Switch 2 titles bind native buffers of up to 8 MiB a few hundred
+// thousand times a second, ~10% of the GPU back thread in title 1. Results are kept per thread
+// until the page table changes (layout_generation). EDEN_NX2_RANGE_CACHE=0 turns it off.
+struct RangeCacheEntry {
+    const void* manager{};
+    u64 generation{};
+    GPUVAddr gpu_addr{};
+    size_t size{};
+    size_t result{};
+};
+constexpr size_t RangeCacheSize = 512;
+
+bool RangeCacheEnabled() {
+    static const char mode = [] {
+        const char* value = std::getenv("EDEN_NX2_RANGE_CACHE");
+        return value != nullptr ? value[0] : '1';
+    }();
+    if (mode != 'a') {
+        return mode != '0';
+    }
+    thread_local bool on = true;
+    thread_local auto toggled = std::chrono::steady_clock::now();
+    thread_local u32 calls = 0;
+    if ((++calls & 1023) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - toggled >= std::chrono::seconds{20}) {
+            on = !on;
+            toggled = now;
+            LOG_INFO(HW_GPU, "GPU memory range cache: {}", on ? "on" : "off");
+        }
+    }
+    return on;
+}
+
+RangeCacheEntry& RangeCacheSlot(std::array<RangeCacheEntry, RangeCacheSize>& cache,
+                                GPUVAddr gpu_addr, size_t size) {
+    const u64 key = (gpu_addr >> 6) ^ (gpu_addr >> 20) ^ (size * 0x9E3779B97F4A7C15ULL >> 40);
+    return cache[key & (RangeCacheSize - 1)];
+}
+} // Anonymous namespace
+
 size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+    thread_local std::array<RangeCacheEntry, RangeCacheSize> cache{};
+    const bool use_cache = RangeCacheEnabled();
+    const u64 generation = layout_generation.load(std::memory_order_acquire);
+    RangeCacheEntry& slot = RangeCacheSlot(cache, gpu_addr, size);
+    if (use_cache && slot.manager == this && slot.generation == generation &&
+        slot.gpu_addr == gpu_addr && slot.size == size) {
+        return slot.result;
+    }
+    const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
+    if (use_cache && (generation & 1) != 0) {
+        slot = {this, generation, gpu_addr, size, result};
+    }
+    return result;
+}
+
+size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
     std::optional<DAddr> old_page_addr{};
     size_t range_so_far = 0;
     bool result{false};
@@ -620,8 +691,23 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
 }
 
 size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr, size_t max_size) const {
-    std::unique_lock<std::mutex> lock(guard);
-    return kind_map.GetContinuousSizeFrom(gpu_addr);
+    thread_local std::array<RangeCacheEntry, RangeCacheSize> cache{};
+    const bool use_cache = RangeCacheEnabled();
+    const u64 generation = layout_generation.load(std::memory_order_acquire);
+    RangeCacheEntry& slot = RangeCacheSlot(cache, gpu_addr, 0);
+    if (use_cache && slot.manager == this && slot.generation == generation &&
+        slot.gpu_addr == gpu_addr) {
+        return slot.result;
+    }
+    size_t result;
+    {
+        std::unique_lock<std::mutex> lock(guard);
+        result = kind_map.GetContinuousSizeFrom(gpu_addr);
+    }
+    if (use_cache && (generation & 1) != 0) {
+        slot = {this, generation, gpu_addr, 0, result};
+    }
+    return result;
 }
 
 void MemoryManager::InvalidateRegion(GPUVAddr gpu_addr, size_t size,
