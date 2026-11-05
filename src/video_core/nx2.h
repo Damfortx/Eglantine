@@ -22,7 +22,8 @@ inline std::atomic<bool> g_nx2_ampere{false};
 /// How a CPU write keeps GPU-written bytes elsewhere on its pages (BufferCache::WriteMemory):
 /// 1 downloads them first (a GPU wait), 2 uploads only the written bytes into the buffer and
 /// leaves the page's other bytes to the GPU, 0 does neither (the next upload of the page sends the
-/// stale guest copy over them: Mario Kart World's shadows came out too dark). 1 by default; 2
+/// stale guest copy over them: Mario Kart World's shadows came out too dark). 1 by default, 0
+/// for Mario Kart World (the download cost its GPU thread ~250 ms a second); 2
 /// cost Mario Kart World more than the download (each small upload split the render pass)
 /// (EDEN_NX2_KEEP_PAGE_GPU_DATA=0/1/2 forces it, =alt switches 1 and 0).
 enum class Nx2KeepPageGpuData : u32 { None, Download, Inline };
