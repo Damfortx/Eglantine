@@ -433,6 +433,7 @@ void DmaPusher::CallMethod(u32 argument) {
     }
     auto& split = VideoCommon::GpuSplit::Get();
     if (dma_state.method < non_puller_methods) {
+        VideoCommon::Nx2Profile::Scope puller_scope{VideoCommon::Nx2Profile::Zone::PullerMethod};
         puller.CallPullerMethod(*this, Engines::Puller::MethodCall{
             dma_state.method,
             argument,
@@ -455,6 +456,7 @@ void DmaPusher::CallMethod(u32 argument) {
             }
         };
         if (split.Active()) {
+            VideoCommon::Nx2Profile::Scope front_scope{VideoCommon::Nx2Profile::Zone::FrontMethod};
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
             if (split.FrontMacros()) {
                 const auto type = subchannel_type[dma_state.subchannel];
@@ -497,6 +499,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
     auto& split = VideoCommon::GpuSplit::Get();
     if (dma_state.method < non_puller_methods) {
+        VideoCommon::Nx2Profile::Scope puller_scope{VideoCommon::Nx2Profile::Zone::PullerMethod};
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
@@ -514,6 +517,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             }
         };
         if (split.Active()) {
+            VideoCommon::Nx2Profile::Scope front_scope{VideoCommon::Nx2Profile::Zone::FrontMethod};
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
             if (split.FrontMacros()) {
                 const auto type = subchannel_type[dma_state.subchannel];

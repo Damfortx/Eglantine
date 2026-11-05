@@ -60,6 +60,8 @@ enum class Zone : u32 {
     InvalidateTexture,  ///< CPU writes invalidated in the texture cache
     InvalidateBuffer,   ///< CPU writes invalidated in the buffer cache
     InvalidatePipeline, ///< CPU writes invalidated in the pipeline cache
+    FrontMethod,  ///< Split front: engine methods handled and sent to the back (Front*, Method)
+    PullerMethod, ///< Puller methods (semaphores, syncpoints, binds)
     Count,
 };
 
@@ -70,7 +72,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait", "deferred", "state apply", "fence commit", "fence create", "fence submit", "fence invalidate", "inval texture", "inval buffer", "inval pipeline",
+    "fence skipped", "method", "split drain", "split wait", "deferred", "state apply", "fence commit", "fence create", "fence submit", "fence invalidate", "inval texture", "inval buffer", "inval pipeline", "front method", "puller method",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
