@@ -74,4 +74,11 @@ void FenceManager::WaitFence(Fence& fence) {
     fence->Wait();
 }
 
+void FenceManager::SubmitDeferred() {
+    // Only the scheduler's owner records and submits (the deferred flush is its own).
+    if (VideoCommon::GpuSplit::OwnsScheduler()) {
+        scheduler.FlushDeferred();
+    }
+}
+
 } // namespace Vulkan
