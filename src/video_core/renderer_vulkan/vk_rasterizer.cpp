@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_map>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -364,6 +365,37 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (!pipeline) {
         report_failure("no pipeline");
         return;
+    }
+    // EDEN_NX2_GPU_PROFILE: draws per render target (colour 0 size, depth only), every 10 s.
+    if (Profile::Enabled()) [[unlikely]] {
+        static std::unordered_map<u64, u64> per_target;
+        static auto window = std::chrono::steady_clock::now();
+        const auto& regs = maxwell3d->regs;
+        const u32 width = regs.rt[0].width, height = regs.rt[0].height;
+        const bool color = regs.rt_control.count != 0 && regs.rt[0].Address() != 0;
+        const u64 key = (u64{color ? width : 0} << 40) | (u64{color ? height : 0} << 16) |
+                        (regs.zeta_enable ? 1 : 0) | (u64{regs.zeta_size.width >> 4} << 1 & 0xfffe);
+        ++per_target[key];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window >= std::chrono::seconds{10}) {
+            std::vector<std::pair<u64, u64>> sorted(per_target.begin(), per_target.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string line;
+            u64 total = 0;
+            for (const auto& [k, c] : sorted) {
+                total += c;
+            }
+            for (size_t i = 0; i < (std::min<size_t>)(sorted.size(), 10); ++i) {
+                const auto [k, c] = sorted[i];
+                line += fmt::format(" | {}x{}{} {:.1f}%", k >> 40, (k >> 16) & 0xffffff,
+                                    (k & 1) ? fmt::format(" z{}", ((k >> 1) & 0x7fff) << 4) : "",
+                                    100.0 * static_cast<double>(c) / static_cast<double>(total));
+            }
+            LOG_INFO(HW_GPU, "Draws per target ({} in 10 s):{}", total, line);
+            per_target.clear();
+            window = now;
+        }
     }
     if (!is_indexed && TryNx2IndirectReset()) {
         submitted = true;
