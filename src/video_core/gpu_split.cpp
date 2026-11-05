@@ -352,7 +352,7 @@ void GpuSplit::Drain(DrainReason reason) {
     pending_write_count = 0;
     pending_write_overflow = false;
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache == write_position) {
+    if (consumed_cache == write_position && BackQuiet()) {
         return;
     }
     Publish();
@@ -360,6 +360,19 @@ void GpuSplit::Drain(DrainReason reason) {
     const auto begin = std::chrono::steady_clock::now();
     ++waits[index];
     WaitConsumed(write_position);
+    // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
+    // from its idle hook afterwards, and the caller may use the scheduler once this returns.
+    if (!BackQuiet()) {
+        RequestIdleHook();
+        for (u32 spins = 0; !BackQuiet() && back_running.load(std::memory_order_acquire);
+             ++spins) {
+            if (spins < 16384) {
+                Pause();
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    }
     publish_every = 8;
     wait_ns[index] += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::steady_clock::now() - begin)
@@ -518,9 +531,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
-            if (available == read_position && idle_hook != nullptr) {
+            if (available == read_position) {
                 hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                // The front may already see everything consumed: Drain() waits for back_quiet
+                // too, so the deferred submit can't overlap whatever the front does next.
+                if (!back_quiet.load(std::memory_order_relaxed)) {
+                    if (idle_hook != nullptr) {
+                        idle_hook(idle_argument);
+                    }
+                    back_quiet.store(true, std::memory_order_release);
+                }
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
@@ -539,6 +559,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
+        // Before any entry runs, so a front that sees these entries consumed also sees this.
+        back_quiet.store(false, std::memory_order_seq_cst);
         g_back_busy.store(true, std::memory_order_relaxed);
         const auto busy_begin = std::chrono::steady_clock::now();
         while (read_position != available) {
