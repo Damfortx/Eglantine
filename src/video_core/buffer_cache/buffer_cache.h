@@ -128,13 +128,13 @@ void BufferCache<P>::TickFrame() {
     }
     // A page the CPU read once stayed Preflushable for the session, downloaded at every fence
     // after each GPU write: title 1 reads different pages as it goes, and ~100,000 downloads a
-    // second piled up. Every EDEN_NX2_PREFLUSH_DECAY frames (default 600, 0 never) the marks are
+    // second piled up. Every EDEN_NX2_PREFLUSH_DECAY frames (e.g. 600; off by default: in play the karts jumped back and forth, maybe from it) the marks are
     // dropped; GPU writes arm read traps again, and pages still read are marked at their next
     // read (one flush each).
     if constexpr (!IS_OPENGL) {
         static const u64 decay = [] {
             const char* value = std::getenv("EDEN_NX2_PREFLUSH_DECAY");
-            return value != nullptr ? std::strtoull(value, nullptr, 10) : 600ULL;
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
         }();
         if (decay != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
             ++preflush_decay_frames >= decay) {

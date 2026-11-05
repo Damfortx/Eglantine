@@ -351,11 +351,8 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
             using Keep = Tegra::Nx2KeepPageGpuData;
             const char* keep = std::getenv("EDEN_NX2_KEEP_PAGE_GPU_DATA");
             Tegra::g_nx2_keep_page_gpu_data =
-                keep == nullptr || keep[0] == 'a'
-                    ? (system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId
-                           ? Keep::Inline
-                           : Keep::Download)
-                : keep[0] == '0' ? Keep::None
+                keep == nullptr || keep[0] == 'a' ? Keep::Download
+                : keep[0] == '0'                  ? Keep::None
                 : keep[0] == '2' ? Keep::Inline
                                  : Keep::Download;
         }
