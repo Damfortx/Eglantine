@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <optional>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -59,6 +60,21 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::GpuSplit::DrainReason::Puller);
 }
 
+void NoteRelease(GPUVAddr address, u32 payload) {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.NoteRelease(address, payload);
+    }
+}
+
+// The payload a release still queued for the back will write at `address`, if any (gpu_split.h).
+std::optional<u32> PredictedRelease(DmaPusher& dma_pusher, GPUVAddr address) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active()) {
+        return std::nullopt;
+    }
+    return split.PredictedRelease(address, dma_pusher.memory_manager.Read<u32>(address));
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -76,6 +92,10 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
+        return true;
+    }
+    if (const auto predicted = PredictedRelease(dma_pusher, pending_acquire->address);
+        predicted && pending_acquire->Matches(*predicted)) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -233,6 +253,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
             }
         });
+        NoteRelease(sequence_address, payload);
+        if (mirror != 0) {
+            NoteRelease(mirror, payload);
+        }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -250,6 +274,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (const auto predicted = PredictedRelease(dma_pusher, acquire.address);
+            predicted && acquire.Matches(*predicted)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
@@ -307,6 +335,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    NoteRelease(sequence_address, payload);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -336,9 +365,20 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
+        NoteRelease(address, payload);
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    if (const auto predicted = PredictedRelease(dma_pusher, address);
+        predicted &&
+        (operation == 0   ? *predicted == payload
+         : operation == 2 ? *predicted >= payload
+         : operation == 3 ? static_cast<s32>(*predicted - payload) >= 0
+         : operation == 4 ? (*predicted & payload) != 0
+         : operation == 5 ? (*predicted & payload) == 0
+                          : true)) {
+        return;
+    }
     DrainBack();
     dma_pusher.rasterizer->ReleaseFences();
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);

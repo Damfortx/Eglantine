@@ -595,11 +595,12 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
 // case that work writes the entry's pages for the first time (Fast Fusion's culling lists). Title
 // 1 waited ~6,000 times a second and never found GPU-written words. With EDEN_NX2_WRITER_WAIT=0
 // pages already read as CPU command lists after such a wait skip it (=alt switches every 20 s).
-// Off by default: skipping the waits did not change the draw rate there.
+// EDEN_NX2_WRITER_WAIT=1 always waits. On its own it did not change the draw rate (semaphore
+// acquires held the front instead); with acquires predicted (gpu_split.h) it is the next wait.
 bool DmaPusher::IsKnownCpuCommandList(GPUVAddr address, size_t size) {
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_WRITER_WAIT");
-        return value != nullptr ? value[0] : '1';
+        return value != nullptr ? value[0] : '0';
     }();
     if (mode == '1') {
         return false;

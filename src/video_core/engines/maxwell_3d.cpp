@@ -1028,6 +1028,20 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) [[unlikely]] {
+        // A release that writes its payload (no counter, no reduction): acquires on the front can
+        // count on it before the back runs it (GpuSplit::PredictedRelease).
+        const u32 query = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.query)];
+        const bool release = (query & 3) == static_cast<u32>(Regs::ReportSemaphore::Operation::Release);
+        const bool payload_report = ((query >> 23) & 0x1f) == 0;
+        const bool reduction = ((query >> 3) & 1) != 0;
+        if (release && payload_report && !reduction) {
+            const GPUVAddr address =
+                (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+                fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+            split.NoteRelease(address, fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)]);
+        }
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,

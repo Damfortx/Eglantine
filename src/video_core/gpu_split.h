@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <unordered_map>
+#include <optional>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -169,6 +171,29 @@ public:
     };
     void Drain(DrainReason reason = DrainReason::Other);
 
+    /// A semaphore release (payload written at `address`) was just sent to the back.
+    void NoteRelease(GPUVAddr address, u32 payload) {
+        if (PredictAcquires()) {
+            FlushState();
+            pending_releases[address] = PendingRelease{payload, write_position};
+        }
+    }
+    /// The value a release still on its way will write at `address`: one sent but not yet in
+    /// memory (`current` is what memory holds now). An acquire it meets need not wait for the
+    /// back: everything after the acquire goes behind that release in the ring.
+    std::optional<u32> PredictedRelease(GPUVAddr address, u32 current) {
+        const auto it = pending_releases.find(address);
+        if (it == pending_releases.end()) {
+            return std::nullopt;
+        }
+        if (current == it->second.payload || write_position - it->second.position > RingWords) {
+            pending_releases.erase(it);
+            return std::nullopt;
+        }
+        return it->second.payload;
+    }
+    static bool PredictAcquires();
+
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
         last_writer_position = write_position;
@@ -241,6 +266,12 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+
+    struct PendingRelease {
+        u32 payload;
+        u64 position;
+    };
+    std::unordered_map<GPUVAddr, PendingRelease> pending_releases;
 
     // Front side: the state block being gathered (StateWrite).
     static constexpr size_t MaxStateRegisters = 0x1000;

@@ -144,6 +144,15 @@ void GpuSplit::MaybeStart(Core::System& system_) {
              state_blocks ? ", state writes in blocks" : "");
 }
 
+bool GpuSplit::PredictAcquires() {
+    // EDEN_NX2_PREDICT_ACQUIRE=0: acquires always wait for the back and read memory.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_PREDICT_ACQUIRE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 void GpuSplit::Stop() {
     if (!back_thread.joinable()) {
         return;
@@ -169,6 +178,7 @@ void GpuSplit::Stop() {
     state_blocks = false;
     state_engine = nullptr;
     state_count = 0;
+    pending_releases.clear();
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
