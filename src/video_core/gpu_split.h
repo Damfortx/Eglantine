@@ -172,25 +172,31 @@ public:
     void Drain(DrainReason reason = DrainReason::Other);
 
     /// A semaphore release (payload written at `address`) was just sent to the back.
-    void NoteRelease(GPUVAddr address, u32 payload) {
+    void NoteRelease(GPUVAddr address, u32 payload, bool at_least = false) {
         if (PredictAcquires()) {
             FlushState();
-            pending_releases[address] = PendingRelease{payload, write_position};
+            pending_releases[address] = PendingRelease{payload, write_position, at_least};
         }
     }
     /// The value a release still on its way will write at `address`: one sent but not yet in
     /// memory (`current` is what memory holds now). An acquire it meets need not wait for the
     /// back: everything after the acquire goes behind that release in the ring.
-    std::optional<u32> PredictedRelease(GPUVAddr address, u32 current) {
+    struct Prediction {
+        u32 value;
+        bool at_least; ///< The release leaves at least `value` (a max release): only >= acquires
+    };
+    std::optional<Prediction> PredictedRelease(GPUVAddr address, u32 current) {
         const auto it = pending_releases.find(address);
         if (it == pending_releases.end()) {
             return std::nullopt;
         }
-        if (current == it->second.payload || write_position - it->second.position > RingWords) {
+        const bool landed = it->second.at_least ? current >= it->second.payload
+                                                : current == it->second.payload;
+        if (landed || write_position - it->second.position > RingWords) {
             pending_releases.erase(it);
             return std::nullopt;
         }
-        return it->second.payload;
+        return Prediction{it->second.payload, it->second.at_least};
     }
     static bool PredictAcquires();
 
@@ -270,6 +276,7 @@ private:
     struct PendingRelease {
         u32 payload;
         u64 position;
+        bool at_least;
     };
     std::unordered_map<GPUVAddr, PendingRelease> pending_releases;
 

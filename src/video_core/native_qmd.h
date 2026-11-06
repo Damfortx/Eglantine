@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -32,6 +33,7 @@ public:
         pending[0] = {address, argument & 15, ((argument >> 14) & 0x3ff) + 1};
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
+            auto& states = *table;
             if (states.size() >= 4096 && !states.contains(request.address)) {
                 // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
                 std::erase_if(states, [](const auto& entry) {
@@ -134,6 +136,19 @@ private:
     // One table for every channel: a QMD's dependency counter is state of the QMD itself, and
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
-    static inline std::unordered_map<Address, State> states;
+    static inline std::unordered_map<Address, State> shared_states;
+
+public:
+    /// A scheduler with its own table (the split GPU thread's front mirrors the back's to learn
+    /// which releases a launch makes, without touching the real QMD state).
+    /// Starts from the shared table as it is now (the caller makes sure no one schedules).
+    void UsePrivateTable() {
+        private_states = std::make_unique<std::unordered_map<Address, State>>(shared_states);
+        table = private_states.get();
+    }
+
+private:
+    std::unique_ptr<std::unordered_map<Address, State>> private_states;
+    std::unordered_map<Address, State>* table = &shared_states;
 };
 } // namespace Tegra

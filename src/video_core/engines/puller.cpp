@@ -67,7 +67,8 @@ void NoteRelease(GPUVAddr address, u32 payload) {
 }
 
 // The payload a release still queued for the back will write at `address`, if any (gpu_split.h).
-std::optional<u32> PredictedRelease(DmaPusher& dma_pusher, GPUVAddr address) {
+std::optional<VideoCommon::GpuSplit::Prediction> PredictedRelease(DmaPusher& dma_pusher,
+                                                                  GPUVAddr address) {
     auto& split = VideoCommon::GpuSplit::Get();
     if (!split.Active()) {
         return std::nullopt;
@@ -95,7 +96,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         return true;
     }
     if (const auto predicted = PredictedRelease(dma_pusher, pending_acquire->address);
-        predicted && pending_acquire->Matches(*predicted)) {
+        predicted && (!predicted->at_least || pending_acquire->operation ==
+                                                  static_cast<u32>(GpuSemaphoreOperation::AcquireGequal)) &&
+        pending_acquire->Matches(predicted->value)) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -275,7 +278,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
         if (const auto predicted = PredictedRelease(dma_pusher, acquire.address);
-            predicted && acquire.Matches(*predicted)) {
+            predicted && (!predicted->at_least || op == GpuSemaphoreOperation::AcquireGequal) &&
+            acquire.Matches(predicted->value)) {
             return;
         }
         DrainBack();
@@ -370,12 +374,12 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
     if (const auto predicted = PredictedRelease(dma_pusher, address);
-        predicted &&
-        (operation == 0   ? *predicted == payload
-         : operation == 2 ? *predicted >= payload
-         : operation == 3 ? static_cast<s32>(*predicted - payload) >= 0
-         : operation == 4 ? (*predicted & payload) != 0
-         : operation == 5 ? (*predicted & payload) == 0
+        predicted && (!predicted->at_least || operation == 2) &&
+        (operation == 0   ? predicted->value == payload
+         : operation == 2 ? predicted->value >= payload
+         : operation == 3 ? static_cast<s32>(predicted->value - payload) >= 0
+         : operation == 4 ? (predicted->value & payload) != 0
+         : operation == 5 ? (predicted->value & payload) == 0
                           : true)) {
         return;
     }

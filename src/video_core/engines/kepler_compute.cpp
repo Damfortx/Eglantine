@@ -1135,6 +1135,9 @@ Texture::TSCEntry KeplerCompute::GetTSCEntry(u32 tsc_index) const {
 // written to each, on the back too) and loads and binds the compute macro code itself.
 struct KeplerCompute::FrontState {
     std::array<u32, 0x1000> registers{};
+    /// The back's QMD scheduling replayed on its own table: which launches run at once and
+    /// which releases they make, for acquires on the front (GpuSplit::NoteRelease).
+    Tegra::NativeQmdScheduler qmd_mirror;
     std::optional<u32> executing_macro;
     std::vector<u32> parameters;
     bool compute_uploaded{};
@@ -1142,11 +1145,42 @@ struct KeplerCompute::FrontState {
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
 };
 
+// QMD launches as the back will run them (ProcessNativeMethod), on the mirror's own table: the
+// releases of the QMDs that run at once are recorded for acquires on the front. Plain releases
+// write their payload, max releases leave at least it; add releases are left out. Inline QMDs
+// (written by the back from registers) are not seen here and so never predicted.
+void KeplerCompute::FrontMirrorQmd(FrontState& fs, u32 method, u32 argument) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.PredictAcquires() || !split.Active()) {
+        return;
+    }
+    if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
+        (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) {
+        return;
+    }
+    const GPUVAddr qmd_address = GPUVAddr{fs.registers[0xad]} << 8;
+    static_cast<void>(fs.qmd_mirror.Signal(
+        qmd_address, argument,
+        [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
+            if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
+            memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+            return true;
+        },
+        [&](u64 address, u32 payload, u32 flags) {
+            if ((flags & (1U << 26)) == 0) {
+                split.NoteRelease(address, payload, (flags & (1U << 19)) != 0);
+            }
+            return true;
+        },
+        [](const auto&) { return true; }));
+}
+
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
         // Copy the back's state and take the macros over while it is idle.
         split.Drain(VideoCommon::GpuSplit::DrainReason::FrontState);
         front = std::make_unique<FrontState>();
+        front->qmd_mirror.UsePrivateTable();
         front->registers = native_registers;
         front->executing_macro = native_executing_macro;
         front->parameters = std::move(native_parameters);
@@ -1166,6 +1200,9 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
         fs.compute_uploaded = true;
     }
     fs.registers[method] = argument;
+    if (method >= 0xae && method <= 0xb0) [[unlikely]] {
+        FrontMirrorQmd(fs, method, argument);
+    }
     switch (method) {
     case 0x45:
         FrontMacroEngine(fs).ClearCode(argument);
