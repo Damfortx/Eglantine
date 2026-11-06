@@ -1837,6 +1837,7 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     std::chrono::steady_clock::time_point m_next_vblank{};
     u32 m_swap_word{};
+    u32 m_swap_stable{}; ///< Presents since the swap word last changed (capped)
 
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
@@ -1853,6 +1854,20 @@ private:
             process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
             process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
+        // Mario Kart World flips between intervals 1 and 2 several times a second (~1,500 flips a
+        // session here): held to two vblanks on each 2, frames that took 20-30 ms were shown at
+        // 33 ms. Its intervals above 1 are honoured once it has kept them for
+        // EDEN_NX2_SWAP_STABLE presents (default 120, 0 honours each at once); the idea is from
+        // the Selevet Eglantine builds.
+        static const u32 stable_presents = [] {
+            const char* value = std::getenv("EDEN_NX2_SWAP_STABLE");
+            return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 120U;
+        }();
+        const bool mkw = process != nullptr &&
+                         process->GetProgramId() == Settings::MarioKartWorldProgramId;
+        if (mkw && stable_presents != 0 && (timing != m_swap_word || m_swap_stable < stable_presents)) {
+            swap_interval = 1;
+        }
         if (mkw_dynamic) {
             swap_interval = 1;
         }
@@ -1861,8 +1876,11 @@ private:
         }
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
         if (timing != std::exchange(m_swap_word, timing)) {
+            m_swap_stable = 0;
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
                      m_presents, swap_interval, refresh_rate, timing);
+        } else if (m_swap_stable < 0xffff) {
+            ++m_swap_stable;
         }
         const auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
