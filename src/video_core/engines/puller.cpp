@@ -99,6 +99,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         predicted && (!predicted->at_least || pending_acquire->operation ==
                                                   static_cast<u32>(GpuSemaphoreOperation::AcquireGequal)) &&
         pending_acquire->Matches(predicted->value)) {
+        VideoCommon::GpuSplit::Get().NotePredictedAcquire();
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -280,6 +281,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (const auto predicted = PredictedRelease(dma_pusher, acquire.address);
             predicted && (!predicted->at_least || op == GpuSemaphoreOperation::AcquireGequal) &&
             acquire.Matches(predicted->value)) {
+            VideoCommon::GpuSplit::Get().NotePredictedAcquire();
             return;
         }
         DrainBack();
@@ -381,6 +383,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
          : operation == 4 ? (predicted->value & payload) != 0
          : operation == 5 ? (predicted->value & payload) == 0
                           : true)) {
+        VideoCommon::GpuSplit::Get().NotePredictedAcquire();
         return;
     }
     DrainBack();

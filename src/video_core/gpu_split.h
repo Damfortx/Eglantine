@@ -199,6 +199,10 @@ public:
         return Prediction{it->second.payload, it->second.at_least};
     }
     static bool PredictAcquires();
+    /// An acquire passed on a predicted release (counted in the drain report).
+    void NotePredictedAcquire() {
+        ++predicted_acquires;
+    }
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
@@ -248,6 +252,8 @@ private:
         }
     }
     void WaitForSpace(size_t words);
+    void WaitConsumed(u64 target);
+    void StoreConsumed(u64 position);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
@@ -279,6 +285,7 @@ private:
         bool at_least;
     };
     std::unordered_map<GPUVAddr, PendingRelease> pending_releases;
+    u64 predicted_acquires{};
 
     // Front side: the state block being gathered (StateWrite).
     static constexpr size_t MaxStateRegisters = 0x1000;
@@ -309,6 +316,8 @@ private:
     alignas(128) std::atomic<u64> consumed{};
     /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
+    alignas(128) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
