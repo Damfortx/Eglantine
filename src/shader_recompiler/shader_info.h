@@ -325,6 +325,7 @@ struct Info {
     bool uses_sparse_residency{};
     bool uses_demote_to_helper_invocation{};
     bool uses_subgroup_vote{};
+    bool removed_conditional_barrier{};
     bool uses_subgroup_mask{};
     bool uses_fswzadd{};
     bool uses_derivatives{};
@@ -382,8 +383,11 @@ struct Info {
 
     /// True when the shader only runs correctly if a subgroup spans a whole guest warp.
     [[nodiscard]] bool UsesWarpOps() const noexcept {
-        return uses_subgroup_vote || uses_subgroup_invocation_id || uses_subgroup_shuffles ||
-               uses_subgroup_mask || uses_quad_shuffles || uses_fswzadd;
+        // A shader that lost a conditional barrier relies on a whole warp running in step: at a
+        // smaller subgroup size it reads stale shared memory (banding in Mario Kart World on
+        // Intel's Windows driver).
+        return removed_conditional_barrier || uses_subgroup_vote || uses_subgroup_invocation_id ||
+               uses_subgroup_shuffles || uses_subgroup_mask || uses_quad_shuffles || uses_fswzadd;
     }
 };
 
