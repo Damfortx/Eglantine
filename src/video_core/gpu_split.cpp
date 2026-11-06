@@ -145,10 +145,11 @@ void GpuSplit::MaybeStart(Core::System& system_) {
 }
 
 bool GpuSplit::PredictAcquires() {
-    // EDEN_NX2_PREDICT_ACQUIRE=0: acquires always wait for the back and read memory.
+    // EDEN_NX2_PREDICT_ACQUIRE=1 turns it on. Off by default: in title 1's attract demo the
+    // front ran no faster with it (~52 fps without, ~48-50 with it).
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_PREDICT_ACQUIRE");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }
@@ -211,15 +212,19 @@ void GpuSplit::WaitForSpace(size_t words) {
 // The front waits for the back to pass `target`: a short spin, then asleep until the back
 // stores its position (it wakes the front only when the front sleeps). It spun up to 16,384
 // pauses and then yielded in a loop: ~20% of the front's samples in title 1, and a busy hardware
-// thread slows its SMT sibling (often the back or a game core). EDEN_NX2_SPLIT_FUTEX=0 spins.
+// thread slows its SMT sibling (often the back or a game core). EDEN_NX2_SPLIT_FUTEX=1 sleeps;
+// off by default: in title 1's attract demo it cost ~5% (the wake-ups are slower than the spin).
 void GpuSplit::WaitConsumed(u64 target) {
     static const bool futex = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT_FUTEX");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     for (u32 spins = 0; spins < (futex ? 256U : ~0U); ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
+            return;
+        }
+        if ((spins & 1023) == 1023 && !back_running.load(std::memory_order_acquire)) {
             return;
         }
         if (spins < 16384) {

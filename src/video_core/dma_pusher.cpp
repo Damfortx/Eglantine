@@ -600,7 +600,7 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
 bool DmaPusher::IsKnownCpuCommandList(GPUVAddr address, size_t size) {
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_WRITER_WAIT");
-        return value != nullptr ? value[0] : '0';
+        return value != nullptr ? value[0] : '1';
     }();
     if (mode == '1') {
         return false;
