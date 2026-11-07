@@ -1194,8 +1194,33 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
 }
 
+namespace {
+// Whether any page of the range was ever written by the GPU through the buffer cache: GPU-modified
+// buffer data only lies on such pages (Nx2MarkGpuWritten, never cleared, on Switch 2).
+bool MayHoldGpuBufferData(DAddr addr, u64 size) {
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_DIRTY_FAST");
+    if (!Tegra::Nx2Switch(mode, true)) {
+        return true;
+    }
+    const DAddr end = addr + size;
+    for (DAddr page = addr & ~DAddr{Core::DEVICE_PAGEMASK}; page < end;
+         page += Core::DEVICE_PAGESIZE) {
+        if (Tegra::Nx2IsGpuWritten(page)) {
+            return true;
+        }
+    }
+    return false;
+}
+} // Anonymous namespace
+
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
-    if ((True(which & VideoCommon::CacheType::BufferCache))) {
+    // The split's front asks for every semaphore it reads and every macro DMA read, CPU threads
+    // for their reads: each took the buffer cache lock the back holds through every draw. Pages
+    // the GPU never wrote need no lock.
+    if ((True(which & VideoCommon::CacheType::BufferCache)) && MayHoldGpuBufferData(addr, size)) {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
