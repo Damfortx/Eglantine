@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -15,6 +16,32 @@
 #include "common/common_types.h"
 
 namespace Tegra {
+
+/// Cheap counters for A/B windows (Nx2AltOn logs them at each switch): draws recorded and time
+/// the split's back thread spent running work (not waiting for the front).
+inline std::atomic<u64> g_nx2_draws{};
+inline std::atomic<u64> g_nx2_back_busy_ns{};
+inline std::atomic<u64> g_nx2_presents{};
+
+/// A switch read from an environment variable: '0' off, '1' on, 'a' alternating every 30 s for
+/// the whole process (logged as "Nx2 alt: on/off", for A/B within one run), else the default.
+[[nodiscard]] bool Nx2AltOn();
+[[nodiscard]] inline char Nx2EnvMode(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? value[0] : 'd';
+}
+[[nodiscard]] inline bool Nx2Switch(char mode, bool default_on) {
+    switch (mode) {
+    case '0':
+        return false;
+    case '1':
+        return true;
+    case 'a':
+        return Nx2AltOn();
+    default:
+        return default_on;
+    }
+}
 
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.

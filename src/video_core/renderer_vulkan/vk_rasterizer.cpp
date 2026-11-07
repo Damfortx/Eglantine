@@ -576,6 +576,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    Tegra::g_nx2_draws.fetch_add(1, std::memory_order_relaxed);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
@@ -1543,10 +1544,8 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     // makes ~100,000 inline writes a second; the buffer cache lock (contended by the fencing
     // thread and CPU write traps) and the range tree walk were ~10% of the split's back thread.
     // EDEN_NX2_INLINE_FAST=0 always takes the lock (for comparisons).
-    static const bool inline_fast = [] {
-        const char* value = std::getenv("EDEN_NX2_INLINE_FAST");
-        return value == nullptr || value[0] != '0';
-    }();
+    static const char inline_mode = Tegra::Nx2EnvMode("EDEN_NX2_INLINE_FAST");
+    const bool inline_fast = Tegra::Nx2Switch(inline_mode, true);
     bool gpu_written = !inline_fast || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
     if (!gpu_written) {
         const u64 last = (*cpu_addr + copy_size + Core::DEVICE_PAGESIZE - 1) & ~u64{Core::DEVICE_PAGEMASK};

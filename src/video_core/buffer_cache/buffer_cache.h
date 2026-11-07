@@ -718,6 +718,13 @@ bool BufferCache<P>::HasUncommittedFlushes() const noexcept {
 }
 
 template <class P>
+void BufferCache<P>::UpdateFlushHint() noexcept {
+    if (!HasUncommittedFlushes()) {
+        nx2_flush_hint.store(false, std::memory_order_relaxed);
+    }
+}
+
+template <class P>
 void BufferCache<P>::AccumulateFlushes() {
     if (uncommitted_gpu_modified_ranges.Empty()) {
         return;

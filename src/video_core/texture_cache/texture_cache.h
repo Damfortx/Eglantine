@@ -1660,6 +1660,7 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
         auto slot = slot_buffer_downloads.insert(new_buffer_download);
         const PendingDownload new_download{false, uncommitted_async_buffers.size(), slot};
         uncommitted_downloads.emplace_back(new_download);
+        nx2_flush_hint.store(true, std::memory_order_relaxed);
         auto download_map = runtime.DownloadStagingBuffer(size, true);
         uncommitted_async_buffers.emplace_back(download_map);
         std::array buffers{
@@ -3714,6 +3715,7 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id) 
             False(slot_images[old_view.image_id].flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
             const PendingDownload new_download{true, 0, old_view.image_id};
             uncommitted_downloads.emplace_back(new_download);
+            nx2_flush_hint.store(true, std::memory_order_relaxed);
         }
     }
     *old_id = new_id;

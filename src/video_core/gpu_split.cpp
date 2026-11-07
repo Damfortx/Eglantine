@@ -7,6 +7,7 @@
 #include <string>
 #include <fmt/format.h>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 
 #ifdef _MSC_VER
@@ -28,6 +29,46 @@
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+
+namespace Tegra {
+bool Nx2AltOn() {
+    static std::atomic<bool> state{true};
+    static std::once_flag started;
+    std::call_once(started, [] {
+        LOG_INFO(HW_GPU, "Nx2 alt: on");
+        std::thread([] {
+            const char* text = std::getenv("EDEN_NX2_ALT_SECONDS");
+            const auto period = std::chrono::milliseconds{
+                text != nullptr ? std::max(1000LL, static_cast<long long>(std::atof(text) * 1000))
+                                : 30'000LL};
+            u64 draws = g_nx2_draws.load(), busy = g_nx2_back_busy_ns.load(),
+                presents = g_nx2_presents.load();
+            auto begin = std::chrono::steady_clock::now();
+            for (;;) {
+                std::this_thread::sleep_for(period);
+                const bool was = state.load(std::memory_order_relaxed);
+                state.store(!was, std::memory_order_relaxed);
+                const auto now = std::chrono::steady_clock::now();
+                const double seconds = std::chrono::duration<double>(now - begin).count();
+                const u64 d = g_nx2_draws.load() - draws, b = g_nx2_back_busy_ns.load() - busy,
+                          p = g_nx2_presents.load() - presents;
+                LOG_INFO(HW_GPU,
+                         "Nx2 alt window {}: {:.1f} fps, {:.0f} draws/s, back busy {:.0f} ms/s, "
+                         "{:.3f} us/draw",
+                         was ? "on" : "off", static_cast<double>(p) / seconds,
+                         static_cast<double>(d) / seconds, static_cast<double>(b) / 1e6 / seconds,
+                         d != 0 ? static_cast<double>(b) / 1e3 / static_cast<double>(d) : 0.0);
+                LOG_INFO(HW_GPU, "Nx2 alt: {}", !was ? "on" : "off");
+                draws += d;
+                busy += b;
+                presents += p;
+                begin = now;
+            }
+        }).detach();
+    });
+    return state.load(std::memory_order_relaxed);
+}
+} // namespace Tegra
 
 namespace VideoCommon {
 
@@ -499,6 +540,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         }
         u64 last_store = read_position;
         g_back_busy.store(true, std::memory_order_relaxed);
+        const auto busy_begin = std::chrono::steady_clock::now();
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size = Execute(&ring[index]);
@@ -518,6 +560,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         g_back_busy.store(false, std::memory_order_release);
+        Tegra::g_nx2_back_busy_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - busy_begin)
+                                 .count()),
+            std::memory_order_relaxed);
         StoreConsumed(read_position);
     }
     back_running.store(false, std::memory_order_seq_cst);

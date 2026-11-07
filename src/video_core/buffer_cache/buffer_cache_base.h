@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <array>
 #include <bit>
@@ -310,6 +311,13 @@ public:
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
+    /// False only if no download was queued since a commit that left none (no lock needed).
+    [[nodiscard]] bool MayHaveUncommittedFlushes() const noexcept {
+        return nx2_flush_hint.load(std::memory_order_relaxed);
+    }
+    /// Under the lock, after a commit: whether downloads are still queued.
+    void UpdateFlushHint() noexcept;
+
     void AccumulateFlushes();
 
     /// Return true when the caller should wait for async downloads
@@ -565,6 +573,9 @@ private:
 
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
+    /// Set (by the GPU thread) whenever downloads are queued for the next fence; cleared once a
+    /// commit leaves none. Fences check it before taking the contended cache lock.
+    std::atomic<bool> nx2_flush_hint{true};
 
     /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
     /// otherwise only when something flushes them (as upstream yuzu below High GPU accuracy).
@@ -600,6 +611,7 @@ private:
     /// the rest of the write keeps its read traps.
     void QueueFenceDownload(DAddr device_addr, u64 size) {
         if (AsyncBufferDownloads()) {
+            nx2_flush_hint.store(true, std::memory_order_relaxed);
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
         }
@@ -609,6 +621,7 @@ private:
         }
         if (!Tegra::g_nx2_preflush_pages_only.load(std::memory_order_relaxed)) {
             if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+                nx2_flush_hint.store(true, std::memory_order_relaxed);
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
             } else {
                 ArmReadTraps(device_addr, size);
@@ -620,6 +633,7 @@ private:
             const DAddr lower = (std::max<DAddr>)(begin, device_addr);
             const DAddr upper = (std::min<DAddr>)(begin + length, device_addr + size);
             if (lower < upper) {
+                nx2_flush_hint.store(true, std::memory_order_relaxed);
                 uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
                 whole |= lower == device_addr && upper == device_addr + size;
             }

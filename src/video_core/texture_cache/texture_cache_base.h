@@ -311,6 +311,15 @@ public:
     /// Whether CommitAsyncFlushes would commit anything (downloads or their buffers).
     [[nodiscard]] bool HasAsyncFlushWork() const noexcept;
 
+    [[nodiscard]] bool MayHaveUncommittedFlushes() const noexcept {
+        return nx2_flush_hint.load(std::memory_order_relaxed);
+    }
+    void UpdateFlushHint() noexcept {
+        if (!HasAsyncFlushWork()) {
+            nx2_flush_hint.store(false, std::memory_order_relaxed);
+        }
+    }
+
     /// Return true when the caller should wait for async downloads
     [[nodiscard]] bool ShouldWaitAsyncFlushes() const noexcept;
 
@@ -578,6 +587,8 @@ private:
     // TODO: This data structure is not optimal and it should be reworked
 
     std::vector<PendingDownload> uncommitted_downloads;
+    /// As BufferCache::nx2_flush_hint: downloads queued since a commit that left none.
+    std::atomic<bool> nx2_flush_hint{true};
     std::deque<std::vector<PendingDownload>> committed_downloads;
     std::vector<AsyncBuffer> uncommitted_async_buffers;
     std::deque<std::vector<AsyncBuffer>> async_buffers;

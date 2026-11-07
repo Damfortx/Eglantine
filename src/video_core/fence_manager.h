@@ -22,6 +22,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#include "video_core/nx2.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
@@ -344,22 +345,31 @@ private:
     /// with work, instead of holding both while it copies (the GPU thread's draws and uploads
     /// waited for it).
     CacheFlushes CommitCacheFlushes() {
+        // Downloads are queued by this (the GPU) thread: a cache that queued none since a commit
+        // left it empty has nothing to commit. Title 1 signals ~10,000 fences a second (one per
+        // QMD release), nearly all with nothing to download, and both locks are contended by
+        // the fencing thread and CPU write traps: ~4% of the split's back thread.
+        // EDEN_NX2_FLUSH_HINT=0 always locks.
+        static const char hint_mode = Tegra::Nx2EnvMode("EDEN_NX2_FLUSH_HINT");
+        const bool use_hint = Tegra::Nx2Switch(hint_mode, true);
         CacheFlushes flushes{};
-        {
+        if (!use_hint || texture_cache.MayHaveUncommittedFlushes()) {
             std::scoped_lock lock{texture_cache.mutex};
             flushes.should_flush = texture_cache.HasUncommittedFlushes();
             if (texture_cache.HasAsyncFlushWork()) {
                 texture_cache.CommitAsyncFlushes();
                 flushes.committed |= TextureFlushes;
             }
+            texture_cache.UpdateFlushHint();
         }
-        {
+        if (!use_hint || buffer_cache.MayHaveUncommittedFlushes()) {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
                 buffer_cache.CommitAsyncFlushes();
                 flushes.should_flush = true;
                 flushes.committed |= BufferFlushes;
             }
+            buffer_cache.UpdateFlushHint();
         }
         return flushes;
     }
