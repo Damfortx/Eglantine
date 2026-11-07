@@ -142,13 +142,18 @@ public:
     /// A scheduler with its own table (the split GPU thread's front mirrors the back's to learn
     /// which releases a launch makes, without touching the real QMD state).
     /// Starts from the shared table as it is now (the caller makes sure no one schedules).
+    /// One table for every channel's front, as the back's (shared_states): a QMD one channel
+    /// schedules is decremented by another, and with a table per channel the front's mirrors ran
+    /// 167 of title 1's ~16,000 QMDs a second. The fronts all run on the one front thread.
     void UsePrivateTable() {
-        private_states = std::make_unique<std::unordered_map<Address, State>>(shared_states);
-        table = private_states.get();
+        if (!front_states) {
+            front_states = std::make_unique<std::unordered_map<Address, State>>(shared_states);
+        }
+        table = front_states.get();
     }
 
 private:
-    std::unique_ptr<std::unordered_map<Address, State>> private_states;
+    static inline std::unique_ptr<std::unordered_map<Address, State>> front_states;
     std::unordered_map<Address, State>* table = &shared_states;
 };
 } // namespace Tegra

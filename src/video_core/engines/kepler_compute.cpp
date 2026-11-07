@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <map>
+#include <cstring>
+#include <string>
 #include <atomic>
 #include <bit>
 #include <bitset>
@@ -364,6 +367,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             },
             [&](u64 address, u32 payload, u32 flags) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
+                Tegra::Nx2NoteQmdReleaseTarget(address, (flags & (1U << 26)) ? 1 : (flags & (1U << 19)) ? 2 : 0);
+                if (static const bool stats = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr; stats) {
+                    static u64 back_adds{};
+                    if ((flags & (1U << 26)) && (++back_adds % 5000) == 0) {
+                        LOG_INFO(HW_GPU, "Back QMD add release #{} at {:#x} (+{}), qmd {:#x}",
+                                 back_adds, address, payload, qmd_address);
+                    }
+                }
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload] {
                         const u32 value = memory_manager.Read<u32>(address) + payload;
@@ -1147,8 +1158,45 @@ struct KeplerCompute::FrontState {
 
 // QMD launches as the back will run them (ProcessNativeMethod), on the mirror's own table: the
 // releases of the QMDs that run at once are recorded for acquires on the front. Plain releases
-// write their payload, max releases leave at least it; add releases are left out. Inline QMDs
-// (written by the back from registers) are not seen here and so never predicted.
+// write their payload, max releases leave at least it; add releases are counted
+// (GpuSplit::NoteAddRelease). Inline QMDs (method 0x107: the back writes the descriptor from
+// registers, then launches it) are mirrored from the registers: title 1 runs ~16,000 a second,
+// and with them left out the mirror ran 167 of its QMDs and none of the add releases its
+// acquires wait for.
+namespace {
+struct InlineQmd {
+    Tegra::NativeQmdScheduler::Descriptor descriptor;
+    u64 position; ///< Ring position of the write: memory has it once the back is past it
+};
+std::unordered_map<GPUVAddr, InlineQmd>& InlineQmdShadow() {
+    static std::unordered_map<GPUVAddr, InlineQmd> shadow;
+    return shadow;
+}
+} // Anonymous namespace
+
+void KeplerCompute::FrontMirrorInlineQmd(FrontState& fs) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MIRROR_INLINE_QMD");
+    if (!split.PredictAcquires() || !split.Active() || !Tegra::Nx2Switch(mode, true)) {
+        return;
+    }
+    const GPUVAddr address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+    auto& shadow = InlineQmdShadow();
+    if (shadow.size() > 8192) {
+        shadow.clear();
+    }
+    InlineQmd& entry = shadow[address];
+    std::memcpy(entry.descriptor.data(), fs.registers.data() + 0xc8, sizeof(entry.descriptor));
+    entry.position = split.SentPosition();
+    split.NotePendingWrite(address, sizeof(entry.descriptor));
+    if ((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12))) {
+        const u32 previous = fs.registers[0xad];
+        fs.registers[0xad] = static_cast<u32>(address >> 8);
+        FrontMirrorQmd(fs, 0xb0, 3);
+        fs.registers[0xad] = previous;
+    }
+}
+
 void KeplerCompute::FrontMirrorQmd(FrontState& fs, u32 method, u32 argument) {
     auto& split = VideoCommon::GpuSplit::Get();
     if (!split.PredictAcquires() || !split.Active()) {
@@ -1159,9 +1207,23 @@ void KeplerCompute::FrontMirrorQmd(FrontState& fs, u32 method, u32 argument) {
         return;
     }
     const GPUVAddr qmd_address = GPUVAddr{fs.registers[0xad]} << 8;
-    static_cast<void>(fs.qmd_mirror.Signal(
+    static const bool stats = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr;
+    static std::map<std::string, u64> mirror_events;
+    if (stats && !fs.qmd_mirror.trace) {
+        fs.qmd_mirror.trace = [](std::string_view event, u64, s32) { ++mirror_events[std::string{event}]; };
+    }
+    const auto mirror_error = (fs.qmd_mirror.Signal(
         qmd_address, argument,
         [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
+            // An inline QMD the back may not have written yet: as the registers held it.
+            auto& shadow = InlineQmdShadow();
+            if (const auto it = shadow.find(address); it != shadow.end()) {
+                if (split.ConsumedPosition() <= it->second.position) {
+                    descriptor = it->second.descriptor;
+                    return true;
+                }
+                shadow.erase(it);
+            }
             if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
             memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
             return true;
@@ -1169,10 +1231,28 @@ void KeplerCompute::FrontMirrorQmd(FrontState& fs, u32 method, u32 argument) {
         [&](u64 address, u32 payload, u32 flags) {
             if ((flags & (1U << 26)) == 0) {
                 split.NoteRelease(address, payload, (flags & (1U << 19)) != 0);
+            } else {
+                // Title 1 waits with GEQ acquires on counters QMD add releases raise: ~1,800
+                // drains a second until these were predicted (GpuSplit::PendingAddSum).
+                split.NoteAddRelease(address, payload);
             }
+            split.NotePendingWrite(address, 4);
             return true;
         },
         [](const auto&) { return true; }));
+    if (stats) {
+        static u64 calls{}, errors{};
+        ++calls;
+        errors += mirror_error.empty() ? 0 : 1;
+        if ((calls % 20000) == 0 || (!mirror_error.empty() && errors < 8)) {
+            std::string events;
+            for (const auto& [name, count] : mirror_events) {
+                events += fmt::format(" {}={}", name, count);
+            }
+            LOG_INFO(HW_GPU, "Front QMD mirror: {} signals, {} errors (last: {});{}", calls, errors,
+                     mirror_error, events);
+        }
+    }
 }
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1202,6 +1282,9 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
     fs.registers[method] = argument;
     if (method >= 0xae && method <= 0xb0) [[unlikely]] {
         FrontMirrorQmd(fs, method, argument);
+    }
+    if (method == 0x107) [[unlikely]] {
+        FrontMirrorInlineQmd(fs);
     }
     switch (method) {
     case 0x45:

@@ -4,10 +4,15 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <vector>
 #include <cstdlib>
 #include <optional>
 
+#include <map>
+#include <tuple>
+#include <string>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -89,7 +94,82 @@ bool MetInMemory(DmaPusher& dma_pusher, GPUVAddr address, u32 value, bool wrappi
         return false;
     }
     const u32 current = dma_pusher.memory_manager.Read<u32>(address);
-    return wrapping ? static_cast<s32>(current - value) >= 0 : current >= value;
+    if (wrapping ? static_cast<s32>(current - value) >= 0 : current >= value) {
+        return true;
+    }
+    // Counters QMD add releases raise: what memory holds plus the adds still queued (read after
+    // memory, so an add run in between is left out rather than counted twice).
+    static const char adds_mode = Tegra::Nx2EnvMode("EDEN_NX2_PREDICT_ADDS");
+    if (!Tegra::Nx2Switch(adds_mode, true)) {
+        return false;
+    }
+    const u64 pending = split.PendingAddSum(address);
+    if (pending == 0 || pending > 0xffffffffULL) {
+        return false;
+    }
+    const u32 predicted = current + static_cast<u32>(pending);
+    const bool met = wrapping ? static_cast<s32>(predicted - value) >= 0
+                              : u64{current} + pending >= value;
+    // EDEN_NX2_VERIFY_ADDS: drain anyway and check that the back's value meets it too.
+    static const bool verify = std::getenv("EDEN_NX2_VERIFY_ADDS") != nullptr;
+    if (verify && met) [[unlikely]] {
+        DrainBack();
+        dma_pusher.rasterizer->ReleaseFences();
+        const u32 actual = ReadSemaphoreWord(dma_pusher, address);
+        const bool actual_met =
+            wrapping ? static_cast<s32>(actual - value) >= 0 : actual >= value;
+        static u64 checks{}, wrong{};
+        ++checks;
+        wrong += actual_met ? 0 : 1;
+        if (!actual_met || (checks % 20000) == 0) {
+            LOG_INFO(HW_GPU, "Add prediction check {}: {:#x} wants {:#x}, predicted {:#x} "
+                     "(memory {:#x} + {}), back {:#x}; {} wrong so far",
+                     checks, address, value, predicted, current, pending, actual, wrong);
+        }
+    }
+    return met;
+}
+
+
+// EDEN_NX2_ACQUIRE_STATS: why acquires still drain the back (site, operation, whether a release
+// the front sent targets the address, whether memory met it before and after the drain).
+void NoteAcquireDrain(DmaPusher& dma_pusher, int site, u32 op, GPUVAddr address, u32 value,
+                      bool after_met) {
+    static const bool stats = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr;
+    if (!stats) {
+        return;
+    }
+    static std::map<std::tuple<int, u32, bool, bool>, u64> counts;
+    static auto window = std::chrono::steady_clock::now();
+    const bool pending = VideoCommon::GpuSplit::Get().HasPendingRelease(address);
+    ++counts[{site, op * 10 + Tegra::Nx2QmdReleaseKind(address), pending, after_met}];
+    static std::map<GPUVAddr, u64> addresses;
+    ++addresses[address & ~GPUVAddr{0xf}];
+    if (addresses.size() > 4096) {
+        addresses.clear();
+    }
+    (void)dma_pusher;
+    (void)value;
+    if (std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
+        std::string line;
+        for (const auto& [key, count] : counts) {
+            line += fmt::format(" | site {} op {} {} {}: {}", std::get<0>(key), std::get<1>(key),
+                                std::get<2>(key) ? "pending" : "none",
+                                std::get<3>(key) ? "met" : "unmet", count);
+        }
+        std::vector<std::pair<u64, GPUVAddr>> top;
+        for (const auto& [a, c] : addresses) {
+            top.emplace_back(c, a);
+        }
+        std::sort(top.rbegin(), top.rend());
+        for (size_t i = 0; i < std::min<size_t>(6, top.size()); ++i) {
+            line += fmt::format(" | addr {:#x}: {}", top[i].second, top[i].first);
+        }
+        addresses.clear();
+        LOG_INFO(HW_GPU, "Acquire drains in 10 s:{}", line);
+        counts.clear();
+        window = std::chrono::steady_clock::now();
+    }
 }
 
 } // Anonymous namespace
@@ -310,8 +390,26 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VideoCommon::GpuSplit::Get().NotePredictedAcquire();
             return;
         }
+        const bool had_pending =
+            VideoCommon::GpuSplit::Get().HasPendingRelease(acquire.address);
+        static const bool acquire_stats = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr;
+        if (acquire_stats) [[unlikely]] {
+            const u32 before = dma_pusher.memory_manager.Read<u32>(acquire.address);
+            const u64 adds = VideoCommon::GpuSplit::Get().PendingAddSum(acquire.address);
+            static u32 logged{};
+            if ((logged++ % 3000) == 2999) {
+                LOG_INFO(HW_GPU, "Acquire drain: {:#x} wants >= {:#x}, memory {:#x}, queued adds {} "
+                         "(adds noted so far {}, last at {:#x})",
+                         acquire.address, acquire.value, before, adds,
+                         VideoCommon::GpuSplit::Get().noted_adds,
+                         VideoCommon::GpuSplit::Get().last_add_address);
+            }
+        }
         DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        const bool met_now = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
+        NoteAcquireDrain(dma_pusher, had_pending ? 1 : 2, static_cast<u32>(op), acquire.address,
+                         acquire.value, met_now);
+        if (met_now) {
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
@@ -416,9 +514,17 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         VideoCommon::GpuSplit::Get().NotePredictedAcquire();
         return;
     }
+    const bool had_pending = VideoCommon::GpuSplit::Get().HasPendingRelease(address);
     DrainBack();
     dma_pusher.rasterizer->ReleaseFences();
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+    NoteAcquireDrain(dma_pusher, had_pending ? 3 : 4, 100 + operation, address, payload,
+                     operation == 0   ? word == payload
+                     : operation == 2 ? word >= payload
+                     : operation == 3 ? static_cast<s32>(word - payload) >= 0
+                     : operation == 4 ? (word & payload) != 0
+                     : operation == 5 ? (word & payload) == 0
+                                      : true);
     const bool ready = operation == 0   ? word == payload
                        : operation == 2 ? word >= payload
                        : operation == 3 ? static_cast<s32>(word - payload) >= 0

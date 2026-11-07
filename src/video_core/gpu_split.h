@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <unordered_map>
 #include <optional>
 #include <atomic>
@@ -217,6 +218,52 @@ public:
         return false;
     }
 
+    /// Ring positions: what the front has sent so far, and what the back has run.
+    [[nodiscard]] u64 SentPosition() {
+        FlushState();
+        return write_position;
+    }
+    [[nodiscard]] u64 ConsumedPosition() const {
+        return consumed.load(std::memory_order_acquire);
+    }
+
+    /// A QMD release that adds `payload` to the word at `address` was just sent to the back.
+    u64 noted_adds{}; ///< EDEN_NX2_ACQUIRE_STATS
+    GPUVAddr last_add_address{};
+    void NoteAddRelease(GPUVAddr address, u32 payload) {
+        ++noted_adds;
+        last_add_address = address;
+        if (PredictAcquires()) {
+            FlushState();
+            auto& adds = pending_adds[address];
+            if (adds.size() < 4096) {
+                adds.push_back({write_position, payload});
+            }
+        }
+    }
+    /// What the add releases sent to the back but not yet run there will add at `address`
+    /// (the back runs them in order, a fence that writes them at once: memory has the others).
+    /// Read memory before calling: an add run in between is then missed, never counted twice.
+    [[nodiscard]] u64 PendingAddSum(GPUVAddr address) {
+        const auto it = pending_adds.find(address);
+        if (it == pending_adds.end()) {
+            return 0;
+        }
+        const u64 done = consumed.load(std::memory_order_acquire);
+        auto& adds = it->second;
+        while (!adds.empty() && adds.front().position < done) {
+            adds.pop_front();
+        }
+        u64 sum = 0;
+        for (const auto& add : adds) {
+            sum += add.payload;
+        }
+        if (adds.empty()) {
+            pending_adds.erase(it);
+        }
+        return sum;
+    }
+
     /// Whether a release the front sent may still be on its way to `address`.
     [[nodiscard]] bool HasPendingRelease(GPUVAddr address) {
         const auto it = pending_releases.find(address);
@@ -332,6 +379,11 @@ private:
         bool at_least;
     };
     std::unordered_map<GPUVAddr, PendingRelease> pending_releases;
+    struct PendingAdd {
+        u64 position;
+        u32 payload;
+    };
+    std::unordered_map<GPUVAddr, std::deque<PendingAdd>> pending_adds;
     u64 predicted_acquires{};
 
     // Front side: the state block being gathered (StateWrite).

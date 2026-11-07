@@ -17,6 +17,17 @@
 
 namespace Tegra {
 
+/// EDEN_NX2_ACQUIRE_STATS: addresses QMD releases wrote, by kind (lossy hash table).
+inline std::array<std::atomic<u64>, 4096> g_nx2_qmd_release_targets{};
+inline void Nx2NoteQmdReleaseTarget(u64 address, u32 kind) {
+    g_nx2_qmd_release_targets[(address >> 2) % 4096].store((address & ~u64{3}) | kind,
+                                                          std::memory_order_relaxed);
+}
+[[nodiscard]] inline u32 Nx2QmdReleaseKind(u64 address) {
+    const u64 entry = g_nx2_qmd_release_targets[(address >> 2) % 4096].load(std::memory_order_relaxed);
+    return (entry & ~u64{3}) == (address & ~u64{3}) ? static_cast<u32>(entry & 3) + 1 : 0;
+}
+
 /// Cheap counters for A/B windows (Nx2AltOn logs them at each switch): draws recorded and time
 /// the split's back thread spent running work (not waiting for the front).
 inline std::atomic<u64> g_nx2_draws{};
