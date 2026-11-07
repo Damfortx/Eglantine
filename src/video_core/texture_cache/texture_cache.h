@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -18,6 +19,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
@@ -1979,6 +1981,17 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             ImageInfo layer_info = image.info;
             layer_info.resources.layers = 1;
             const size_t layer_size = CalculateUnswizzledSizeBytes(layer_info);
+            const auto upload_begin = std::chrono::steady_clock::now();
+            SCOPE_EXIT {
+                // EDEN_NX2_LAYER_TIMING: refreshes of layered images that took over 10 ms.
+                static const bool timing = std::getenv("EDEN_NX2_LAYER_TIMING") != nullptr;
+                const auto took = std::chrono::steady_clock::now() - upload_begin;
+                if (timing && took > std::chrono::milliseconds{10}) {
+                    LOG_INFO(HW_GPU, "Layer refresh of {} layers ({} KiB each) took {} ms",
+                             layers.size(), image.info.layer_stride >> 10,
+                             std::chrono::duration_cast<std::chrono::milliseconds>(took).count());
+                }
+            };
             auto staging = runtime.UploadStagingBuffer(layer_size * layers.size());
             std::vector<BufferImageCopy> copies;
             std::vector<boost::container::small_vector<BufferImageCopy, 16>> per_layer(layers.size());
@@ -1995,8 +2008,28 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             // layered sparse images as the GPU writes them, ~4% of the split's back thread).
             // EDEN_NX2_PARALLEL_UNSWIZZLE=0 runs them in order here.
             static const char parallel_mode = Tegra::Nx2EnvMode("EDEN_NX2_PARALLEL_UNSWIZZLE");
-            if (layers.size() >= 2 && Tegra::Nx2Switch(parallel_mode, true)) {
-                static Common::ThreadWorker pool{4, "Unswizzle"};
+            static Common::ThreadWorker pool{4, "Unswizzle"};
+            const u64 stride = image.info.layer_stride;
+            if (layers.size() == 1 && stride >= (u64{8} << 20) &&
+                Tegra::Nx2Switch(parallel_mode, true)) {
+                // One big layer (title 1 refreshes 87 MiB layers of an 8192x8192 array, a ~100 ms
+                // hitch each): most of the time went to copying it out of guest memory, which is
+                // split between the helper threads and this one.
+                const GPUVAddr layer_addr = image.gpu_addr + u64{layers[0]} * stride;
+                swizzle_data_buffer.resize_destructive(stride);
+                u8* const data = swizzle_data_buffer.data();
+                const u64 chunk = Common::AlignUp(Common::DivCeil(stride, u64{4}), u64{4096});
+                for (u64 offset = chunk; offset < stride; offset += chunk) {
+                    pool.QueueWork([this, layer_addr, data, offset, size = (std::min)(chunk, stride - offset)] {
+                        gpu_memory->ReadBlockUnsafe(layer_addr + offset, data + offset, size);
+                    });
+                }
+                gpu_memory->ReadBlockUnsafe(layer_addr, data, (std::min)(chunk, stride));
+                pool.WaitForRequests();
+                per_layer[0] = UnswizzleImage(*gpu_memory, layer_addr, layer_info,
+                                              std::span<const u8>(data, stride),
+                                              staging.mapped_span.subspan(0, layer_size));
+            } else if (layers.size() >= 2 && Tegra::Nx2Switch(parallel_mode, true)) {
                 for (size_t i = 1; i < layers.size(); ++i) {
                     pool.QueueWork([&unswizzle, i] {
                         thread_local Common::ScratchBuffer<u8> buffer;
