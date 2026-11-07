@@ -8,11 +8,18 @@
 #include <cmath>
 #include <cstring>
 #include <span>
+#include <vector>
+#include <atomic>
+#include <cstdlib>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
+#include "common/thread_worker.h"
+#include "video_core/gpu_split.h"
+#include "video_core/nx2.h"
 #include "video_core/gpu.h"
 #include "video_core/textures/decoders.h"
 
@@ -63,11 +70,11 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     const u32 block_depth_mask = (1U << block_depth) - 1;
     const u32 x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
 
-    for (u32 slice = 0; slice < depth; ++slice) {
+    const auto lines = [&](u32 slice, u32 first_line, u32 end_line) {
         const u32 z = slice + origin_z;
         const u32 offset_z = (z >> block_depth) * slice_size +
                              ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
-        for (u32 line = 0; line < height; ++line) {
+        for (u32 line = first_line; line < end_line; ++line) {
             const u32 y = line + origin_y;
             const u32 swizzled_y = pdep<SWIZZLE_Y_BITS>(y);
 
@@ -93,6 +100,38 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
                 std::memcpy(dst, src, BYTES_PER_PIXEL);
             }
         }
+    };
+    // Lines write disjoint parts of the output: a big 2D image on the split's back thread is done
+    // in four bands, three on helper threads (title 1 refreshes 8192x8192 layers, ~70 ms each on
+    // one thread). EDEN_NX2_PARALLEL_SWIZZLE=0 does it in order.
+    static const char parallel_mode = Tegra::Nx2EnvMode("EDEN_NX2_PARALLEL_SWIZZLE");
+    if (depth == 1 && height >= 1024 && VideoCommon::GpuSplit::OnBackThread() &&
+        Tegra::Nx2Switch(parallel_mode, true)) {
+        static Common::ThreadWorker pool{3, "Swizzle"};
+        const u32 band = Common::AlignUp(Common::DivCeil(height, 4U), 64U);
+        for (u32 first = band; first < height; first += band) {
+            pool.QueueWork([&lines, first, end = (std::min)(first + band, height)] {
+                lines(0, first, end);
+            });
+        }
+        lines(0, 0, (std::min)(band, height));
+        pool.WaitForRequests();
+        // EDEN_NX2_SWIZZLE_VERIFY: redo it in order into a copy and compare (debug aid).
+        static const bool verify = std::getenv("EDEN_NX2_SWIZZLE_VERIFY") != nullptr;
+        if (verify) [[unlikely]] {
+            std::vector<u8> parallel(output.begin(), output.end());
+            lines(0, 0, height);
+            static std::atomic<u32> checks{}, mismatches{};
+            const bool same = std::memcmp(parallel.data(), output.data(), output.size()) == 0;
+            mismatches += same ? 0 : 1;
+            LOG_INFO(HW_GPU, "Parallel swizzle check {}: {} ({}x{} bpp {}), {} mismatches so far",
+                     ++checks, same ? "same" : "DIFFERENT", width, height, BYTES_PER_PIXEL,
+                     mismatches.load());
+        }
+        return;
+    }
+    for (u32 slice = 0; slice < depth; ++slice) {
+        lines(slice, 0, height);
     }
 }
 
