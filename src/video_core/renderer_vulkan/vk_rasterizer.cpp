@@ -1538,8 +1538,27 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }();
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.
-    bool uploaded;
-    {
+    // InlineMemory uploads only into buffer data the GPU wrote, which the pages GPU writes are
+    // marked for (Nx2MarkGpuWritten, never cleared): on other pages it changes nothing. Title 1
+    // makes ~100,000 inline writes a second; the buffer cache lock (contended by the fencing
+    // thread and CPU write traps) and the range tree walk were ~10% of the split's back thread.
+    // EDEN_NX2_INLINE_FAST=0 always takes the lock (for comparisons).
+    static const bool inline_fast = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_FAST");
+        return value == nullptr || value[0] != '0';
+    }();
+    bool gpu_written = !inline_fast || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    if (!gpu_written) {
+        const u64 last = (*cpu_addr + copy_size + Core::DEVICE_PAGESIZE - 1) & ~u64{Core::DEVICE_PAGEMASK};
+        for (u64 page = *cpu_addr & ~u64{Core::DEVICE_PAGEMASK}; page < last;
+             page += u64{1} << Tegra::Nx2WrittenPageBits) {
+            gpu_written |= Tegra::Nx2IsGpuWritten(page);
+        }
+    }
+    bool uploaded = false;
+    if (!gpu_written && defer) {
+        buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+    } else {
         std::scoped_lock lock{buffer_cache.mutex};
         // Guest memory has the words now: a command list copy of the page no longer does.
         buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
