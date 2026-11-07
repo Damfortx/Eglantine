@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -488,6 +489,36 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
+    // EDEN_NX2_MEMO_STATS: how often a draw reads the same texture handles as this pipeline's
+    // previous draw, and the draw before it used this pipeline too.
+    static const bool memo_stats = std::getenv("EDEN_NX2_MEMO_STATS") != nullptr;
+    if (memo_stats) [[unlikely]] {
+        u64 hash = 0xcbf29ce484222325ULL;
+        for (const auto& view : views) {
+            hash = (hash ^ view.index) * 0x100000001b3ULL;
+        }
+        for (const auto sampler : samplers) {
+            hash = (hash ^ sampler.index) * 0x100000001b3ULL;
+        }
+        static const GraphicsPipeline* last_pipeline{};
+        static u64 draws{}, same_handles{}, same_consecutive{}, no_images{};
+        static auto window = std::chrono::steady_clock::now();
+        ++draws;
+        no_images += views.empty() ? 1 : 0;
+        if (hash == memo_last_handles) {
+            ++same_handles;
+            same_consecutive += last_pipeline == this ? 1 : 0;
+        }
+        memo_last_handles = hash;
+        last_pipeline = this;
+        if (std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
+            LOG_INFO(Render_Vulkan, "Handle reuse: {} draws, {} with the pipeline's previous "
+                     "handles ({} right after it), {} without images",
+                     draws, same_handles, same_consecutive, no_images);
+            draws = same_handles = same_consecutive = no_images = 0;
+            window = std::chrono::steady_clock::now();
+        }
+    }
     {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,

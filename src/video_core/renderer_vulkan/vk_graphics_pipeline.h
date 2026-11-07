@@ -188,6 +188,7 @@ private:
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
     size_t num_image_elements{};
+    u64 memo_last_handles{}; ///< EDEN_NX2_MEMO_STATS
     u32 num_textures{};
     bool fragment_has_color0_output{};
 

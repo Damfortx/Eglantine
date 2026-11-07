@@ -1981,15 +1981,37 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
             const size_t layer_size = CalculateUnswizzledSizeBytes(layer_info);
             auto staging = runtime.UploadStagingBuffer(layer_size * layers.size());
             std::vector<BufferImageCopy> copies;
-            for (size_t i = 0; i < layers.size(); ++i) {
+            std::vector<boost::container::small_vector<BufferImageCopy, 16>> per_layer(layers.size());
+            const auto unswizzle = [&](size_t i, Common::ScratchBuffer<u8>& buffer) {
                 const GPUVAddr layer_addr = image.gpu_addr + u64{layers[i]} * image.info.layer_stride;
                 Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
-                    swizzle_data(*gpu_memory, layer_addr, image.info.layer_stride,
-                                 &swizzle_data_buffer);
-                auto layer_copies =
+                    swizzle_data(*gpu_memory, layer_addr, image.info.layer_stride, &buffer);
+                per_layer[i] =
                     UnswizzleImage(*gpu_memory, layer_addr, layer_info, swizzle_data,
                                    staging.mapped_span.subspan(i * layer_size, layer_size));
-                for (BufferImageCopy copy : layer_copies) {
+            };
+            // Each layer unswizzles into its own part of the staging buffer: the layers after the
+            // first run on helper threads while this one does the first (title 1 refreshes
+            // layered sparse images as the GPU writes them, ~4% of the split's back thread).
+            // EDEN_NX2_PARALLEL_UNSWIZZLE=0 runs them in order here.
+            static const char parallel_mode = Tegra::Nx2EnvMode("EDEN_NX2_PARALLEL_UNSWIZZLE");
+            if (layers.size() >= 2 && Tegra::Nx2Switch(parallel_mode, true)) {
+                static Common::ThreadWorker pool{4, "Unswizzle"};
+                for (size_t i = 1; i < layers.size(); ++i) {
+                    pool.QueueWork([&unswizzle, i] {
+                        thread_local Common::ScratchBuffer<u8> buffer;
+                        unswizzle(i, buffer);
+                    });
+                }
+                unswizzle(0, swizzle_data_buffer);
+                pool.WaitForRequests();
+            } else {
+                for (size_t i = 0; i < layers.size(); ++i) {
+                    unswizzle(i, swizzle_data_buffer);
+                }
+            }
+            for (size_t i = 0; i < layers.size(); ++i) {
+                for (BufferImageCopy copy : per_layer[i]) {
                     copy.buffer_offset += i * layer_size;
                     copy.image_subresource.base_layer = static_cast<s32>(layers[i]);
                     copies.push_back(copy);
