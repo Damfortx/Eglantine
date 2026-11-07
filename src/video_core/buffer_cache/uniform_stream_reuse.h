@@ -11,6 +11,7 @@
 #include <span>
 #include <type_traits>
 
+#include "video_core/nx2.h"
 #include "common/common_types.h"
 
 namespace VideoCommon {
@@ -97,8 +98,16 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
-    u8* const scratch = reuse.scratch.data();
-    device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+    // Compared and copied straight from guest memory when it is contiguous there: the copy into
+    // scratch was a quarter of the bytes moved for every uniform buffer of every draw.
+    // EDEN_NX2_UNIFORM_DIRECT=0 always copies into scratch first (=a alternates).
+    static const char direct_mode = Tegra::Nx2EnvMode("EDEN_NX2_UNIFORM_DIRECT");
+    const u8* scratch =
+        Tegra::Nx2Switch(direct_mode, true) ? device_memory.GetSpan(device_addr, size) : nullptr;
+    if (scratch == nullptr) {
+        device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
+        scratch = reuse.scratch.data();
+    }
 
     const bool same_bytes =
         slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
@@ -106,15 +115,16 @@ template <class Runtime, class DeviceMemory>
         runtime.RebindStreamUniform(slot.ref, size);
         return true;
     }
-    const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-    std::memcpy(span.data(), scratch, size);
-    slot.ref = runtime.LastStreamUniformRef();
-    // After the allocation: the tick the stream region is tagged with is the one current now.
-    slot.tick = runtime.CurrentTick();
+    // The slot's copy is what gets uploaded: guest memory may change between the reads.
     if (!same_bytes) {
         slot.size = size;
         std::memcpy(slot.bytes.data(), scratch, size);
     }
+    const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+    std::memcpy(span.data(), slot.bytes.data(), size);
+    slot.ref = runtime.LastStreamUniformRef();
+    // After the allocation: the tick the stream region is tagged with is the one current now.
+    slot.tick = runtime.CurrentTick();
     return true;
 }
 
