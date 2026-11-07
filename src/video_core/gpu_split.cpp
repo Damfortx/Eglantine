@@ -145,13 +145,15 @@ void GpuSplit::MaybeStart(Core::System& system_) {
 }
 
 bool GpuSplit::PredictAcquires() {
-    // EDEN_NX2_PREDICT_ACQUIRE=1 turns it on. Off by default: in title 1's attract demo the
-    // front ran no faster with it (~52 fps without, ~48-50 with it).
-    static const bool enabled = [] {
+    // On for title 1 (with g_nx2_skip_known_writer_waits): with the writer waits gone its attract
+    // demo ran 53-57 fps with it, 50-53 without (vsync off). Measured with the writer waits it ran
+    // no faster: they held the front instead. EDEN_NX2_PREDICT_ACQUIRE=1 or 0 forces it.
+    static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_PREDICT_ACQUIRE");
-        return value != nullptr && value[0] == '1';
+        return value != nullptr ? value[0] : 'd';
     }();
-    return enabled;
+    return mode == '1' ||
+           (mode == 'd' && Tegra::g_nx2_skip_known_writer_waits.load(std::memory_order_relaxed));
 }
 
 void GpuSplit::Stop() {
@@ -305,6 +307,9 @@ void GpuSplit::Drain(DrainReason reason) {
             window_start = now;
         }
     }
+    // Everything sent so far has run once this returns: so have the writes it noted.
+    pending_write_count = 0;
+    pending_write_overflow = false;
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;

@@ -358,6 +358,8 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
                 : keep[0] == '0' ? Keep::None
                 : keep[0] == '2' ? Keep::Inline
                                  : Keep::Download;
+            Tegra::g_nx2_skip_known_writer_waits =
+                system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId;
         }
         ApplyNx2Characteristics(params.gc);
         params.gpu_characteristics_buf_size = Nx2CharacteristicsSize;

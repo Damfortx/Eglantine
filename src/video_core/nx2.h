@@ -28,6 +28,9 @@ inline std::atomic<bool> g_nx2_ampere{false};
 /// (EDEN_NX2_KEEP_PAGE_GPU_DATA=0/1/2 forces it, =alt switches 1 and 0).
 enum class Nx2KeepPageGpuData : u32 { None, Download, Inline };
 inline std::atomic<Nx2KeepPageGpuData> g_nx2_keep_page_gpu_data{Nx2KeepPageGpuData::Download};
+/// Whether command lists on pages already read as CPU command lists skip the wait for queued GPU
+/// writers (DmaPusher::IsKnownCpuCommandList). On for title 1, which never runs GPU-written lists.
+inline std::atomic<bool> g_nx2_skip_known_writer_waits{false};
 /// Measurement only (EDEN_NX2_PREFLUSH_DOWNLOADS=alt): when false, GPU writes to ranges the CPU
 /// has read are not copied back at fences (the CPU may then read stale data).
 inline std::atomic<bool> g_nx2_preflush_downloads{true};

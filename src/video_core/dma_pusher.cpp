@@ -28,6 +28,28 @@
 
 namespace Tegra {
 
+namespace {
+// EDEN_NX2_DUMP_GPU_LISTS=<file>: appends every command list read from GPU-written pages
+// (u64 address, u32 word count, u32 path, words) to find which words the GPU fills in.
+void DumpGpuWrittenList(u64 address, std::span<const Tegra::CommandHeader> commands, u32 path) {
+    static std::FILE* const file = [] {
+        const char* name = std::getenv("EDEN_NX2_DUMP_GPU_LISTS");
+        return name != nullptr ? std::fopen(name, "wb") : nullptr;
+    }();
+    static u64 written{};
+    if (file == nullptr || written > (u64{512} << 20)) {
+        return;
+    }
+    const u32 size = static_cast<u32>(commands.size());
+    std::fwrite(&address, sizeof(address), 1, file);
+    std::fwrite(&size, sizeof(size), 1, file);
+    std::fwrite(&path, sizeof(path), 1, file);
+    std::fwrite(commands.data(), sizeof(u32), size, file);
+    written += 16 + u64{size} * 4;
+}
+} // namespace
+
+
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
 
@@ -228,6 +250,7 @@ bool DmaPusher::Step() {
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
+            DumpGpuWrittenList(header.addr, commands, 1);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
@@ -235,6 +258,9 @@ bool DmaPusher::Step() {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
+            if (gpu_written) {
+                DumpGpuWrittenList(header.addr, commands, 2);
+            }
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         }
@@ -466,7 +492,9 @@ void DmaPusher::CallMethod(u32 argument) {
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+                            engine_type == Engines::EngineTypes::MaxwellDMA ||
+                            engine_type == Engines::EngineTypes::KeplerMemory ||
+                            engine_type == Engines::EngineTypes::Fermi2D;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
@@ -527,7 +555,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+                            engine_type == Engines::EngineTypes::MaxwellDMA ||
+                            engine_type == Engines::EngineTypes::KeplerMemory ||
+                            engine_type == Engines::EngineTypes::Fermi2D;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
@@ -578,6 +608,7 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
     }
 }
 
+
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
         return false;
@@ -593,16 +624,18 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
 
 // Every entry not on GPU-written pages waited for the compute and copy work queued before it, in
 // case that work writes the entry's pages for the first time (Fast Fusion's culling lists). Title
-// 1 waited ~6,000 times a second and never found GPU-written words. With EDEN_NX2_WRITER_WAIT=0
-// pages already read as CPU command lists after such a wait skip it (=alt switches every 20 s).
-// EDEN_NX2_WRITER_WAIT=1 always waits. On its own it did not change the draw rate (semaphore
-// acquires held the front instead); with acquires predicted (gpu_split.h) it is the next wait.
+// 1 waited ~6,000 times a second and never found GPU-written words: each wait left the back with
+// nothing queued while the front caught up, so the two threads took turns. Pages already read as
+// CPU command lists after such a wait skip it: title 1's attract demo went from 33-50 fps to
+// 56-59 (vsync off). Default for title 1 only (g_nx2_skip_known_writer_waits);
+// EDEN_NX2_WRITER_WAIT=0 skips for every title, =1 always waits, =a switches every 20 s.
 bool DmaPusher::IsKnownCpuCommandList(GPUVAddr address, size_t size) {
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_WRITER_WAIT");
-        return value != nullptr ? value[0] : '1';
+        return value != nullptr ? value[0] : 'd';
     }();
-    if (mode == '1') {
+    if (mode == '1' ||
+        (mode == 'd' && !Tegra::g_nx2_skip_known_writer_waits.load(std::memory_order_relaxed))) {
         return false;
     }
     if (mode == 'a') {

@@ -185,6 +185,41 @@ public:
         u32 value;
         bool at_least; ///< The release leaves at least `value` (a max release): only >= acquires
     };
+    /// Guest memory a method sent to the back writes when it runs (inline uploads, reports): a
+    /// front read of it must drain first. Cleared by Drain. Copy and compute engines are noted as
+    /// writers instead (NoteWriter), their ranges aren't known here.
+    void NotePendingWrite(GPUVAddr address, u64 size) {
+        if (pending_write_count == pending_writes.size()) {
+            pending_write_overflow = true;
+            return;
+        }
+        pending_writes[pending_write_count++] = {address, address + size};
+    }
+    /// A range nothing sent may still write without a drain or the writers' wait first.
+    [[nodiscard]] bool OverlapsPendingWrite(GPUVAddr address, u64 size) const {
+        if (pending_write_overflow) {
+            return true;
+        }
+        for (size_t i = 0; i < pending_write_count; ++i) {
+            if (address < pending_writes[i].second && pending_writes[i].first < address + size) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether a release the front sent may still be on its way to `address`.
+    [[nodiscard]] bool HasPendingRelease(GPUVAddr address) {
+        const auto it = pending_releases.find(address);
+        if (it == pending_releases.end()) {
+            return false;
+        }
+        if (write_position - it->second.position > RingWords) {
+            pending_releases.erase(it);
+            return false;
+        }
+        return true;
+    }
     std::optional<Prediction> PredictedRelease(GPUVAddr address, u32 current) {
         const auto it = pending_releases.find(address);
         if (it == pending_releases.end()) {
@@ -273,6 +308,9 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    std::array<std::pair<GPUVAddr, GPUVAddr>, 256> pending_writes{};
+    size_t pending_write_count{};
+    bool pending_write_overflow{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

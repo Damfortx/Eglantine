@@ -63,6 +63,8 @@ void DrainBack() {
 void NoteRelease(GPUVAddr address, u32 payload) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         split.NoteRelease(address, payload);
+        // Up to 16 bytes (with the timestamp) once the back runs it (front DMA reads).
+        split.NotePendingWrite(address, 16);
     }
 }
 
@@ -74,6 +76,20 @@ std::optional<VideoCommon::GpuSplit::Prediction> PredictedRelease(DmaPusher& dma
         return std::nullopt;
     }
     return split.PredictedRelease(address, dma_pusher.memory_manager.Read<u32>(address));
+}
+
+
+// An acquire that waits for at least a value (GEQUAL, or SEM_EXECUTE's wrapping >=) is met by
+// what memory holds now if no release the front sent to the back targets the address: releases
+// only raise these counters, so anything still queued can't undo it. Title 1 drained the back
+// for ~9,000 acquires a second, most of them already met (the front waited half its time).
+bool MetInMemory(DmaPusher& dma_pusher, GPUVAddr address, u32 value, bool wrapping) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || !split.PredictAcquires() || split.HasPendingRelease(address)) {
+        return false;
+    }
+    const u32 current = dma_pusher.memory_manager.Read<u32>(address);
+    return wrapping ? static_cast<s32>(current - value) >= 0 : current >= value;
 }
 
 } // Anonymous namespace
@@ -93,6 +109,11 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
+        return true;
+    }
+    if (pending_acquire->operation == static_cast<u32>(GpuSemaphoreOperation::AcquireGequal) &&
+        MetInMemory(dma_pusher, pending_acquire->address, pending_acquire->value, false)) {
+        VideoCommon::GpuSplit::Get().NotePredictedAcquire();
         return true;
     }
     if (const auto predicted = PredictedRelease(dma_pusher, pending_acquire->address);
@@ -278,6 +299,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (op == GpuSemaphoreOperation::AcquireGequal &&
+            MetInMemory(dma_pusher, acquire.address, acquire.value, false)) {
+            VideoCommon::GpuSplit::Get().NotePredictedAcquire();
+            return;
+        }
         if (const auto predicted = PredictedRelease(dma_pusher, acquire.address);
             predicted && (!predicted->at_least || op == GpuSemaphoreOperation::AcquireGequal) &&
             acquire.Matches(predicted->value)) {
@@ -375,6 +401,10 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    if ((operation == 2 || operation == 3) && MetInMemory(dma_pusher, address, payload, operation == 3)) {
+        VideoCommon::GpuSplit::Get().NotePredictedAcquire();
+        return;
+    }
     if (const auto predicted = PredictedRelease(dma_pusher, address);
         predicted && (!predicted->at_least || operation == 2) &&
         (operation == 0   ? predicted->value == payload
