@@ -8,7 +8,9 @@
 
 #include <unordered_map>
 
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -677,6 +679,17 @@ public:
     [[nodiscard]] VkImageView StorageView(Shader::TextureType texture_type,
                                           Shader::ImageFormat image_format);
 
+    /// StorageView without creating anything (any thread): VK_NULL_HANDLE when the image has
+    /// no handle (StorageView's result too) or when that view was not created yet.
+    [[nodiscard]] VkImageView TryStorageView(Shader::TextureType texture_type,
+                                             Shader::ImageFormat image_format) const noexcept {
+        if (!image_handle) {
+            return VK_NULL_HANDLE;
+        }
+        return published_storage.handles[StorageViewIndex(texture_type, image_format)].load(
+            std::memory_order_acquire);
+    }
+
     [[nodiscard]] bool IsRescaled() const noexcept;
 
     [[nodiscard]] VkImageView Handle(Shader::TextureType texture_type) const noexcept {
@@ -729,6 +742,34 @@ private:
         std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> unsigneds;
     };
 
+    /// The storage views StorageView created, published for TryStorageView: typeless at 0,
+    /// unsigned at 1 + type, signed at 1 + NUM_TEXTURE_TYPES + type.
+    struct PublishedStorage {
+        static constexpr size_t Count = 2 * Shader::NUM_TEXTURE_TYPES + 1;
+        std::array<std::atomic<VkImageView>, Count> handles{};
+        PublishedStorage() = default;
+        PublishedStorage(PublishedStorage&& other) noexcept {
+            *this = std::move(other);
+        }
+        PublishedStorage& operator=(PublishedStorage&& other) noexcept {
+            for (size_t i = 0; i < Count; ++i) {
+                handles[i].store(other.handles[i].load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+            }
+            return *this;
+        }
+    };
+
+    [[nodiscard]] static size_t StorageViewIndex(Shader::TextureType texture_type,
+                                                 Shader::ImageFormat image_format) noexcept {
+        if (image_format == Shader::ImageFormat::Typeless) {
+            return 0;
+        }
+        const bool is_signed = image_format == Shader::ImageFormat::R8_SINT ||
+                               image_format == Shader::ImageFormat::R16_SINT;
+        return 1 + (is_signed ? Shader::NUM_TEXTURE_TYPES : 0) + static_cast<size_t>(texture_type);
+    }
+
     [[nodiscard]] vk::ImageView MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,
                                          std::optional<Shader::TextureType> texture_type = std::nullopt);
 
@@ -738,6 +779,7 @@ private:
     std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
     std::optional<StorageViews> storage_views;
     vk::ImageView typeless_storage_view;
+    PublishedStorage published_storage;
     vk::ImageView depth_view;
     vk::ImageView stencil_view;
     vk::ImageView color_view;
@@ -787,6 +829,9 @@ public:
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
 
+    /// HandleFor without creating a variant (any thread): VK_NULL_HANDLE when it is missing.
+    [[nodiscard]] VkSampler TryHandleFor(const ImageView& image_view, bool is_depth) const noexcept;
+
 private:
     struct VariantKey {
         bool reduce_anisotropy;
@@ -809,13 +854,22 @@ private:
     };
 
     static constexpr size_t MAX_VARIANTS = 32;
+    /// Room past MAX_VARIANTS for the reduced keys HandleFor uses once it is reached (the
+    /// variants never move: readers scan them without a lock).
+    static constexpr size_t VARIANT_CAPACITY = 64;
 
     [[nodiscard]] VariantKey MakeKey(const ImageView& image_view, bool is_depth) const noexcept;
     [[nodiscard]] VkSampler Find(const VariantKey& key) const noexcept;
     VkSampler Emplace(VariantKey key);
 
+    [[nodiscard]] VariantKey ReducedKey(VariantKey key) const noexcept;
+
     CustomBorderColorBudget custom_border_color_budget;
-    std::vector<Variant> variants;
+    /// Published by num_variants (release); written only under variant_mutex.
+    std::array<Variant, VARIANT_CAPACITY> variants;
+    std::atomic<u32> num_variants{0};
+    /// Serializes Emplace across all samplers (and the budget it charges).
+    static inline std::mutex variant_mutex;
 
     const Device* device_ptr{nullptr};
     VkSamplerCreateInfo base_ci{};

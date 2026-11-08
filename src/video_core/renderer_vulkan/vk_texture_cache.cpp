@@ -4116,6 +4116,7 @@ VkImageView ImageView::StorageView(Shader::TextureType texture_type,
             if (!typeless_storage_view) {
                 auto info = MaxwellToVK::SurfaceFormat(*device, FormatType::Optimal, true, format);
                 typeless_storage_view = MakeView(info.format, VK_IMAGE_ASPECT_COLOR_BIT, texture_type);
+                published_storage.handles[0].store(*typeless_storage_view, std::memory_order_release);
             }
             return *typeless_storage_view;
         }
@@ -4125,8 +4126,11 @@ VkImageView ImageView::StorageView(Shader::TextureType texture_type,
             storage_views.emplace();
         auto& views{is_signed ? storage_views->signeds : storage_views->unsigneds};
         auto& view{views[size_t(texture_type)]};
-        if (!view)
+        if (!view) {
             view = MakeView(Format(image_format), VK_IMAGE_ASPECT_COLOR_BIT, texture_type);
+            published_storage.handles[StorageViewIndex(texture_type, image_format)].store(
+                *view, std::memory_order_release);
+        }
         return *view;
     }
     return VK_NULL_HANDLE;
@@ -4291,7 +4295,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
         .borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT,
         .unnormalizedCoordinates = VK_FALSE,
     };
-    variants.reserve(1);
+    std::scoped_lock lock{variant_mutex};
     Emplace(VariantKey{});
 }
 
@@ -4310,14 +4314,28 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
 }
 
 VkSampler Sampler::Find(const VariantKey& key) const noexcept {
-    const auto it = std::ranges::find(variants, key, &Variant::key);
-    if (it == variants.end()) {
-        return VK_NULL_HANDLE;
+    const u32 count = num_variants.load(std::memory_order_acquire);
+    for (u32 i = 0; i < count; ++i) {
+        if (variants[i].key == key) {
+            return *variants[i].sampler;
+        }
     }
-    return *it->sampler;
+    return VK_NULL_HANDLE;
+}
+
+Sampler::VariantKey Sampler::ReducedKey(VariantKey key) const noexcept {
+    if (num_variants.load(std::memory_order_acquire) >= MAX_VARIANTS) {
+        key.srgb_border = false;
+        key.swizzle = {};
+    }
+    return key;
 }
 
 VkSampler Sampler::Emplace(VariantKey key) {
+    // Caller holds variant_mutex.
+    if (const VkSampler existing = Find(key); existing != VK_NULL_HANDLE) {
+        return existing;
+    }
     bool custom_border = has_custom_border_colors && !key.drop_custom_border;
     if (custom_border && !custom_border_color_budget.TryAcquire(*device_ptr, 1)) {
         static bool warned_budget = false;
@@ -4379,23 +4397,28 @@ VkSampler Sampler::Emplace(VariantKey key) {
     if (!custom_border) {
         create_info.borderColor = ConvertBorderColor(color);
     }
-    variants.push_back(Variant{
+    const u32 count = num_variants.load(std::memory_order_relaxed);
+    if (count == VARIANT_CAPACITY) {
+        return *variants[0].sampler;
+    }
+    variants[count] = Variant{
         .key = key,
         .sampler = device_ptr->GetLogical().CreateSampler(create_info),
-    });
-    return *variants.back().sampler;
+    };
+    num_variants.store(count + 1, std::memory_order_release);
+    return *variants[count].sampler;
 }
 
 VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
-    VariantKey key = MakeKey(image_view, is_depth);
-    if (variants.size() >= MAX_VARIANTS) {
-        key.srgb_border = false;
-        key.swizzle = {};
-    }
-    if (const VkSampler existing = Find(key); existing != VK_NULL_HANDLE) {
+    if (const VkSampler existing = TryHandleFor(image_view, is_depth); existing != VK_NULL_HANDLE) {
         return existing;
     }
-    return Emplace(key);
+    std::scoped_lock lock{variant_mutex};
+    return Emplace(ReducedKey(MakeKey(image_view, is_depth)));
+}
+
+VkSampler Sampler::TryHandleFor(const ImageView& image_view, bool is_depth) const noexcept {
+    return Find(ReducedKey(MakeKey(image_view, is_depth)));
 }
 
 Framebuffer::Framebuffer(TextureCacheRuntime& runtime, std::span<ImageView*, NUM_RT> color_buffers,

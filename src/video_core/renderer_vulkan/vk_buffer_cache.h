@@ -271,14 +271,21 @@ public:
         return max_dynamic_storage_buffers;
     }
 
-private:
-    void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
+    /// The descriptor entry of a uniform/storage buffer bind, into any payload sink (the guest
+    /// descriptor queue, or a resolver's arena: they must not drift apart).
+    template <typename Sink>
+    static void MakeBufferDescriptor(Sink& sink, const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
         if (handle == VK_NULL_HANDLE) {
-            guest_descriptor_queue.AddBuffer(handle, 0, 0, VK_WHOLE_SIZE);
+            sink.AddBuffer(handle, 0, 0, VK_WHOLE_SIZE);
         } else {
-            guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset, size);
+            sink.AddBuffer(handle, buffer.DeviceAddress(), offset, size);
         }
+    }
+
+private:
+    void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
+        MakeBufferDescriptor(guest_descriptor_queue, buffer, offset, size);
     }
 
     VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;

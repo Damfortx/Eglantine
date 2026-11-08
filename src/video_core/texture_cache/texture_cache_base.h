@@ -402,6 +402,15 @@ public:
     /// `manager` (nullptr detaches). Only while no other thread uses the cache.
     void MtSetEpochManager(MT::EpochManager* manager);
 
+    /// The null view (slot 0, never erased), from any thread.
+    [[nodiscard]] const ImageView& NullImageViewObject() const noexcept {
+        return slot_image_views.UncheckedAt(NULL_IMAGE_VIEW_ID);
+    }
+
+    /// Held by every writer of slot_samplers, the channels' samplers and samplers_mt (the
+    /// committer's FindSampler and resolvers creating samplers).
+    std::mutex sampler_create_mutex;
+
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 

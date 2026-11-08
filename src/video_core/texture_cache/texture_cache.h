@@ -3137,6 +3137,8 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
     if (std::ranges::all_of(config.raw, [](u64 value) { return value == 0; })) {
         return NULL_SAMPLER_ID;
     }
+    // Resolver threads create samplers too (CreateSamplerFromResolver).
+    std::scoped_lock lock{sampler_create_mutex};
     const auto [pair, is_new] = channel_state->samplers.try_emplace(config);
     if (is_new) {
         pair->second = slot_samplers.insert(runtime, config);
