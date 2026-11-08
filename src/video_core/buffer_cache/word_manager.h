@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2.h"
 
 namespace VideoCommon {
 
@@ -308,6 +309,11 @@ struct WordManager {
     void CollectChangedRanges(bool add_to_tracker, u64 word_index, u64 current_bits, u64 new_bits, std::vector<std::pair<VAddr, u64>>& out_ranges) const {
         u64 changed_bits = (add_to_tracker ? current_bits : ~current_bits) & new_bits;
         VAddr addr = cpu_addr + word_index * BYTES_PER_WORD;
+        // Every caller changes the untracked bits of this word right after, in the same critical
+        // section, and a newly tracked page's upload copy runs after this: the bitmap leads both.
+        if (changed_bits != 0 && Tegra::Nx2BufferTrackedPagesOn()) {
+            Tegra::Nx2NoteBufferTrackedWord(addr, changed_bits, add_to_tracker);
+        }
         IteratePages(changed_bits, [&](size_t offset, size_t size) {
             out_ranges.emplace_back(addr + offset * BYTES_PER_PAGE, size * BYTES_PER_PAGE);
         });
@@ -332,6 +338,14 @@ struct WordManager {
             }
         }
         coalesced.emplace_back(cur_addr, cur_size);
+        // A CPU write trap (EDEN_NX2_CPUWRITE_FAST) drops the protection after the lock.
+        if (delta < 0 && Tegra::t_nx2_deferred_uncache != nullptr) {
+            for (const auto& [range_addr, range_size] : coalesced) {
+                (void)Tegra::Nx2TryDeferUncache(range_addr, range_size);
+            }
+            ranges.clear();
+            return;
+        }
         // Use batch API to reduce lock acquisitions and contention.
         tracker->UpdatePagesCachedBatch(coalesced, delta);
         ranges.clear();

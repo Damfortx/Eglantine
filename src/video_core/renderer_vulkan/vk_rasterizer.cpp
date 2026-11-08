@@ -1355,6 +1355,52 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    // EDEN_NX2_CPUWRITE_FAST: guest CPU threads (~800 contended traps a second each in title 1)
+    // held the cache locks the back needs for every draw through the work below, mprotect
+    // included. On by default ('0' off, 'a' alternates; the tracked-page bitmap is kept for both).
+    static const char fast_mode = Tegra::Nx2EnvMode("EDEN_NX2_CPUWRITE_FAST");
+    if (Tegra::Nx2BufferTrackedPagesOn() && Tegra::Nx2Switch(fast_mode, true)) {
+        // 1. The buffer cache can only act on this write if it protects one of the pages, if the
+        //    GPU ever wrote one (it may be GPU-modified: the write is collected, return true) or
+        //    if one holds a command list (its host writes are counted). Otherwise its answer is
+        //    "false, nothing to do" (the CPU-modified state that made it stop protecting the page
+        //    is already set), the same as when no other cache keeps the page trapped and the
+        //    write never reaches here. Checked without the lock: see Nx2NoteBufferTrackedWord for
+        //    why a stale 0 is a write that ran before the tracking, as if it had taken the lock
+        //    first.
+        // 2. The caches append the protection they drop instead of doing it (an mprotect and a
+        //    TLB shootdown under the lock); it is applied once both locks are released. Until
+        //    then the pages only trap more writes, which step 1 lets through.
+        thread_local std::vector<std::pair<u64, std::size_t>> uncache;
+        uncache.clear();
+        const auto apply_uncache = [this] {
+            for (const auto& [range_addr, range_size] : uncache) {
+                device_memory.UpdatePagesCachedCount(range_addr, range_size, -1);
+            }
+            uncache.clear();
+        };
+        if (MayHoldGpuBufferData(addr, size) || Tegra::Nx2MayBufferTrack(addr, size) ||
+            Tegra::Nx2AnyCommandListPage(addr, size)) {
+            bool gpu_modified;
+            {
+                Tegra::Nx2DeferUncache defer{uncache};
+                std::scoped_lock lock{buffer_cache.mutex};
+                gpu_modified = buffer_cache.OnCPUWrite(addr, size);
+            }
+            if (gpu_modified) {
+                apply_uncache();
+                return true;
+            }
+        }
+        if (MayHoldTexture(addr, size)) {
+            Tegra::Nx2DeferUncache defer{uncache};
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_cache.WriteMemory(addr, size);
+        }
+        apply_uncache();
+        pipeline_cache.InvalidateRegion(addr, size);
+        return false;
+    }
     {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.OnCPUWrite(addr, size)) {

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -213,6 +214,121 @@ inline void Nx2MarkTexturePages(u64 device_address, u64 size) {
         page += count;
     }
     return false;
+}
+// EDEN_NX2_CPUWRITE_FAST (on by default, '0' off, 'a' alternates): guest CPU writes to cached pages
+// (RasterizerVulkan::OnCPUWrite) took the buffer cache lock even when the buffer cache does not
+// protect the page (it is trapped for an image or a shader, e.g. layered/sparse images, which
+// stay tracked through CPU writes), and held both cache locks through the mprotect (and the TLB
+// shootdown) that drops a page's protection, ~9 us of the split's back waiting per hit.
+//
+// Device pages the buffer cache currently protects (its untracked bit clear), same layout as
+// g_nx2_gpu_written_pages. Written only under the buffer cache lock, by WordManager: set as a page
+// starts being tracked (before its upload copy reads guest memory), cleared as it stops (in the
+// same critical section that marks it CPU-modified). Kept unless the switch is '0'.
+inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64>
+    g_nx2_buffer_tracked_pages{};
+
+[[nodiscard]] inline bool Nx2BufferTrackedPagesOn() {
+    static const bool on = [] {
+        const char mode = Nx2EnvMode("EDEN_NX2_CPUWRITE_FAST");
+        return mode != '0';
+    }();
+    return on;
+}
+
+/// WordManager: the 64 pages of a word starting at @p device_address (64-page aligned) in @p bits
+/// start (@p tracked) or stop being protected by the buffer cache.
+inline void Nx2NoteBufferTrackedWord(u64 device_address, u64 bits, bool tracked) {
+    const u64 page = device_address >> Nx2WrittenPageBits;
+    if (bits == 0 || page / 64 >= g_nx2_buffer_tracked_pages.size()) {
+        return;
+    }
+    auto& word = g_nx2_buffer_tracked_pages[page / 64];
+    if (page % 64 != 0) [[unlikely]] {
+        // Not word aligned (regions are 4 MiB aligned, so never): stay conservative.
+        word.store(~u64{0}, std::memory_order_seq_cst);
+        if (page / 64 + 1 < g_nx2_buffer_tracked_pages.size()) {
+            g_nx2_buffer_tracked_pages[page / 64 + 1].store(~u64{0}, std::memory_order_seq_cst);
+        }
+        return;
+    }
+    if (tracked) {
+        word.fetch_or(bits, std::memory_order_seq_cst);
+    } else {
+        word.fetch_and(~bits, std::memory_order_seq_cst);
+    }
+}
+
+/// Whether the buffer cache may protect any page of the range (conservatively true outside the
+/// bitmap).
+[[nodiscard]] inline bool Nx2MayBufferTrack(u64 device_address, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 limit = g_nx2_buffer_tracked_pages.size() * 64;
+    const u64 first = device_address >> Nx2WrittenPageBits;
+    const u64 last = (device_address + size - 1) >> Nx2WrittenPageBits;
+    if (last >= limit || last < first) {
+        return true;
+    }
+    for (u64 page = first; page <= last;) {
+        const u64 shift = page % 64;
+        const u64 count = std::min<u64>(64 - shift, last - page + 1);
+        const u64 mask = (count == 64 ? ~u64{0} : ((u64{1} << count) - 1)) << shift;
+        if (g_nx2_buffer_tracked_pages[page / 64].load(std::memory_order_seq_cst) & mask) {
+            return true;
+        }
+        page += count;
+    }
+    return false;
+}
+
+/// Whether any page of the range holds a command list the front read (BufferCache counts the
+/// host writes to those, Nx2NoteListHostWrite).
+[[nodiscard]] inline bool Nx2AnyCommandListPage(u64 device_address, u64 size) {
+    if (size == 0 || !g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const u64 end = device_address + size;
+    for (u64 page = device_address & ~((u64{1} << Nx2WrittenPageBits) - 1); page < end;
+         page += u64{1} << Nx2WrittenPageBits) {
+        if (Nx2IsCommandListPage(page)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// While set on a thread, the caches append the ranges whose cached count they drop (a page
+/// they stop protecting) here instead of applying them: the owner applies them with
+/// DeviceMemoryManager::UpdatePagesCachedCount(-1) after releasing the cache lock, so the
+/// mprotect is not done under it. Ranges may overlap (buffer and image on one page): apply each.
+inline thread_local std::vector<std::pair<u64, std::size_t>>* t_nx2_deferred_uncache = nullptr;
+
+class Nx2DeferUncache {
+public:
+    explicit Nx2DeferUncache(std::vector<std::pair<u64, std::size_t>>& sink)
+        : previous{t_nx2_deferred_uncache} {
+        t_nx2_deferred_uncache = &sink;
+    }
+    ~Nx2DeferUncache() {
+        t_nx2_deferred_uncache = previous;
+    }
+    Nx2DeferUncache(const Nx2DeferUncache&) = delete;
+    Nx2DeferUncache& operator=(const Nx2DeferUncache&) = delete;
+
+private:
+    std::vector<std::pair<u64, std::size_t>>* previous;
+};
+
+/// A cache drops its count of [device_address, +size): true when it was deferred.
+[[nodiscard]] inline bool Nx2TryDeferUncache(u64 device_address, std::size_t size) {
+    auto* const sink = t_nx2_deferred_uncache;
+    if (sink == nullptr) {
+        return false;
+    }
+    sink->emplace_back(device_address, size);
+    return true;
 }
 
 // NVN2 queues release their progress values into the second page of a two-page GPU-accessible

@@ -3516,8 +3516,10 @@ template <class P>
 void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
     ASSERT(True(image.flags & ImageFlagBits::Tracked));
     image.flags &= ~ImageFlagBits::Tracked;
+    // A CPU write trap (EDEN_NX2_CPUWRITE_FAST) drops the protection after the lock.
     if (False(image.flags & ImageFlagBits::Sparse)) {
-        if (image.cpu_addr < ~(1ULL << 40)) {
+        if (image.cpu_addr < ~(1ULL << 40) &&
+            !Tegra::Nx2TryDeferUncache(image.cpu_addr, image.guest_size_bytes)) {
             device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, -1);
         }
         return;
@@ -3530,7 +3532,9 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
         const auto& map = slot_map_views[map_view_id];
         const DAddr cpu_addr = map.cpu_addr;
         const std::size_t size = map.size;
-        device_memory.UpdatePagesCachedCount(cpu_addr, size, -1);
+        if (!Tegra::Nx2TryDeferUncache(cpu_addr, size)) {
+            device_memory.UpdatePagesCachedCount(cpu_addr, size, -1);
+        }
     }
 }
 
