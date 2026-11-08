@@ -856,7 +856,7 @@ private:
     static constexpr size_t MAX_VARIANTS = 32;
     /// Room past MAX_VARIANTS for the reduced keys HandleFor uses once it is reached (the
     /// variants never move: readers scan them without a lock).
-    static constexpr size_t VARIANT_CAPACITY = 64;
+    static constexpr size_t VARIANT_CAPACITY = 48;
 
     [[nodiscard]] VariantKey MakeKey(const ImageView& image_view, bool is_depth) const noexcept;
     [[nodiscard]] VkSampler Find(const VariantKey& key) const noexcept;
