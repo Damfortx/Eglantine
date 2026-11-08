@@ -278,7 +278,7 @@ inline void Nx2MarkPages(Nx2PageBitmap& bitmap, u64 device_address, u64 size) {
     return Nx2Switch(mode, false);
 }
 
-// EDEN_NX2_CPUWRITE_FAST (on by default, '0' off, 'a' alternates): guest CPU writes to cached pages
+// EDEN_NX2_CPUWRITE_FAST (off by default: randomized A/B -0.6 +/- 4.1 fps; '1' on, 'a' alternates): guest CPU writes to cached pages
 // (RasterizerVulkan::OnCPUWrite) took the buffer cache lock even when the buffer cache does not
 // protect the page (it is trapped for an image or a shader, e.g. layered/sparse images, which
 // stay tracked through CPU writes), and held both cache locks through the mprotect (and the TLB
@@ -287,14 +287,14 @@ inline void Nx2MarkPages(Nx2PageBitmap& bitmap, u64 device_address, u64 size) {
 // Device pages the buffer cache currently protects (its untracked bit clear), same layout as
 // g_nx2_gpu_written_pages. Written only under the buffer cache lock, by WordManager: set as a page
 // starts being tracked (before its upload copy reads guest memory), cleared as it stops (in the
-// same critical section that marks it CPU-modified). Kept unless the switch is '0'.
+// same critical section that marks it CPU-modified). Kept while the switch is '1' or 'a'.
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64>
     g_nx2_buffer_tracked_pages{};
 
 [[nodiscard]] inline bool Nx2BufferTrackedPagesOn() {
     static const bool on = [] {
         const char mode = Nx2EnvMode("EDEN_NX2_CPUWRITE_FAST");
-        return mode != '0';
+        return mode == '1' || mode == 'a';
     }();
     return on;
 }

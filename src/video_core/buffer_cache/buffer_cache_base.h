@@ -753,6 +753,21 @@ private:
         u32 size = 0;
         BufferId buffer_id{};
     } index_buffer_memo{};
+    /// Vertex stream memo (EDEN_NX2_VERTEX_MEMO): direct mapped on the stream's GPU start. The
+    /// (start, end) range resolved to (device_addr, size, buffer_id) under one odd layout
+    /// generation of one memory manager and one buffer deletion epoch.
+    struct VertexBufferMemo {
+        u64 gpu_memory_id = ~u64{0};
+        u64 generation = 0;
+        u64 epoch = 0;
+        GPUVAddr gpu_begin = 0;
+        GPUVAddr gpu_end = 0;
+        DAddr device_addr = 0;
+        u32 size = 0;
+        BufferId buffer_id{};
+    };
+    static constexpr size_t VERTEX_MEMO_ENTRIES = 1024;
+    std::array<VertexBufferMemo, VERTEX_MEMO_ENTRIES> vertex_buffer_memo{};
 #ifdef YUZU_LEGACY
     bool immediately_free = false;
 #endif

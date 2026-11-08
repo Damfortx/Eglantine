@@ -2789,8 +2789,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         constexpr size_t MaxScanBytes = 64_MiB;
         if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
             const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
+            // Off by default: randomized A/B -4.3 +/- 4.7 fps (the full copy may warm the cache
+            // for the upload that follows). EDEN_NX2_ASTC_SCAN_DIRECT=1 turns it on.
             static const char direct_mode = Tegra::Nx2EnvMode("EDEN_NX2_ASTC_SCAN_DIRECT");
-            const bool direct = Tegra::Nx2Switch(direct_mode, true);
+            const bool direct = Tegra::Nx2Switch(direct_mode, false);
             if (scan_bytes <= MaxScanBytes && direct) {
                 // Scan the guest bytes in place when they are contiguous; otherwise in chunks,
                 // stopping at the first block with alpha. Copying the whole image up front cost

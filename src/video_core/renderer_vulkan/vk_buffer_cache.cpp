@@ -755,6 +755,38 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     if (binding_count == 0) {
         return;
     }
+    // The lambda below holds a whole HostBindings (four 32-entry arrays) and 32 handles: ~1.3 KiB
+    // of the scheduler's 32 KiB chunk per vertex bind, i.e. a chunk handoff to the worker every
+    // ~20 draws in titles that change vertex streams per draw (MKW). Few bindings (the usual
+    // case) go in a fixed 4-entry record instead (~140 bytes), with the same arguments.
+    // EDEN_NX2_VB_COMPACT=0 turns it off (=a alternates).
+    static constexpr u32 COMPACT_BINDINGS = 4;
+    static const char compact_mode = Tegra::Nx2EnvMode("EDEN_NX2_VB_COMPACT");
+    if (binding_count <= COMPACT_BINDINGS && device.IsExtExtendedDynamicStateSupported() &&
+        Tegra::Nx2Switch(compact_mode, false)) {
+        struct Compact {
+            std::array<VkBuffer, COMPACT_BINDINGS> buffers;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> offsets;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> sizes;
+            std::array<VkDeviceSize, COMPACT_BINDINGS> strides;
+            u32 first;
+            u32 count;
+        } compact{};
+        compact.first = bindings.min_index;
+        compact.count = binding_count;
+        for (u32 i = 0; i < binding_count; ++i) {
+            compact.buffers[i] = buffer_handles[i];
+            compact.offsets[i] = bindings.offsets[i];
+            compact.sizes[i] = bindings.sizes[i];
+            compact.strides[i] = bindings.strides[i];
+        }
+        scheduler.Record([compact](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindVertexBuffers2EXT(compact.first, compact.count, compact.buffers.data(),
+                                         compact.offsets.data(), compact.sizes.data(),
+                                         compact.strides.data());
+        });
+        return;
+    }
     if (device.IsExtExtendedDynamicStateSupported()) {
         scheduler.Record([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindVertexBuffers2EXT(bindings_.min_index, binding_count, buffer_handles_.data(), bindings_.offsets.data(), bindings_.sizes.data(), bindings_.strides.data());

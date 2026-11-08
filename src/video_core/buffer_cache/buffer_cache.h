@@ -1615,12 +1615,12 @@ void BufferCache<P>::UpdateIndexBuffer() {
     // address of the start) and the buffer set (no deletion anywhere) hold, the buffer FindBuffer
     // returned for (start, memo.size) is the page_table entry at start and covers any smaller
     // size from the same start, so FindBuffer would return it again. Accurate GPU fences make
-    // FindBuffer synchronize writes, so the memo stays off there. On by default since title 1
-    // at 2x gained +6.4 and +4.0 fps (in-run A/B means; neutral before frames ahead).
-    // EDEN_NX2_INDEX_MEMO=0 turns it off (=a alternates).
+    // FindBuffer synchronize writes, so the memo stays off there. Off by default: the
+    // +6.4/+4.0 fps it seemed to give came from strict alternation; randomized A/B 0.0 +/- 4.5.
+    // EDEN_NX2_INDEX_MEMO=1 turns it on (=a alternates).
     static const char index_memo_mode = Tegra::Nx2EnvMode("EDEN_NX2_INDEX_MEMO");
     const bool use_memo =
-        Tegra::Nx2Switch(index_memo_mode, true) && !Settings::IsGPUFenceBehaviorAccurate();
+        Tegra::Nx2Switch(index_memo_mode, false) && !Settings::IsGPUFenceBehaviorAccurate();
     const u64 generation = use_memo ? gpu_memory->LayoutGeneration() : 0;
     IndexBufferMemo& memo = index_buffer_memo;
     if (use_memo && size != 0 && memo.buffer_id && memo.generation == generation &&
@@ -1689,6 +1689,36 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
     }
     const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
+
+    // MKW changes its vertex streams on nearly every draw, and each change paid a GPU page table
+    // translation, the range checks and a FindBuffer (page_table and Buffer loads, mostly cache
+    // misses) per stream. Everything after the register reads is a function of (start, end), the
+    // GPU page table (LayoutGeneration, read first, only odd values memoized) and the buffer set
+    // (FindBuffer returns the page_table entry covering the range; it only changes when a buffer
+    // is deleted, which bumps buffer_deletion_epoch, read after FindBuffer). Accurate GPU fences
+    // make FindBuffer wait on buffer writes, so the memo stays off there.
+    // EDEN_NX2_VERTEX_MEMO=0 turns it off (=a alternates).
+    static const char vertex_memo_mode = Tegra::Nx2EnvMode("EDEN_NX2_VERTEX_MEMO");
+    const bool use_memo = array.enable != 0 && Tegra::Nx2Switch(vertex_memo_mode, false) &&
+                          !Settings::IsGPUFenceBehaviorAccurate();
+    const u64 generation = use_memo ? gpu_memory->LayoutGeneration() : 0;
+    VertexBufferMemo* const memo =
+        use_memo ? &vertex_buffer_memo[((gpu_addr_begin >> 6) ^ (gpu_addr_begin >> 16)) %
+                                       VERTEX_MEMO_ENTRIES]
+                 : nullptr;
+    if (memo && memo->generation == generation && memo->epoch == buffer_deletion_epoch &&
+        memo->gpu_begin == gpu_addr_begin && memo->gpu_end == gpu_addr_end &&
+        memo->gpu_memory_id == gpu_memory->GetID()) {
+        const Binding binding{
+            .device_addr = memo->device_addr,
+            .size = memo->size,
+            .buffer_id = memo->buffer_id,
+        };
+        channel_state->vertex_buffers[index] = binding;
+        UpdateVertexBufferSlot(index, binding);
+        return;
+    }
+
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     u32 size = address_size; // TODO: Analyze stride and number of vertices
@@ -1708,6 +1738,20 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
     };
     channel_state->vertex_buffers[index] = binding;
     UpdateVertexBufferSlot(index, binding);
+    // NULL_BUFFER_ID is truthy (index 0); FindBuffer never returns a cleared (falsy) id, but a
+    // null or unstable result is simply not memoized.
+    if (memo && (generation & 1) != 0 && buffer_id && buffer_id != NULL_BUFFER_ID) {
+        *memo = VertexBufferMemo{
+            .gpu_memory_id = gpu_memory->GetID(),
+            .generation = generation,
+            .epoch = buffer_deletion_epoch,
+            .gpu_begin = gpu_addr_begin,
+            .gpu_end = gpu_addr_end,
+            .device_addr = *device_addr,
+            .size = size,
+            .buffer_id = buffer_id,
+        };
+    }
 }
 
 template <class P>

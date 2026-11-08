@@ -1372,9 +1372,9 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
     // EDEN_NX2_CPUWRITE_FAST: guest CPU threads (~800 contended traps a second each in title 1)
     // held the cache locks the back needs for every draw through the work below, mprotect
-    // included. On by default ('0' off, 'a' alternates; the tracked-page bitmap is kept for both).
+    // included. Off by default ('1' on, 'a' alternates; the tracked-page bitmap is kept for both).
     static const char fast_mode = Tegra::Nx2EnvMode("EDEN_NX2_CPUWRITE_FAST");
-    if (Tegra::Nx2BufferTrackedPagesOn() && Tegra::Nx2Switch(fast_mode, true)) {
+    if (Tegra::Nx2BufferTrackedPagesOn() && Tegra::Nx2Switch(fast_mode, false)) {
         // 1. The buffer cache can only act on this write if it protects one of the pages, if the
         //    GPU ever wrote one (it may be GPU-modified: the write is collected, return true) or
         //    if one holds a command list (its host writes are counted). Otherwise its answer is
