@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include "common/scope_exit.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -344,6 +345,18 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     qmd_address, fmt::join(descriptor, ","));
             }
         }
+        // The launch's dispatch and each release's fence take both cache locks: once here
+        // instead (they are recursive). EDEN_NX2_QMD_LOCK=0 leaves them to each (=a alternates).
+        static const char qmd_lock = Tegra::Nx2EnvMode("EDEN_NX2_QMD_LOCK");
+        const bool lock_caches = Tegra::Nx2Switch(qmd_lock, true);
+        if (lock_caches) {
+            rasterizer->LockCaches();
+        }
+        SCOPE_EXIT {
+            if (lock_caches) {
+                rasterizer->UnlockCaches();
+            }
+        };
         const auto error = native_qmd.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;

@@ -112,6 +112,13 @@ public:
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
+    void LockCaches() override {
+        std::lock(texture_cache.mutex, buffer_cache.mutex);
+    }
+    void UnlockCaches() override {
+        buffer_cache.mutex.unlock();
+        texture_cache.mutex.unlock();
+    }
     void UnmapMemory(DAddr addr, u64 size) override;
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
     void SignalFence(std::function<void()>&& func) override;

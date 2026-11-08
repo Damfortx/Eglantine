@@ -151,6 +151,11 @@ public:
     /// Sync memory between guest and host.
     virtual void InvalidateGPUCache() = 0;
 
+    /// Takes (and releases) the texture and buffer cache locks around a run of work that takes
+    /// them several times (they are recursive): one contended acquisition instead of several.
+    virtual void LockCaches() {}
+    virtual void UnlockCaches() {}
+
     /// Unmap memory range
     virtual void UnmapMemory(DAddr addr, u64 size) = 0;
 
