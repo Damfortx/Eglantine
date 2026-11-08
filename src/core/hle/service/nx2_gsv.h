@@ -69,6 +69,7 @@
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
+#include "core/hle/service/nx2_movie_pacing.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
@@ -1501,6 +1502,7 @@ private:
 // shared with the vi2 session so presents can find an image's memory. Command meanings follow
 // the shared changes.patch (IGraphicsSupervisor), re-checked against title 4's SDK.
 struct Nx2NativeObjects {
+    MkwMovieActivity mkw_movie_activity;
     struct Memory {
         u64 size{};
         u64 address{}; // CPU (== GPU) address once bound by 114/423
@@ -1920,6 +1922,11 @@ private:
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
     void PaceToVblank(u32 timing, const Kernel::KProcess* process) {
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+            return;
+        }
+        const auto movie_now = std::chrono::steady_clock::now();
+        if (m_objects->mkw_movie_activity.Active(movie_now)) {
+            m_next_vblank = movie_now;
             return;
         }
         static const u32 forced_interval = [] {
@@ -2503,6 +2510,9 @@ public:
             m_cv.notify_all();
             m_worker.join();
         }
+        if (m_movie_program_id == 0x0400C3F00006E000ULL && m_width >= 1920) {
+            m_objects->mkw_movie_activity.Reset();
+        }
         // The ready timer runs on the HostTiming thread: clear its event under its lock first.
         {
             std::scoped_lock lk{m_ready->mutex};
@@ -2618,6 +2628,8 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
+            const auto* process = ctx.GetThread().GetOwnerProcess();
+            m_movie_program_id = process ? process->GetProgramId() : 0;
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -2827,6 +2839,9 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
+                if (MkwMovieActivity::IsLargeMovie(m_movie_program_id, m_width)) {
+                    m_objects->mkw_movie_activity.Reset();
+                }
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -2851,6 +2866,10 @@ private:
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
+                if (!m_flush && frame.picture && frame.picture->frame &&
+                    MkwMovieActivity::IsLargeMovie(m_movie_program_id, frame.picture->width)) {
+                    m_objects->mkw_movie_activity.RecordFrame(std::chrono::steady_clock::now());
+                }
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
                 if (frame.end) {
                     m_stream_ended = true;
@@ -3023,6 +3042,7 @@ private:
     std::string m_codec;
     u32 m_width{};
     u32 m_height{};
+    u64 m_movie_program_id{};
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
     std::deque<Input> m_inputs;

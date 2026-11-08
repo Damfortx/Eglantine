@@ -34,6 +34,7 @@
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/mkw_wave_workaround.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -189,6 +190,44 @@ bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
                         gpu_memory->IsFullyMappedRange(address, 1);
     storage_pointer_types.emplace(key, static_cast<u8>(mapped));
     return mapped;
+}
+
+static void CollectStoragePointerSlots(const ::Common::unordered_map<u64, u8>& types,
+                                       const ::Common::unordered_map<u64, u32>& values,
+                                       std::vector<u64>& pointers, std::vector<u64>& null_slots) {
+    for (const auto& [key, type] : types) {
+        if ((key >> 63) != 0) {
+            continue; // pointer-table entries
+        }
+        if (type != 0) {
+            pointers.push_back(key);
+            continue;
+        }
+        const u32 index = static_cast<u32>(key >> 32);
+        const u32 offset = static_cast<u32>(key);
+        const auto low = values.find(MakeCbufKey(index, offset));
+        const auto high = values.find(MakeCbufKey(index, offset + 4));
+        if (low != values.end() && high != values.end() && low->second == 0 &&
+            high->second == 0) {
+            null_slots.push_back(key);
+        }
+    }
+}
+
+void GenericEnvironment::StoragePointerSlots(std::vector<u64>& pointers,
+                                             std::vector<u64>& null_slots) const {
+    CollectStoragePointerSlots(storage_pointer_types, cbuf_values, pointers, null_slots);
+}
+
+void GenericEnvironment::SeedStoragePointers(std::span<const u64> slots) {
+    for (const u64 key : slots) {
+        storage_pointer_types.emplace(key, u8{1});
+    }
+}
+
+void FileEnvironment::StoragePointerSlots(std::vector<u64>& pointers,
+                                          std::vector<u64>& null_slots) const {
+    CollectStoragePointerSlots(storage_pointer_types, cbuf_values, pointers, null_slots);
 }
 
 std::optional<u64> GenericEnvironment::Analyze() {
@@ -552,13 +591,15 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
             program_base, lowered.error_offset, lowered.error, words[0] & 0xfff, words[0],
             words[1], words[2], words[3]);
     }
+    VideoCommon::ApplyMkwZeroDepthFallback(native, lowered);
     auto result = std::make_shared<LoweredNativeCode>();
+    result->native_program_key = Shader::Ampere::NativeProgramKey(native);
     static const bool hash_for_indirect_reset = [] {
         const char* value = std::getenv("EDEN_NX2_RESETFIX");
         return !value || std::string_view{value} != "0";
     }();
     if (hash_for_indirect_reset) {
-        result->diagnostic_key = Shader::Ampere::NativeProgramKey(native);
+        result->diagnostic_key = result->native_program_key;
     }
     result->texture_bound = lowered.required_texture_buffer;
     result->source_size = native_header_size + lowered.source_size;

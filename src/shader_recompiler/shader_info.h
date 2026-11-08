@@ -374,6 +374,12 @@ struct Info {
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;
     ImageDescriptors image_descriptors;
+
+    /// True when the shader only runs correctly if a subgroup spans a whole guest warp.
+    [[nodiscard]] bool UsesWarpOps() const noexcept {
+        return uses_subgroup_vote || uses_subgroup_invocation_id || uses_subgroup_shuffles ||
+               uses_subgroup_mask || uses_quad_shuffles || uses_fswzadd;
+    }
 };
 
 template <typename Descriptors>
