@@ -59,6 +59,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/mt/mirror_3d.h"
 
 namespace Vulkan {
 
@@ -331,6 +332,7 @@ bool RasterizerVulkan::TryNx2IndirectReset() {
 
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+    VideoCommon::MT::MirrorCheckDraw(*maxwell3d);
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -1089,6 +1091,7 @@ bool SyncFixEnabled() {
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {
+    VideoCommon::MT::MirrorCheckCompute(*kepler_compute);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     // As PrepareDraw: both cache locks once for the dispatch.
     static const char early_mode = Tegra::Nx2EnvMode("EDEN_NX2_EARLY_LOCK");
@@ -1997,6 +2000,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
             );
             if (regs.logic_op.enable) {
                 regs.logic_op.enable = static_cast<u32>(!has_float);
+                maxwell3d->MtMarkField(regs.logic_op.enable);
             }
         }
         UpdateLogicOpEnable(regs);

@@ -361,6 +361,7 @@ void Maxwell3D::ApplyState(Core::System& system, const u64* pairs, u32 count, bo
             drew = true;
         }
         regs.reg_array[method] = value;
+        mt_written.Mark(method);
         for (auto const& table : dirty.tables) {
             dirty.flags[table[method]] = true;
         }
@@ -375,6 +376,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         draw_manager.DrawDeferred(*this, true);
     }
     regs.reg_array[method] = argument;
+    mt_written.Mark(method);
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
 }
@@ -385,15 +387,11 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
     }
     switch (method) {
     case RootTables::SelectMethod:
-        root_tables.selected = argument & 7;
-        root_tables.offset = (argument >> 8) & 0xff;
-        return;
     case RootTables::LoadMethod:
-        if (root_tables.offset < 256 && root_tables.offset % 4 == 0) {
-            root_tables.tables[root_tables.selected][root_tables.offset / 4] = argument;
-            root_tables.loaded = true;
+        ApplyRootTableMethod(root_tables, method, argument);
+        if (mt_record) [[unlikely]] {
+            mt_root_ops.push_back(method | (u64{argument} << 32));
         }
-        root_tables.offset += 4;
         return;
     case MAXWELL3D_REG_INDEX(wait_for_idle):
         return rasterizer->WaitForIdle();
@@ -410,6 +408,7 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
     case MAXWELL3D_REG_INDEX(load_mme.start_address):
         if (front_macros) {
             ++regs.load_mme.start_address_ptr;
+            MtMarkField(regs.load_mme.start_address_ptr);
             return;
         }
         return ProcessMacroBind(argument);
@@ -615,11 +614,13 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
 
 void Maxwell3D::ProcessMacroUpload(u32 data) {
     GetNativeMacroEngine().AddCode(regs.load_mme.instruction_ptr++, data);
+    MtMarkField(regs.load_mme.instruction_ptr);
 }
 
 void Maxwell3D::ProcessMacroBind(u32 data) {
     const auto positions = GetNativeMacroPositions();
     const u32 index = regs.load_mme.start_address_ptr++;
+    MtMarkField(regs.load_mme.start_address_ptr);
     if (index < positions.size()) {
         positions[index] = data;
     }
@@ -631,6 +632,7 @@ void Maxwell3D::ProcessFirmwareCall4() {
     // Firmware call 4 is a blob that changes some registers depending on its parameters.
     // These registers don't affect emulation and so are stubbed by setting 0xd00 to 1.
     regs.shadow_scratch[0] = 1;
+    MtMarkField(regs.shadow_scratch[0]);
 }
 
 void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_query) {
@@ -776,6 +778,16 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     buffer.enabled = bind_data.valid.Value() != 0;
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
+    if (mt_record) [[unlikely]] {
+        mt_cb_binds.push_back({
+            .stage = static_cast<u8>(stage_index),
+            .slot = static_cast<u8>(bind_data.shader_slot.Value()),
+            .enabled = static_cast<u8>(buffer.enabled ? 1 : 0),
+            .pad = 0,
+            .size = buffer.size,
+            .gpu_addr = buffer.address,
+        });
+    }
 
     const bool is_enabled = bind_data.valid.Value() != 0;
     if (!is_enabled) {
@@ -814,6 +826,7 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
 
     // Increment the current buffer position.
     regs.const_buffer.offset += static_cast<u32>(copy_size);
+    MtMarkField(regs.const_buffer.offset);
 }
 
 void Maxwell3D::ProcessCBData(u32 value) {

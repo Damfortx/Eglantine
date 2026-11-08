@@ -118,12 +118,14 @@ void HLE_DrawArraysIndirect::Fallback(Core::System& system, Engines::Maxwell3D& 
     const u32 base_instance = parameters[4];
     if (extended) {
         maxwell3d.regs.global_base_instance_index = base_instance;
+        maxwell3d.MtMarkField(maxwell3d.regs.global_base_instance_index);
         maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
         maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
     }
     maxwell3d.draw_manager.DrawArray(maxwell3d, topology, vertex_first, vertex_count, base_instance, instance_count);
     if (extended) {
         maxwell3d.regs.global_base_instance_index = 0;
+        maxwell3d.MtMarkField(maxwell3d.regs.global_base_instance_index);
         maxwell3d.engine_state = Maxwell3D::EngineHint::None;
         maxwell3d.replace_table.clear();
     }
@@ -140,8 +142,11 @@ void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D& 
     const u32 element_base = parameters[4];
     const u32 base_instance = parameters[5];
     maxwell3d.regs.vertex_id_base = element_base;
+    maxwell3d.MtMarkField(maxwell3d.regs.vertex_id_base);
     maxwell3d.regs.global_base_vertex_index = element_base;
+    maxwell3d.MtMarkField(maxwell3d.regs.global_base_vertex_index);
     maxwell3d.regs.global_base_instance_index = base_instance;
+    maxwell3d.MtMarkField(maxwell3d.regs.global_base_instance_index);
     maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     if (extended) {
         maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
@@ -160,8 +165,11 @@ void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D& 
     maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     maxwell3d.draw_manager.DrawIndexedIndirect(maxwell3d, topology, 0, estimate);
     maxwell3d.regs.vertex_id_base = 0x0;
+    maxwell3d.MtMarkField(maxwell3d.regs.vertex_id_base);
     maxwell3d.regs.global_base_vertex_index = 0x0;
+    maxwell3d.MtMarkField(maxwell3d.regs.global_base_vertex_index);
     maxwell3d.regs.global_base_instance_index = 0x0;
+    maxwell3d.MtMarkField(maxwell3d.regs.global_base_instance_index);
     if (extended) {
         maxwell3d.engine_state = Maxwell3D::EngineHint::None;
         maxwell3d.replace_table.clear();
@@ -173,8 +181,11 @@ void HLE_DrawIndexedIndirect::Fallback(Core::System& system, Engines::Maxwell3D&
     const u32 element_base = parameters[4];
     const u32 base_instance = parameters[5];
     maxwell3d.regs.vertex_id_base = element_base;
+    maxwell3d.MtMarkField(maxwell3d.regs.vertex_id_base);
     maxwell3d.regs.global_base_vertex_index = element_base;
+    maxwell3d.MtMarkField(maxwell3d.regs.global_base_vertex_index);
     maxwell3d.regs.global_base_instance_index = base_instance;
+    maxwell3d.MtMarkField(maxwell3d.regs.global_base_instance_index);
     maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     if (extended) {
         maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
@@ -183,8 +194,11 @@ void HLE_DrawIndexedIndirect::Fallback(Core::System& system, Engines::Maxwell3D&
     }
     maxwell3d.draw_manager.DrawIndex(maxwell3d, Tegra::Maxwell3D::Regs::PrimitiveTopology(parameters[0]), parameters[3], parameters[1], element_base, base_instance, instance_count);
     maxwell3d.regs.vertex_id_base = 0x0;
+    maxwell3d.MtMarkField(maxwell3d.regs.vertex_id_base);
     maxwell3d.regs.global_base_vertex_index = 0x0;
+    maxwell3d.MtMarkField(maxwell3d.regs.global_base_vertex_index);
     maxwell3d.regs.global_base_instance_index = 0x0;
+    maxwell3d.MtMarkField(maxwell3d.regs.global_base_instance_index);
     if (extended) {
         maxwell3d.engine_state = Maxwell3D::EngineHint::None;
         maxwell3d.replace_table.clear();
@@ -200,6 +214,7 @@ void HLE_MultiLayerClear::Execute(Core::System& system, Engines::Maxwell3D& maxw
     ASSERT(clear_params.layer == 0);
 
     maxwell3d.regs.clear_surface.raw = clear_params.raw;
+    maxwell3d.MtMarkField(maxwell3d.regs.clear_surface.raw);
     maxwell3d.draw_manager.Clear(maxwell3d, num_layers);
 }
 void HLE_MultiDrawIndexedIndirectCount::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
@@ -243,6 +258,7 @@ void HLE_MultiDrawIndexedIndirectCount::Fallback(Core::System& system, Engines::
     SCOPE_EXIT {
         // Clean everything.
         maxwell3d.regs.vertex_id_base = 0x0;
+        maxwell3d.MtMarkField(maxwell3d.regs.vertex_id_base);
         maxwell3d.engine_state = Maxwell3D::EngineHint::None;
         maxwell3d.replace_table.clear();
     };
@@ -265,6 +281,7 @@ void HLE_MultiDrawIndexedIndirectCount::Fallback(Core::System& system, Engines::
         const u32 base_vertex = parameters[base + 3];
         const u32 base_instance = parameters[base + 4];
         maxwell3d.regs.vertex_id_base = base_vertex;
+        maxwell3d.MtMarkField(maxwell3d.regs.vertex_id_base);
         maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
         maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
         maxwell3d.SetHLEReplacementAttributeType(0, 0x644, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
@@ -288,8 +305,11 @@ void HLE_DrawIndirectByteCount::Execute(Core::System& system, Engines::Maxwell3D
         params.max_draw_counts = 1;
         params.stride = parameters[1];
         maxwell3d.regs.draw.begin = parameters[0];
+        maxwell3d.MtMarkField(maxwell3d.regs.draw.begin);
         maxwell3d.regs.draw_auto_stride = parameters[1];
+        maxwell3d.MtMarkField(maxwell3d.regs.draw_auto_stride);
         maxwell3d.regs.draw_auto_byte_count = parameters[2];
+        maxwell3d.MtMarkField(maxwell3d.regs.draw_auto_byte_count);
         maxwell3d.draw_manager.DrawArrayIndirect(maxwell3d, topology);
     } else {
         Fallback(system, maxwell3d, parameters);
@@ -298,8 +318,11 @@ void HLE_DrawIndirectByteCount::Execute(Core::System& system, Engines::Maxwell3D
 void HLE_DrawIndirectByteCount::Fallback(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters) {
     maxwell3d.RefreshParameters();
     maxwell3d.regs.draw.begin = parameters[0];
+    maxwell3d.MtMarkField(maxwell3d.regs.draw.begin);
     maxwell3d.regs.draw_auto_stride = parameters[1];
+    maxwell3d.MtMarkField(maxwell3d.regs.draw_auto_stride);
     maxwell3d.regs.draw_auto_byte_count = parameters[2];
+    maxwell3d.MtMarkField(maxwell3d.regs.draw_auto_byte_count);
     maxwell3d.draw_manager.DrawArray(maxwell3d, maxwell3d.regs.draw.topology, 0, maxwell3d.regs.draw_auto_byte_count / maxwell3d.regs.draw_auto_stride, 0, 1);
 }
 void HLE_C713C83D8F63CCF3::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
@@ -308,9 +331,13 @@ void HLE_C713C83D8F63CCF3::Execute(Core::System& system, Engines::Maxwell3D& max
     const u32 address = maxwell3d.regs.shadow_scratch[24];
     auto& const_buffer = maxwell3d.regs.const_buffer;
     const_buffer.size = 0x7000;
+    maxwell3d.MtMarkField(const_buffer.size);
     const_buffer.address_high = (address >> 24) & 0xFF;
+    maxwell3d.MtMarkField(const_buffer.address_high);
     const_buffer.address_low = address << 8;
+    maxwell3d.MtMarkField(const_buffer.address_low);
     const_buffer.offset = offset;
+    maxwell3d.MtMarkField(const_buffer.offset);
 }
 void HLE_D7333D26E0A93EDE::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
     maxwell3d.RefreshParameters();
@@ -319,8 +346,11 @@ void HLE_D7333D26E0A93EDE::Execute(Core::System& system, Engines::Maxwell3D& max
     const u32 size = maxwell3d.regs.shadow_scratch[47 + index];
     auto& const_buffer = maxwell3d.regs.const_buffer;
     const_buffer.size = size;
+    maxwell3d.MtMarkField(const_buffer.size);
     const_buffer.address_high = (address >> 24) & 0xFF;
+    maxwell3d.MtMarkField(const_buffer.address_high);
     const_buffer.address_low = address << 8;
+    maxwell3d.MtMarkField(const_buffer.address_low);
 }
 void HLE_BindShader::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
     maxwell3d.RefreshParameters();
@@ -331,19 +361,26 @@ void HLE_BindShader::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d
     }
 
     regs.pipelines[index & 0xF].offset = parameters[2];
+    maxwell3d.MtMarkField(regs.pipelines[index & 0xF].offset);
     maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
     regs.shadow_scratch[28 + index] = parameters[1];
     regs.shadow_scratch[34 + index] = parameters[2];
+    maxwell3d.MtMarkField(regs.shadow_scratch[28 + index]);
+    maxwell3d.MtMarkField(regs.shadow_scratch[34 + index]);
 
     const u32 address = parameters[4];
     auto& const_buffer = regs.const_buffer;
     const_buffer.size = 0x10000;
+    maxwell3d.MtMarkField(const_buffer.size);
     const_buffer.address_high = (address >> 24) & 0xFF;
+    maxwell3d.MtMarkField(const_buffer.address_high);
     const_buffer.address_low = address << 8;
+    maxwell3d.MtMarkField(const_buffer.address_low);
 
     const size_t bind_group_id = parameters[3] & 0x7F;
     auto& bind_group = regs.bind_groups[bind_group_id];
     bind_group.raw_config = 0x11;
+    maxwell3d.MtMarkField(bind_group.raw_config);
     maxwell3d.ProcessCBBind(bind_group_id);
 }
 void HLE_SetRasterBoundingBox::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
@@ -353,16 +390,22 @@ void HLE_SetRasterBoundingBox::Execute(Core::System& system, Engines::Maxwell3D&
     const u32 raster_enabled = maxwell3d.regs.conservative_raster_enable;
     const u32 scratch_data = maxwell3d.regs.shadow_scratch[52];
     regs.raster_bounding_box.raw = raster_mode & 0xFFFFF00F;
+    maxwell3d.MtMarkField(regs.raster_bounding_box.raw);
     regs.raster_bounding_box.pad.Assign(scratch_data & raster_enabled);
+    maxwell3d.MtMarkField(regs.raster_bounding_box);
 }
 void HLE_ClearConstBuffer::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
     static constexpr std::array<u32, 0x7000> zeroes{}; //must be bigger than either 7000 or 5F00
     maxwell3d.RefreshParameters();
     auto& regs = maxwell3d.regs;
     regs.const_buffer.size = u32(base_size);
+    maxwell3d.MtMarkField(regs.const_buffer.size);
     regs.const_buffer.address_high = parameters[0];
+    maxwell3d.MtMarkField(regs.const_buffer.address_high);
     regs.const_buffer.address_low = parameters[1];
+    maxwell3d.MtMarkField(regs.const_buffer.address_low);
     regs.const_buffer.offset = 0;
+    maxwell3d.MtMarkField(regs.const_buffer.offset);
     maxwell3d.ProcessCBMultiData(zeroes.data(), parameters[2] * 4);
 }
 void HLE_ClearMemory::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
@@ -373,9 +416,13 @@ void HLE_ClearMemory::Execute(Core::System& system, Engines::Maxwell3D& maxwell3
     }
     auto& regs = maxwell3d.regs;
     regs.upload.line_length_in = parameters[2];
+    maxwell3d.MtMarkField(regs.upload.line_length_in);
     regs.upload.line_count = 1;
+    maxwell3d.MtMarkField(regs.upload.line_count);
     regs.upload.dest.address_high = parameters[0];
+    maxwell3d.MtMarkField(regs.upload.dest.address_high);
     regs.upload.dest.address_low = parameters[1];
+    maxwell3d.MtMarkField(regs.upload.dest.address_low);
     maxwell3d.CallMethod(system, size_t(MAXWELL3D_REG_INDEX(launch_dma)), 0x1011, true);
     maxwell3d.CallMultiMethod(system, size_t(MAXWELL3D_REG_INDEX(inline_data)), zero_memory.data(), needed_memory, needed_memory);
 }
@@ -383,14 +430,23 @@ void HLE_TransformFeedbackSetup::Execute(Core::System& system, Engines::Maxwell3
     maxwell3d.RefreshParameters();
     auto& regs = maxwell3d.regs;
     regs.transform_feedback_enabled = 1;
+    maxwell3d.MtMarkField(regs.transform_feedback_enabled);
     regs.transform_feedback.buffers[0].start_offset = 0;
+    maxwell3d.MtMarkField(regs.transform_feedback.buffers[0].start_offset);
     regs.transform_feedback.buffers[1].start_offset = 0;
+    maxwell3d.MtMarkField(regs.transform_feedback.buffers[1].start_offset);
     regs.transform_feedback.buffers[2].start_offset = 0;
+    maxwell3d.MtMarkField(regs.transform_feedback.buffers[2].start_offset);
     regs.transform_feedback.buffers[3].start_offset = 0;
+    maxwell3d.MtMarkField(regs.transform_feedback.buffers[3].start_offset);
     regs.upload.line_length_in = 4;
+    maxwell3d.MtMarkField(regs.upload.line_length_in);
     regs.upload.line_count = 1;
+    maxwell3d.MtMarkField(regs.upload.line_count);
     regs.upload.dest.address_high = parameters[0];
+    maxwell3d.MtMarkField(regs.upload.dest.address_high);
     regs.upload.dest.address_low = parameters[1];
+    maxwell3d.MtMarkField(regs.upload.dest.address_low);
     maxwell3d.CallMethod(system, size_t(MAXWELL3D_REG_INDEX(launch_dma)), 0x1011, true);
     maxwell3d.CallMethod(system, size_t(MAXWELL3D_REG_INDEX(inline_data)), regs.transform_feedback.controls[0].stride, true);
     maxwell3d.Rasterizer().RegisterTransformFeedback(regs.upload.dest.Address());

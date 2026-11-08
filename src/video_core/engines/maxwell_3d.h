@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/mt/reg_delta.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3194,6 +3195,44 @@ public:
         u32 offset{};
         bool loaded{};
     } root_tables;
+
+    /// Multithreaded back (docs/mt-plan.md): registers written since the last delta was taken,
+    /// and, while mt_record is set, the state kept outside regs (constant buffer binds, root
+    /// table methods) as pseudo-deltas for the register mirrors to replay.
+    VideoCommon::MT::RegWriteSet mt_written;
+    bool mt_record{};
+    std::vector<VideoCommon::MT::CbBindDelta> mt_cb_binds;
+    std::vector<u64> mt_root_ops; ///< method | argument << 32
+
+    /// Marks a register field written directly (not through CallMethod/ApplyState).
+    template <typename T>
+    void MtMarkField(const T& field) noexcept {
+        const auto offset = reinterpret_cast<const u8*>(&field) - reinterpret_cast<const u8*>(&regs);
+        mt_written.MarkRange(static_cast<u32>(offset / sizeof(u32)),
+                             static_cast<u32>((sizeof(T) + sizeof(u32) - 1) / sizeof(u32)));
+    }
+
+    /// The root table methods' effect (SelectMethod/LoadMethod), shared with the mirrors.
+    static void ApplyRootTableMethod(RootTables& tables, u32 method, u32 argument) {
+        if (method == RootTables::SelectMethod) {
+            tables.selected = argument & 7;
+            tables.offset = (argument >> 8) & 0xff;
+            return;
+        }
+        if (tables.offset < 256 && tables.offset % 4 == 0) {
+            tables.tables[tables.selected][tables.offset / 4] = argument;
+            tables.loaded = true;
+        }
+        tables.offset += 4;
+    }
+
+    /// ProcessCBBind's state change, shared with the mirrors.
+    static void ApplyCbBind(State& target, const VideoCommon::MT::CbBindDelta& bind) {
+        auto& buffer = target.shader_stages[bind.stage].const_buffers[bind.slot];
+        buffer.enabled = bind.enabled != 0;
+        buffer.address = bind.gpu_addr;
+        buffer.size = bind.size;
+    }
 
 
     /// Write the value to the register identified by method.

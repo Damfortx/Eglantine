@@ -82,6 +82,7 @@ void KeplerCompute::ConsumeSinkImpl(Core::System& system) {
     for (auto [method, value] : method_sink) {
         if (method < Regs::NUM_REGS) {
             regs.reg_array[method] = value;
+            mt_written.Mark(method);
         }
     }
     method_sink.clear();
@@ -460,7 +461,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
     }
     default:
         // The inline upload register block is shared with the older class.
-        if (method < Regs::NUM_REGS) regs.reg_array[method] = argument;
+        if (method < Regs::NUM_REGS) {
+            regs.reg_array[method] = argument;
+            mt_written.Mark(method);
+        }
         return method != KEPLER_COMPUTE_REG_INDEX(exec_upload) && method != KEPLER_COMPUTE_REG_INDEX(data_upload);
     }
 }
@@ -474,6 +478,7 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
             native_registers[method] = method_argument;
             if (method < Regs::NUM_REGS) {
                 regs.reg_array[method] = method_argument;
+                mt_written.Mark(method);
             }
             return;
         }
@@ -485,6 +490,7 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
     }
 
     regs.reg_array[method] = method_argument;
+    mt_written.Mark(method);
 
     switch (method) {
     case KEPLER_COMPUTE_REG_INDEX(exec_upload): {
@@ -559,6 +565,8 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     launch_description.local_crs_alloc.Assign(qmd[50] & 0xffffff);
     regs.code_loc.address_low = qmd[48];
     regs.code_loc.address_high = qmd[49] & 0x1ffff;
+    mt_written.Mark(KEPLER_COMPUTE_REG_INDEX(code_loc.address_low));
+    mt_written.Mark(KEPLER_COMPUTE_REG_INDEX(code_loc.address_high));
     for (u32 slot = 0; slot < NumConstBuffers; ++slot) {
         const u32 high = qmd[33 + slot * 2];
         if (high & 0x1ff00) {

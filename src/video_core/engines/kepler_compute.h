@@ -21,6 +21,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/macro.h"
+#include "video_core/mt/reg_delta.h"
 #include "video_core/native_qmd.h"
 #include "video_core/textures/texture.h"
 
@@ -64,6 +65,10 @@ public:
 
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+
+    MemoryManager& GetMemoryManager() {
+        return memory_manager;
+    }
 
     /// Whether a write to `method` can write memory (a dispatch, upload or report): with the
     /// native class, every method besides those that only store their value; macros always.
@@ -238,6 +243,9 @@ public:
 
     static_assert(sizeof(Regs) == Regs::NUM_REGS * sizeof(u32),
                   "KeplerCompute Regs has wrong size");
+
+    /// Multithreaded back (docs/mt-plan.md): registers written since the last delta was taken.
+    VideoCommon::MT::RegWriteSet mt_written;
 
     static_assert(sizeof(LaunchParams) == LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32),
                   "KeplerCompute LaunchParams has wrong size");
