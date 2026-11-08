@@ -67,6 +67,14 @@ public:
     void Start();
     void Stop();
 
+    /// The resolver's stream cursor (watchdog).
+    [[nodiscard]] u32 Consumer() const noexcept {
+        return consumer;
+    }
+    [[nodiscard]] bool Running() const noexcept {
+        return has_consumer;
+    }
+
     VideoCommon::MT::BatchCursor cursor;
     VideoCommon::MT::RingArena<u64> results{size_t{1} << 20}; // 8 MiB
     ResolverCounters counters;
@@ -289,6 +297,11 @@ inline void Resolver::OnEntry(const u64* entry, std::stop_token& stop) {
         // ack), copy the newly bound channel's state.
         LeaveBatch();
         const auto* const done = reinterpret_cast<const std::atomic<u32>*>(entry[3]);
+        VideoCommon::MT::WaitWatch::Scope watch_scope{
+            pipeline.watch,
+            static_cast<VideoCommon::MT::WaitSite>(
+                static_cast<u32>(VideoCommon::MT::WaitSite::ResolverBarrier0) + (index & 7)),
+            reinterpret_cast<u64>(done)};
         for (u32 spins = 0; done->load(std::memory_order_acquire) == 0; ++spins) {
             if (stop.stop_requested()) {
                 return;
@@ -732,6 +745,8 @@ inline MT::ResolvedDraw* Nx2DrawPipeline::WaitResolved(const DrawHeader& header)
         const bool timed = VideoCommon::MT::Stats();
         const auto begin = std::chrono::steady_clock::now();
         bool warned = false;
+        VideoCommon::MT::WaitWatch::Scope watch_scope{watch, VideoCommon::MT::WaitSite::CommitResolved,
+                                                      header.batch};
         resolver.cursor.Wait(
             header.batch,
             [&] {
@@ -963,6 +978,129 @@ inline void Nx2DrawPipeline::LogResolverStats(double seconds) {
              rate(take(counters.shadow_checks)),
              counters.shadow_mismatches.load(std::memory_order_relaxed),
              rate(take(counters.shadow_unvalidated)), epochs.PendingCount());
+}
+
+inline void Nx2DrawPipeline::KickWaiters() {
+    stream.WakeAll();
+    commit_word.fetch_add(1, std::memory_order_seq_cst);
+    commit_word.notify_all();
+    serial_word.fetch_add(1, std::memory_order_seq_cst);
+    serial_word.notify_all();
+    for (const auto& resolver : resolvers) {
+        resolver->cursor.Wake();
+    }
+}
+
+inline void Nx2DrawPipeline::WatchdogReport(const std::string& why) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    std::string resolver_text;
+    for (const auto& resolver : resolvers) {
+        if (!resolver->Running()) {
+            continue;
+        }
+        resolver_text += fmt::format(" [cursor {} published batches {}]",
+                                     stream.ConsumerPosition(resolver->Consumer()),
+                                     resolver->cursor.PublishedCount());
+    }
+    LOG_WARNING(Render_Vulkan,
+                "MT watchdog: {} | stream published {} committer cursor {} (quiet {}, hook {}, "
+                "commit_waiting {}, commit_word {}, serial_word {}) | draws emitted {} committed {} "
+                "open batch {} | resolvers{} | split consumed {} settled {} | packets {} serials "
+                "{} marks {} batches {}",
+                why, stream.PublishedPosition(), stream.ConsumerPosition(consumer),
+                committer_quiet.load(std::memory_order_relaxed),
+                hook_requested.load(std::memory_order_relaxed),
+                commit_waiting.load(std::memory_order_relaxed),
+                commit_word.load(std::memory_order_relaxed),
+                serial_word.load(std::memory_order_relaxed),
+                emitted_seq.load(std::memory_order_relaxed),
+                committed_seq.load(std::memory_order_relaxed),
+                open_batch.load(std::memory_order_relaxed),
+                resolver_text.empty() ? std::string{" none"} : resolver_text,
+                split.ConsumedPosition(), split.SettledPosition(),
+                counters.packets.load(std::memory_order_relaxed),
+                [&] {
+                    u64 total = 0;
+                    for (const auto& value : counters.serials) {
+                        total += value.load(std::memory_order_relaxed);
+                    }
+                    return total;
+                }(),
+                counters.marks.load(std::memory_order_relaxed),
+                counters.batches.load(std::memory_order_relaxed));
+}
+
+inline void Nx2DrawPipeline::WatchdogLoop(std::stop_token stop) {
+    Common::SetCurrentThreadName("GPUWatchdog");
+    using VideoCommon::MT::WaitWatch;
+    constexpr u64 Limit = 2'000'000'000ULL;
+    struct Progress {
+        u64 position = 0;
+        u64 since = 0;
+        bool reported = false;
+    };
+    // Committer, then resolvers.
+    std::array<Progress, 1 + 8> progress{};
+    u64 reported_space = 0;
+    u64 recovered_seen = 0;
+    const auto check_cursor = [&](Progress& p, u64 position, u64 published, u64 now,
+                                  const std::string& who) {
+        if (position >= published || position != p.position) {
+            if (p.reported && position != p.position) {
+                LOG_WARNING(Render_Vulkan, "MT watchdog: {} advanced again ({} -> {})", who,
+                            p.position, position);
+            }
+            p = Progress{position, now, false};
+            return;
+        }
+        if (!p.reported && now - p.since > Limit) {
+            p.reported = true;
+            WatchdogReport(fmt::format("{} has not advanced in {} ms with {} words pending", who,
+                                       (now - p.since) / 1'000'000, published - position));
+            KickWaiters();
+        }
+    };
+    while (!stop.stop_requested()) {
+        for (u32 i = 0; i < 10 && !stop.stop_requested(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+        const u64 now = WaitWatch::NowNs();
+        for (u32 site = 0; site < watch.slots.size(); ++site) {
+            auto& slot = watch.slots[site];
+            const u64 since = slot.since.load(std::memory_order_acquire);
+            if (since == 0 || since > now || now - since <= Limit ||
+                slot.reported_since.load(std::memory_order_relaxed) == since) {
+                continue;
+            }
+            slot.reported_since.store(since, std::memory_order_relaxed);
+            WatchdogReport(fmt::format("{} waiting {} ms (target {})",
+                                       VideoCommon::MT::WaitSiteName(site),
+                                       (now - since) / 1'000'000,
+                                       slot.target.load(std::memory_order_relaxed)));
+            KickWaiters();
+        }
+        if (const u64 since = stream.space_wait_since.load(std::memory_order_relaxed);
+            since != 0 && since < now && now - since > Limit && since != reported_space) {
+            reported_space = since;
+            WatchdogReport(fmt::format("sequencer waiting {} ms for stream space",
+                                       (now - since) / 1'000'000));
+            KickWaiters();
+        }
+        const u64 published = stream.PublishedPosition();
+        check_cursor(progress[0], stream.ConsumerPosition(consumer), published, now, "committer");
+        for (size_t i = 0; i < resolvers.size() && i < 8; ++i) {
+            if (resolvers[i]->Running()) {
+                check_cursor(progress[1 + i], stream.ConsumerPosition(resolvers[i]->Consumer()),
+                             published, now, fmt::format("resolver {}", i));
+            }
+        }
+        if (const u64 recovered = watch.recovered.load(std::memory_order_relaxed);
+            recovered != recovered_seen) {
+            LOG_WARNING(Render_Vulkan, "MT watchdog: {} reported wait(s) ended after the report",
+                        recovered - recovered_seen);
+            recovered_seen = recovered;
+        }
+    }
 }
 
 } // namespace Vulkan

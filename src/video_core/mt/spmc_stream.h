@@ -91,7 +91,13 @@ public:
     void Commit() {
         write_pos += reserved;
         reserved = 0;
-        published.store(write_pos, std::memory_order_release);
+        // seq_cst, not release: WaitForData is a Dekker pair (waiters++ then load `published`;
+        // store `published` then load `waiters`). With a release store the waiters load could
+        // be satisfied before the store left the store buffer (x86 StoreLoad reordering): the
+        // consumer saw the old position and slept, the producer saw no waiter and did not
+        // notify — a lost wake-up that left the committer asleep with entries pending while the
+        // sequencer waited for it (the EDEN_NX2_MT=1 VERIFY hangs).
+        published.store(write_pos, std::memory_order_seq_cst);
         if (waiters.load(std::memory_order_seq_cst) != 0) {
             signal.fetch_add(1, std::memory_order_seq_cst);
             signal.notify_all();
@@ -110,6 +116,11 @@ public:
 
     [[nodiscard]] u64 WritePosition() const noexcept {
         return write_pos;
+    }
+
+    /// Any thread: the position consumers may read up to.
+    [[nodiscard]] u64 PublishedPosition() const noexcept {
+        return published.load(std::memory_order_acquire);
     }
 
     // ---- consumers ----
@@ -189,6 +200,7 @@ private:
             reclaimed = SlowestCursor();
             if (write_pos + total_words - reclaimed <= capacity) {
                 if (spins != 0) {
+                    space_wait_since.store(0, std::memory_order_relaxed);
                     space_wait_ns += static_cast<u64>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - begin)
@@ -198,6 +210,8 @@ private:
             }
             if (spins == 0) {
                 begin = std::chrono::steady_clock::now();
+                space_wait_since.store(static_cast<u64>(begin.time_since_epoch().count()),
+                                       std::memory_order_relaxed);
             }
             if (spins > 64) {
                 std::this_thread::yield();
@@ -217,6 +231,9 @@ private:
 public:
     /// Producer-owned: time the producer waited for ring space (MT_STATS).
     u64 space_wait_ns = 0;
+    /// Producer: steady_clock ticks when the current wait for space began, 0 when not waiting
+    /// (the MT watchdog reads it).
+    std::atomic<u64> space_wait_since{0};
 
 private:
     // Producer-owned.

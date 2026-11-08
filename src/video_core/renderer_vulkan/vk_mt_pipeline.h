@@ -45,6 +45,7 @@
 #include "video_core/mt/role.h"
 #include "video_core/mt/spmc_stream.h"
 #include "video_core/mt/tracker_lock.h"
+#include "video_core/mt/wait_watch.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2.h"
 #include "video_core/shader_handle_program.h"
@@ -570,6 +571,21 @@ private:
     alignas(64) std::atomic<u32> commit_word{};
     std::atomic<bool> commit_waiting{};
     std::atomic<bool> start_ready{};
+
+    // Watchdog (EDEN_NX2_MT_STATS / EDEN_NX2_MT_WATCHDOG, vk_mt_resolve.h).
+    VideoCommon::MT::WaitWatch watch;
+    std::jthread watchdog;
+    /// Sequencer mirrors for the watchdog's report: last emitted draw seq, next batch id.
+    std::atomic<u64> emitted_seq{0};
+    /// EDEN_NX2_MT_VERIFY (lockstep): GuestCpuWrites() when the sequencer began the capture of
+    /// the draw the committer verifies.
+    std::atomic<u64> verify_cpu_writes_since{0};
+    std::atomic<u64> open_batch{0};
+    void WatchdogLoop(std::stop_token stop);
+    /// Logs the pipeline's positions (`why` first).
+    void WatchdogReport(const std::string& why);
+    /// Wakes every waiter of the pipeline (they all re-check their condition).
+    void KickWaiters();
 };
 
 } // namespace Vulkan
@@ -636,6 +652,9 @@ inline void Nx2DrawPipeline::Start() {
         static_cast<Nx2DrawPipeline*>(context)->BeforeWrite(device_addr, size);
     };
     AttachEpochs(VideoCommon::MT::DeferredFree());
+    if (verify) {
+        VideoCommon::MT::g_cpu_write_log_on.store(true, std::memory_order_seq_cst);
+    }
     if (VideoCommon::MT::UboGen()) {
         using View = VideoCommon::MT::CaptureView;
         seq_ubo_memo = {};
@@ -649,6 +668,9 @@ inline void Nx2DrawPipeline::Start() {
         std::this_thread::yield();
     }
     StartResolvers();
+    if (watch.on) {
+        watchdog = std::jthread([this](std::stop_token stop) { WatchdogLoop(stop); });
+    }
     running = true;
     VideoCommon::MT::g_write_hook_on.store(true, std::memory_order_seq_cst);
     VideoCommon::MT::g_active.store(true, std::memory_order_seq_cst);
@@ -673,11 +695,17 @@ inline void Nx2DrawPipeline::Stop() {
     committer.request_stop();
     stream.WakeAll();
     committer.join();
+    // The watchdog reads the resolvers: it stops first.
+    if (watchdog.joinable()) {
+        watchdog.request_stop();
+        watchdog.join();
+    }
     StopResolvers();
     VideoCommon::MT::g_active.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_check.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_write_hook_on.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_ubo_gen_on.store(false, std::memory_order_seq_cst);
+    VideoCommon::MT::g_cpu_write_log_on.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_hooks = {};
     stream.RemoveConsumer(consumer);
     AttachEpochs(false);
@@ -773,6 +801,7 @@ inline void Nx2DrawPipeline::CloseBatch() {
     const u64 payload[2]{batch_id, batch_draws};
     stream.Push(static_cast<u8>(MT::StreamEntry::BatchEnd), 0, payload, 2);
     ++batch_id;
+    open_batch.store(batch_id, std::memory_order_relaxed);
     batch_draws = 0;
     batch_open = false;
 }
@@ -801,6 +830,10 @@ inline void Nx2DrawPipeline::SerialRaw(MT::Kind kind, void (*fn)(void*), void* a
         }
         MTDetail::Pause();
     }
+    std::optional<VideoCommon::MT::WaitWatch::Scope> watch_scope;
+    if (done.load(std::memory_order_acquire) == 0) {
+        watch_scope.emplace(watch, VideoCommon::MT::WaitSite::SeqSerial, stream.WritePosition());
+    }
     while (done.load(std::memory_order_acquire) == 0) {
         const u32 seen = serial_word.load(std::memory_order_seq_cst);
         if (done.load(std::memory_order_seq_cst) != 0) {
@@ -808,8 +841,11 @@ inline void Nx2DrawPipeline::SerialRaw(MT::Kind kind, void (*fn)(void*), void* a
         }
         serial_word.wait(seen, std::memory_order_seq_cst);
     }
+    watch_scope.reset();
     if (barrier) {
         counters.barriers.fetch_add(1, std::memory_order_relaxed);
+        VideoCommon::MT::WaitWatch::Scope acks_scope{watch, VideoCommon::MT::WaitSite::SeqBarrierAcks,
+                                                    resolver_count};
         for (u32 spins = 0; acks.acks.load(std::memory_order_acquire) != resolver_count; ++spins) {
             if (spins < 4096) {
                 MTDetail::Pause();
@@ -851,6 +887,8 @@ inline void Nx2DrawPipeline::WaitCommitted() {
         }
         MTDetail::Pause();
     }
+    VideoCommon::MT::WaitWatch::Scope watch_scope{watch, VideoCommon::MT::WaitSite::SeqWaitCommitted,
+                                                  target};
     commit_waiting.store(true, std::memory_order_seq_cst);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     while (true) {
@@ -1332,6 +1370,10 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
     const auto& regs = real.regs;
     const auto& infos = pipeline->StageInfos();
     ClearCapture();
+    if (verify) {
+        verify_cpu_writes_since.store(VideoCommon::MT::GuestCpuWrites().Snapshot(),
+                                      std::memory_order_release);
+    }
 
     // Pass 1: what forces the old path, and the reads ConfigureImpl will repeat.
     if (regs.transform_feedback_enabled != 0) {
@@ -1645,10 +1687,16 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
                       geometry_words + tic_words + blob_words;
     const u64 seq = next_seq;
     if (Batching()) {
-        // Back-pressure: the resolved slot of `seq` must have been committed.
-        while (!VideoCommon::MT::SeqSlotRing<char, ResolvedSlots>::HasRoom(
-            seq, committed_seq.load(std::memory_order_acquire), 2 * VideoCommon::MT::BatchSize())) {
+        // Back-pressure: the resolved slot of `seq` must have been committed. One wait for
+        // everything emitted is enough (every draw before is committed then); a loop on
+        // committed_seq spun forever when compute packets (which take seqs too, but do not
+        // store committed_seq) followed the last draw.
+        if (!VideoCommon::MT::SeqSlotRing<char, ResolvedSlots>::HasRoom(
+                seq, committed_seq.load(std::memory_order_acquire),
+                2 * VideoCommon::MT::BatchSize())) {
             counters.ring_waits.fetch_add(1, std::memory_order_relaxed);
+            VideoCommon::MT::WaitWatch::Scope watch_scope{
+                watch, VideoCommon::MT::WaitSite::SeqBackPressure, seq};
             WaitCommitted();
         }
         batch_open = true;
@@ -1657,6 +1705,7 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     out[0] = SpmcStream::MakeHeader(static_cast<u8>(MT::StreamEntry::DrawPacket), words, 0);
     DrawHeader header{};
     header.seq = next_seq++;
+    emitted_seq.store(header.seq, std::memory_order_relaxed);
     header.pipeline = pipeline;
     header.draw_state = DrawStateCopy{
         .topology = state.topology,
@@ -1839,6 +1888,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         .blob = blob_data,
         .verify = verify,
         .ubo_memo = ubo_memo_bytes.get(),
+        .cpu_write_since = verify_cpu_writes_since.load(std::memory_order_acquire),
     };
     {
         // EDEN_NX2_MT_LOCKSCOPE: the uploads under the buffer mutex, then ConfigureDrawPipeline
@@ -1934,6 +1984,7 @@ inline void Nx2DrawPipeline::ReportView(u64 seq, const VideoCommon::MT::CaptureV
     struct {
         u64 seq;
     } header{seq};
+    counters.verify_cpu_writes.fetch_add(view.concurrent_cpu_syncs, std::memory_order_relaxed);
     {
         const u64 misses = view.overlay_misses + view.ubo_misses + view.decision_mismatches +
                            view.uncaptured_syncs;
@@ -2009,6 +2060,10 @@ inline void Nx2DrawPipeline::VerifyCaptures(
     // since (the sequencer waits for this packet; the game's threads don't): its write trap
     // marked them CPU-modified in the buffer tracker.
     const auto written_by_cpu = [&](DAddr device_addr, u64 size) {
+        if (VideoCommon::MT::GuestCpuWrites().WrittenSince(
+                verify_cpu_writes_since.load(std::memory_order_acquire), device_addr, size)) {
+            return true;
+        }
         std::scoped_lock lock{rasterizer.buffer_cache.mutex};
         return rasterizer.buffer_cache.IsRegionCpuModified(device_addr, size);
     };
@@ -2055,8 +2110,23 @@ inline void Nx2DrawPipeline::VerifyCaptures(
                 counters.verify_cpu_writes.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            VerifyReport(0x3002, fmt::format("draw {}: upload at {:#x} (+{}) changed",
-                                             header.seq, entry.device_addr, entry.size));
+            u32 first_diff = 0;
+            u32 diff_bytes = 0;
+            for (u32 i = entry.size; i-- > 0;) {
+                if (bytes[i] != data[i]) {
+                    first_diff = i;
+                    ++diff_bytes;
+                }
+            }
+            u64 was = 0;
+            u64 now = 0;
+            std::memcpy(&was, data + (first_diff & ~7u), std::min<u32>(8, entry.size - (first_diff & ~7u)));
+            std::memcpy(&now, bytes.data() + (first_diff & ~7u),
+                        std::min<u32>(8, entry.size - (first_diff & ~7u)));
+            VerifyReport(0x3002, fmt::format("draw {}: upload at {:#x} (+{}) changed: {} bytes "
+                                             "from +{:#x} ({:#018x} -> {:#018x})",
+                                             header.seq, entry.device_addr, entry.size, diff_bytes,
+                                             first_diff, was, now));
         }
     }
 }
@@ -2264,6 +2334,10 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
     const auto& qmd = real.launch_description;
     const auto& cbufs = qmd.const_buffer_config;
     ClearCapture();
+    if (verify) {
+        verify_cpu_writes_since.store(VideoCommon::MT::GuestCpuWrites().Snapshot(),
+                                      std::memory_order_release);
+    }
     if (real.GetIndirectComputeAddress()) {
         return 12;
     }
@@ -2518,6 +2592,7 @@ inline void Nx2DrawPipeline::CommitCompute(const u64* entry) {
         .blob = blob_data,
         .verify = verify,
         .ubo_memo = ubo_memo_bytes.get(),
+        .cpu_write_since = verify_cpu_writes_since.load(std::memory_order_acquire),
     };
     {
         // DispatchComputeBody takes both cache mutexes itself.
