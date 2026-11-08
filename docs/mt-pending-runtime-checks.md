@@ -52,3 +52,21 @@ EDEN_NX2_GPU_TIMESTAMPS=1 (any MT mode).
 8. GPU time: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_GPU_TIMESTAMPS=1 ./demo.sh $BIN 120 gpu-ts` (MT unset) and with `EDEN_NX2_MT=1`;
    `grep "GPU timestamps" runs/cli-gpu-ts.out`: ms GPU per frame vs frame time says whether a run is GPU-bound.
 9. Role checks with the new paths: 3 with `EDEN_NX2_MT_CHECK=1 EDEN_NX2_MT_DMA=packet`; `grep "MT check"`.
+
+## Results 2026-11-08 (merged mkw-mt, BIN=build/pgo, demo 120 s, VSYNC 240)
+Hangs fixed: SpmcStream::Commit published `published` with a release store before reading
+`waiters` (Dekker pair with WaitForData): lost wake-up, committer asleep with entries pending
+while the sequencer waited (both observed hangs). Watchdog (MT_STATS / EDEN_NX2_MT_WATCHDOG=1)
+reports any MT wait > 2 s and stalled cursors, then kicks waiters: 0 reports in all runs below.
+| run | fps (mean of 10 s windows) | notes |
+|---|---|---|
+| MT unset (m-off) | 47.9 | 20 errors = baseline (unmapped reads) |
+| MT=1 K=0 VERIFY | 42.1 | 0 mismatches (1844 concurrent guest writes classified) |
+| MT=1 K=2 VERIFY | 34.0 | before the upload read-after-protect fix: 113 (one buffer, explained) |
+| MT=1 K=0 free | 43.1 | screenshot correct |
+| MT=1 K=2 free | 43.3 | screenshot correct; batches 8-9 draws, commit wait ~400 ms/s |
+| SHADOW=1 VERIFY | 31.0 | 0 shadow mismatches, 1 verify (async GPU-side write, 1 byte) |
+| SHADOW=1 free / SHADOW=2 | 37.1 / 36.4 | 0 mismatches; validation failures buffer ~1/s, view rare |
+| RCHECK=2 SHADOW=1 | 39.9 | 183 injected/s handled |
+| RCOMMIT=1 / +RCHECK=2 | 42.8 / 41.2 | committed == ok; screenshots not taken (window covered) |
+All runs: 120 s, clean "committer stopped", no exit hang.
