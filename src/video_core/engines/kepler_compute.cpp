@@ -1401,7 +1401,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             static const char upload_batch = Tegra::Nx2EnvMode("EDEN_NX2_UPLOAD_BATCH");
             if (address == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
                 Tegra::Nx2Switch(upload_batch, true)) {
-                split.ConstBufferWord(this, address, value);
+                split.MacroWrite(this, address, value, true);
             } else {
                 split.MacroWrite(this, address, value);
             }

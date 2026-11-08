@@ -16,6 +16,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/nx2.h"
 
 namespace Core {
 class System;
@@ -137,14 +138,56 @@ public:
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
-    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
-        FlushState();
-        SelectEngine(engine);
-        u64* const entry = Reserve(1);
-        entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
-                   (u64{argument} << 32);
-        Commit(1);
+    /// A register write a macro makes (run even if not executable). An engine's writes are
+    /// gathered and go to the back as one entry (Kind::List) before any entry of another kind:
+    /// title 1's macros make ~2.5 million writes a second, each an entry of its own before.
+    /// `mergeable`: a constant buffer data word (3D) or inline upload word (compute), whose
+    /// consecutive runs the back runs as one multi-method (one write, not one a word).
+    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                    bool mergeable = false) {
+        // Off by default: the back ran 0.25-1 us less a draw with it but the attract demo showed
+        // 0.4-1.6 fewer frames a second in four A/B runs (latency not found yet).
+        // EDEN_NX2_MACRO_LIST=1 turns it on (=a alternates).
+        static const char list_mode = Tegra::Nx2EnvMode("EDEN_NX2_MACRO_LIST");
+        if (!Tegra::Nx2Switch(list_mode, false)) {
+            if (mergeable && list_mode == 'd') {
+                // Without lists, the constant buffer / upload words still go as runs.
+                if (list_count != 0 && list_engine != engine) {
+                    FlushState();
+                }
+                if (state_count != 0) {
+                    FlushState();
+                }
+                list_engine = engine;
+                list[list_count++] = u64{method & 0xffff} | Mergeable | (u64{argument} << 32);
+                if (list_count == list.size()) {
+                    FlushMacroList();
+                }
+                return;
+            }
+            FlushState();
+            SelectEngine(engine);
+            u64* const entry = Reserve(1);
+            entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct |
+                       (u64{method & 0xffff} << 8) | (u64{argument} << 32);
+            Commit(1);
+            return;
+        }
+        // State gathered since goes first (after the list gathered before it: FlushState).
+        if (state_count != 0 ||
+            (list_count != 0 && (list_engine != engine || list_count == list.size()))) {
+            FlushState();
+        }
+        list_engine = engine;
+        list[list_count++] =
+            u64{method & 0xffff} | (mergeable ? Mergeable : 0) | (u64{argument} << 32);
+        // Out as soon as it would have been published as entries of its own: held longer, the
+        // back waited for whole lists (draws come from macros too) and ran ~2% fewer frames.
+        if (write_position + list_count + 1 - published_local >= publish_every) {
+            FlushMacroList();
+        }
     }
+    void FlushMacroList();
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     template <typename Func>
@@ -183,33 +226,14 @@ public:
     }
     /// Sends the gathered state writes (before any other entry, publish or wait).
     void FlushState() {
-        if (cb_run_count != 0) [[unlikely]] {
-            FlushConstBufferRun();
+        if (list_count != 0) {
+            FlushMacroList();
         }
         if (state_count != 0) {
             FlushStateSlow();
         }
     }
 
-    /// A word a macro writes to one of the 3D engine's const_buffer.buffer registers (`method`),
-    /// or to the compute engine's inline upload data: consecutive ones of one engine go to the
-    /// back as one multi-method entry (one write, not one entry and one write a word). The 16
-    /// constant buffer registers all write at const_buffer.offset and advance it. Title 1's
-    /// macros write ~1.3 million constant buffer words a second and ~360,000 upload words.
-    void ConstBufferWord(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
-        if (cb_run_count != 0 && (cb_run_engine != engine || cb_run_count == cb_run.size())) {
-            FlushConstBufferRun();
-        }
-        if (state_count != 0) {
-            FlushStateSlow();
-        }
-        if (cb_run_count == 0) {
-            cb_run_engine = engine;
-            cb_run_method = method;
-        }
-        cb_run[cb_run_count++] = argument;
-    }
-    void FlushConstBufferRun();
 
     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
     /// using back-owned state (the Vulkan scheduler) while the back runs entries.
@@ -362,7 +386,9 @@ private:
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
         State,  ///< Bits 32-63 count; flag IsLast: the shadow RAM tracks; then (method | value << 32)
+        List,   ///< Bits 32-63 count; then (method | Mergeable | value << 32): macro writes (Direct)
     };
+    static constexpr u64 Mergeable = u64{1} << 16; ///< List: consecutive ones go as one multi-method
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
@@ -415,10 +441,9 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
-    std::array<u32, 1024> cb_run{};
-    size_t cb_run_count{};
-    Tegra::Engines::EngineInterface* cb_run_engine{};
-    u32 cb_run_method{};
+    std::array<u64, 2048> list{};
+    size_t list_count{};
+    Tegra::Engines::EngineInterface* list_engine{};
     std::array<std::pair<GPUVAddr, GPUVAddr>, 256> pending_writes{};
     size_t pending_write_count{};
     bool pending_write_overflow{};

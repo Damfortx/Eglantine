@@ -526,10 +526,14 @@ void GpuSplit::FlushStateSlow() {
     Commit(1 + count);
 }
 
-void GpuSplit::FlushConstBufferRun() {
-    const u32 count = static_cast<u32>(cb_run_count);
-    cb_run_count = 0; // First: MultiMethod flushes the state, which comes here again.
-    MultiMethod(cb_run_engine, cb_run_method, cb_run.data(), count, count, nullptr);
+void GpuSplit::FlushMacroList() {
+    const size_t count = list_count;
+    list_count = 0; // First: SelectEngine and Reserve may flush the state, which comes here.
+    SelectEngine(list_engine);
+    u64* const entry = Reserve(1 + count);
+    entry[0] = static_cast<u64>(Kind::List) | (u64{count} << 32);
+    std::memcpy(entry + 1, list.data(), count * sizeof(u64));
+    Commit(1 + count);
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
@@ -629,6 +633,30 @@ size_t GpuSplit::Execute(const u64* entry) {
         engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
                                 amount, static_cast<u32>(entry[1]));
         return data + (amount + 1) / 2;
+    }
+    case Kind::List: {
+        const size_t count = static_cast<size_t>(head >> 32);
+        auto* const engine = back_engine;
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        const u64* const tokens = entry + 1;
+        std::array<u32, 2048> words;
+        for (size_t i = 0; i < count; ++i) {
+            const u32 method = static_cast<u32>(tokens[i] & 0xffff);
+            if ((tokens[i] & Mergeable) != 0) {
+                size_t n = 0;
+                while (i + n < count && (tokens[i + n] & Mergeable) != 0) {
+                    words[n] = static_cast<u32>(tokens[i + n] >> 32);
+                    ++n;
+                }
+                engine->CallMultiMethod(*system, method, words.data(), static_cast<u32>(n),
+                                        static_cast<u32>(n));
+                i += n - 1;
+                continue;
+            }
+            engine->CallMethod(*system, method, static_cast<u32>(tokens[i] >> 32), true);
+        }
+        return 1 + count;
     }
     case Kind::State: {
         const u32 count = static_cast<u32>(head >> 32);

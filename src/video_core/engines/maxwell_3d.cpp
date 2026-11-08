@@ -1056,7 +1056,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         constexpr u32 cb_first = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         if (method >= cb_first && method < cb_first + 16 &&
             fs.control != Regs::ShadowRamControl::Replay && Tegra::Nx2Switch(cb_batch, true)) {
-            split.ConstBufferWord(this, method, argument);
+            split.MacroWrite(this, method, argument, true);
         } else {
             split.MacroWrite(this, method, argument);
         }
