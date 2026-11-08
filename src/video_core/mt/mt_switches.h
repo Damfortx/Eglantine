@@ -117,10 +117,44 @@ namespace VideoCommon::MT {
     return us;
 }
 
-/// EDEN_NX2_MT_REPLAY=1: per-render-pass POD replay closures (phase 5b); 2 also records the old
-/// closures and checks the op stream against them.
+/// EDEN_NX2_MT_RBUF (on): resolvers also resolve the buffer half of ConfigureImpl (uniform,
+/// storage, vertex and index ranges, streamed uniforms into a per-resolver ring) and build the
+/// whole descriptor payload; the committer only applies the intents and records. =0: the
+/// committer runs the buffer half (phase 5 RCOMMIT).
+[[nodiscard]] inline bool ResolverBufferHalf() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_RBUF");
+    static const bool on = Tegra::Nx2Switch(mode, true);
+    return on;
+}
+
+/// EDEN_NX2_MT_COMPACT (on): compact draw packets (variable-length header, uniform bytes in a
+/// side arena with sequencer-side dedupe, packed entries).
+[[nodiscard]] inline bool CompactPackets() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_COMPACT");
+    static const bool on = Tegra::Nx2Switch(mode, true);
+    return on;
+}
+
+/// EDEN_NX2_MT_FLUSHCMD (on): flush/invalidate requests on the sequencer skip the committer
+/// when a sequencer-side check finds nothing to do, and invalidations run there or as ordered
+/// Commands; Serial only when GPU data must reach guest memory first.
+[[nodiscard]] inline bool FlushCommands() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_FLUSHCMD");
+    static const bool on = Tegra::Nx2Switch(mode, true);
+    return on;
+}
+
+/// EDEN_NX2_MT_REPLAY (on): the committer's scheduler records go into per-render-pass POD op
+/// lists (one scheduler record per list), with bind elision; =2 also checks the order the
+/// worker runs the ops in. =0 off.
 [[nodiscard]] inline u32 Replay() {
-    static const u32 level = EnvNumber("EDEN_NX2_MT_REPLAY", 0);
+    static const u32 level = [] {
+        const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_REPLAY");
+        if (mode == '2') {
+            return 2u;
+        }
+        return Tegra::Nx2Switch(mode, true) ? 1u : 0u;
+    }();
     return level;
 }
 

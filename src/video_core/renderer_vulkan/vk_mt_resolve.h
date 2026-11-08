@@ -27,6 +27,7 @@
 #include "video_core/mt/resolve_packet.h"
 #include "video_core/mt/resolve_sync.h"
 #include "video_core/mt/role.h"
+#include "video_core/mt/uniform_ring.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/textures/texture.h"
 #include "video_core/renderer_vulkan/vk_mt_resolve_types.h"
@@ -79,6 +80,26 @@ public:
     VideoCommon::MT::RingArena<u64> results{size_t{1} << 20}; // 8 MiB
     ResolverCounters counters;
 
+    /// EDEN_NX2_MT_RBUF: the resolver's streamed uniform ring (host-visible, created by Start on
+    /// the thread that starts the pipeline: the memory allocator is not thread-safe).
+    struct UniformRing {
+        vk::Buffer buffer;
+        VkBuffer handle{};
+        VkDeviceAddress address{};
+        std::span<u8> mapped;
+        VideoCommon::MT::UniformRingCore core;
+        VideoCommon::MT::UniformReuseMemo memo;
+        std::vector<u8> scratch;
+    };
+    std::unique_ptr<UniformRing> ring;
+    /// Committer: the batch's draws are recorded into command buffers up to `tick`.
+    void StampBatch(u64 batch, u64 tick) noexcept {
+        if (ring) {
+            ring->core.Stamp(batch / count, tick);
+        }
+    }
+    static constexpr size_t RingBytes = size_t{32} << 20;
+
 private:
     struct Mirrors {
         Maxwell3D* real3d{};
@@ -111,6 +132,8 @@ private:
     std::vector<const ImageView*> view_objects;
     std::vector<u8> view_rescaled;
     std::vector<Sampler*> sampler_objects;
+    std::vector<const Buffer*> buffer_objects;
+    void CreateRing();
     std::jthread thread;
     std::atomic<bool> ready{false};
 };
@@ -126,7 +149,46 @@ inline void Resolver::AddConsumer() {
     has_consumer = true;
 }
 
+inline void Resolver::CreateRing() {
+    RasterizerVulkan& r = pipeline.rasterizer;
+    if (!VideoCommon::MT::ResolverBufferHalf() || ring) {
+        return;
+    }
+    try {
+        auto created = std::make_unique<UniformRing>();
+        VkBufferCreateInfo ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = RingBytes,
+            .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+        if (r.device.IsBufferDeviceAddressSupported()) {
+            ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        }
+        // Host memory (MemoryUsage::Upload): VRAM is the constraint at 2x.
+        created->buffer = r.memory_allocator.CreateBuffer(ci, MemoryUsage::Upload);
+        created->handle = *created->buffer;
+        created->mapped = created->buffer.Mapped();
+        if (created->mapped.size() < RingBytes) {
+            LOG_WARNING(Render_Vulkan, "MT resolver {}: uniform ring is not host visible", index);
+            return;
+        }
+        if (r.device.IsBufferDeviceAddressSupported()) {
+            created->address = r.device.GetLogical().GetBufferDeviceAddress(created->handle);
+        }
+        created->core.Reset(RingBytes, r.buffer_cache.MtUniformBufferAlignment());
+        ring = std::move(created);
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "MT resolver {}: no uniform ring ({})", index, e.what());
+    }
+}
+
 inline void Resolver::Start() {
+    CreateRing();
     ready.store(false, std::memory_order_relaxed);
     thread = std::jthread([this](std::stop_token stop) { Loop(stop); });
     while (!ready.load(std::memory_order_acquire)) {
@@ -283,6 +345,9 @@ inline void Resolver::OnEntry(const u64* entry, std::stop_token& stop) {
         const u64 batch = entry[1];
         if (batch % count == index) {
             LeaveBatch();
+            if (ring) {
+                ring->core.EndBatch(batch / count);
+            }
             counters.batches.fetch_add(1, std::memory_order_relaxed);
             cursor.Publish(batch);
         }
@@ -338,6 +403,10 @@ inline void Resolver::ResolveDraw(const u64* entry) {
     out.channel_gen = channel_gen;
     out.pipeline = packet.header.pipeline;
     out.buffer_epoch = pipeline.rasterizer.buffer_cache.MtBufferEpoch();
+    out.buffer_fail = BufOff;
+    if (ring) {
+        ring->core.BeginBatch(packet.header.batch / count);
+    }
     bool ok = false;
     try {
         ok = ResolveOne(packet, out);
@@ -358,6 +427,9 @@ inline void Resolver::ResolveDraw(const u64* entry) {
     }
     counters.draws.fetch_add(1, std::memory_order_relaxed);
     counters.slow[out.reason].fetch_add(1, std::memory_order_relaxed);
+    if (ok) {
+        counters.buffer_fail[out.buffer_fail].fetch_add(1, std::memory_order_relaxed);
+    }
     if (timed) {
         counters.busy_ns.fetch_add(
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -383,15 +455,57 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     }
     Maxwell3D& mirror = *current->mirror3d;
     const auto& regs = mirror.regs;
-    // Results: views, samplers, then buffers (UBOs, SSBOs, geometry), in u64 words.
-    u32 max_buffers = static_cast<u32>(packet.ssbos.size() + packet.geometry.size());
-    for (const auto& ubo : packet.ubos) {
-        max_buffers += ubo.staged == 0 ? 1 : 0;
+    const auto& stage_infos = *info.stage_infos;
+
+    // The payload layout, per stage: uniform buffers, storage buffers, then images (texture
+    // buffers never reach here). The image entries keep this layout without EDEN_NX2_MT_RBUF.
+    bool rbuf = VideoCommon::MT::ResolverBufferHalf();
+    u8 buffer_fail = rbuf ? BufNone : BufOff;
+    const auto fail_buffers = [&](u8 why) {
+        if (buffer_fail == BufNone) {
+            buffer_fail = why;
+        }
+    };
+    std::array<u32, Maxwell::MaxShaderStage> stage_base{};
+    std::array<u32, Maxwell::MaxShaderStage> stage_buffers{};
+    u32 payload_entries = 0;
+    for (size_t stage = 0; stage < stage_infos.size(); ++stage) {
+        if (!info.spec.enabled_stages[stage]) {
+            continue;
+        }
+        const Shader::Info& stage_info = stage_infos[stage];
+        const u32 ubos = static_cast<u32>(std::popcount(info.enabled_uniform_buffer_masks[stage]));
+        const u32 ssbos = static_cast<u32>(stage_info.storage_buffers_descriptors.size());
+        u32 images = Shader::NumDescriptors(stage_info.texture_descriptors);
+        if (info.spec.has_images) {
+            images += Shader::NumDescriptors(stage_info.image_descriptors);
+        }
+        stage_base[stage] = payload_entries;
+        stage_buffers[stage] = rbuf ? ubos + ssbos : 0;
+        payload_entries += stage_buffers[stage] + images;
     }
+    if (rbuf) {
+        if (header.indirect != 0) {
+            fail_buffers(BufIndirect);
+        } else if (header.inline_index_size != 0) {
+            fail_buffers(BufInlineIndex);
+        } else if (Settings::IsGPUFenceBehaviorAccurate()) {
+            fail_buffers(BufAccurateFences);
+        } else if (r.buffer_cache_runtime.ShouldLimitDynamicStorageBuffers()) {
+            fail_buffers(BufStorageLimit);
+        } else if (payload_entries != info.num_descriptor_entries) {
+            fail_buffers(BufLayout);
+        } else if (!ring) {
+            fail_buffers(BufNoRing);
+        }
+    }
+    // Results: views, samplers, then buffers (UBOs, SSBOs, geometry), in u64 words.
+    u32 max_buffers = static_cast<u32>(packet.ssbos.size() + packet.geometry.size() +
+                                       packet.ubos.size() + Maxwell::MaxShaderStage);
     const size_t view_words = size_t{info.num_image_elements} * sizeof(ViewRef) / 8;
     const size_t sampler_words = size_t{info.num_textures} * sizeof(SamplerRef) / 8;
     const size_t buffer_words = size_t{max_buffers} * sizeof(BufferRef) / 8;
-    const size_t entry_words = size_t{info.num_image_elements} * sizeof(DescriptorUpdateEntry) / 8;
+    const size_t entry_words = size_t{payload_entries} * sizeof(DescriptorUpdateEntry) / 8;
     const size_t total_words = view_words + sampler_words + buffer_words + entry_words;
     u64 end_position = 0;
     std::span<u64> words;
@@ -406,12 +520,15 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     auto* const views = reinterpret_cast<ViewRef*>(words.data());
     auto* const samplers = reinterpret_cast<SamplerRef*>(words.data() + view_words);
     auto* const buffers = reinterpret_cast<BufferRef*>(words.data() + view_words + sampler_words);
-    auto* const image_entries = reinterpret_cast<DescriptorUpdateEntry*>(
+    auto* const payload = reinterpret_cast<DescriptorUpdateEntry*>(
         words.data() + view_words + sampler_words + buffer_words);
     view_objects.assign(info.num_image_elements, nullptr);
     view_rescaled.assign(info.num_image_elements, 0);
     sampler_objects.assign(info.num_textures, nullptr);
-    out.image_entries = image_entries;
+    buffer_objects.assign(max_buffers, nullptr);
+    out.image_entries = payload;
+    out.payload = payload;
+    out.num_payload = payload_entries;
     out.views = views;
     out.samplers = samplers;
     out.buffers = buffers;
@@ -510,7 +627,8 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     };
     const auto resolve_buffer = [&](u8 kind, u8 stage, u8 slot, u8 written, DAddr device_addr,
                                     u32 size, u32 lookup_size) -> bool {
-        BufferRef& ref = buffers[buffer_cursor++];
+        const u32 ref_index = buffer_cursor++;
+        BufferRef& ref = buffers[ref_index];
         ref = BufferRef{};
         ref.kind = kind;
         ref.stage = stage;
@@ -525,12 +643,67 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             ref.buffer = range.id.index;
             ref.gen = range.gen;
             ref.offset = range.offset;
+            buffer_objects[ref_index] = range.buffer;
             return true;
         case BufferCache::MtRangeResolve::Miss:
             out.reason = BufferPageMiss;
             return false;
         }
         return false;
+    };
+
+    // EDEN_NX2_MT_RBUF: buffer descriptor entries, as UpdateDescriptorQueue::AddBuffer writes them.
+    struct PayloadSink {
+        DescriptorUpdateEntry* cursor;
+        bool use_descriptor_buffer;
+        void AddBuffer(VkBuffer buffer, VkDeviceAddress base_address, VkDeviceSize offset,
+                       VkDeviceSize size) {
+            if (!use_descriptor_buffer) {
+                *cursor++ = VkDescriptorBufferInfo{
+                    .buffer = buffer,
+                    .offset = offset,
+                    .range = size,
+                };
+                return;
+            }
+            *cursor++ = DescriptorAddress{
+                .address = base_address == 0 ? 0 : base_address + offset,
+                .range = base_address == 0 ? VK_WHOLE_SIZE : size,
+                .format = VK_FORMAT_UNDEFINED,
+            };
+        }
+    };
+    const bool use_descriptor_buffer =
+        r.guest_descriptor_queue.SupportsDescriptorBuffer() && info.uses_descriptor_buffer;
+    const u64 ring_local = header.batch / count;
+    // A streamed uniform buffer's bytes into the ring (or the slot's previous allocation).
+    const auto stream_uniform = [&](PayloadSink& sink, u32 stage, u32 index, const u8* data,
+                                    u32 size, u64 source) -> bool {
+        UniformRing& rg = *ring;
+        std::optional<u64> offset = rg.memo.Find(stage, index, ring_local, source, data, size);
+        if (offset) {
+            counters.ring_reuses.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            rg.core.BeginBatch(ring_local);
+            offset = rg.core.Allocate(size, [&](u64 tick) { return r.scheduler.IsFree(tick); });
+            if (!offset) {
+                return false;
+            }
+            std::memcpy(rg.mapped.data() + *offset, data, size);
+            rg.memo.Store(stage, index, ring_local, source, *offset, data, size);
+            counters.ring_bytes.fetch_add(size, std::memory_order_relaxed);
+        }
+        counters.ring_streams.fetch_add(1, std::memory_order_relaxed);
+        sink.AddBuffer(rg.handle, rg.address, *offset, size);
+        BufferRef& ref = buffers[buffer_cursor++];
+        ref = BufferRef{};
+        ref.kind = KindUboStream;
+        ref.stage = static_cast<u8>(stage);
+        ref.slot = static_cast<u8>(index);
+        ref.buffer = VideoCommon::NULL_BUFFER_ID.index;
+        ref.offset = static_cast<u32>(*offset);
+        ref.size = size;
+        return true;
     };
 
     // Geometry first, as UpdateGraphicsBuffers does.
@@ -544,7 +717,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             return false;
         }
     }
-    const auto& stage_infos = *info.stage_infos;
+    const auto& uniform_sizes = *info.uniform_buffer_sizes;
     size_t ssbo_cursor = 0;
     size_t ubo_cursor = 0;
     for (size_t stage = 0; stage < stage_infos.size(); ++stage) {
@@ -553,29 +726,90 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         }
         const Shader::Info& stage_info = stage_infos[stage];
         const auto& cbufs = mirror.state.shader_stages[stage].const_buffers;
-        // Cached uniform buffers (streamed ones are bound from the packet's bytes).
-        for (; ubo_cursor < packet.ubos.size() && packet.ubos[ubo_cursor].stage == stage;
-             ++ubo_cursor) {
-            const auto& ubo = packet.ubos[ubo_cursor];
-            if (ubo.staged != 0) {
+        PayloadSink sink{payload + stage_base[stage], use_descriptor_buffer};
+        // Uniform buffers in BindHostGraphicsUniformBuffers' order: cached ones from the cache,
+        // streamed ones (RBUF) into the ring, bank 17 from the root table when unbound.
+        u32 mask = info.enabled_uniform_buffer_masks[stage];
+        while (mask != 0) {
+            const u32 index = static_cast<u32>(std::countr_zero(mask));
+            mask &= mask - 1;
+            const VideoCommon::MT::UboEntry* ubo = nullptr;
+            if (ubo_cursor < packet.ubos.size() && packet.ubos[ubo_cursor].stage == stage &&
+                packet.ubos[ubo_cursor].index == index) {
+                ubo = &packet.ubos[ubo_cursor++];
+            }
+            if (ubo == nullptr) {
+                if (buffer_fail != BufNone) {
+                    continue;
+                }
+                if (index != 17 || !mirror.root_tables.loaded) {
+                    fail_buffers(BufMissingUniform);
+                    continue;
+                }
+                // Root table 0 streamed as bank 17 (BindHostGraphicsUniformBuffer).
+                const auto& table = mirror.root_tables.tables[0];
+                const u32 size = uniform_sizes[stage][index];
+                const u32 copied = (std::min)(size, static_cast<u32>(sizeof(table)));
+                ring->scratch.assign(size, 0);
+                std::memcpy(ring->scratch.data(), table.data(), copied);
+                if (!stream_uniform(sink, static_cast<u32>(stage), index, ring->scratch.data(), size,
+                                    0)) {
+                    fail_buffers(BufRingFull);
+                }
                 continue;
             }
-            // FindBuffer looks up the whole bound size (UpdateUniformBuffers).
-            const u32 bound_size = cbufs[ubo.index].size;
-            if (!resolve_buffer(KindUbo, static_cast<u8>(stage), ubo.index, 0, ubo.device_addr,
-                                ubo.size, (std::max)(bound_size, ubo.size))) {
-                return false;
+            if (ubo->staged == 0) {
+                // FindBuffer looks up the whole bound size (UpdateUniformBuffers).
+                const u32 bound_size = cbufs[ubo->index].size;
+                const u32 ref_index = buffer_cursor;
+                if (!resolve_buffer(KindUbo, static_cast<u8>(stage), ubo->index, 0,
+                                    ubo->device_addr, ubo->size,
+                                    (std::max)(bound_size, ubo->size))) {
+                    return false;
+                }
+                if (buffer_fail == BufNone) {
+                    BufferCacheRuntime::MakeBufferDescriptor(sink, *buffer_objects[ref_index],
+                                                             buffers[ref_index].offset, ubo->size);
+                }
+                continue;
+            }
+            if (buffer_fail != BufNone) {
+                continue;
+            }
+            if (ubo->staged != 1) {
+                fail_buffers(BufUniformMemo); // the committer's per-slot copy (UBO_GEN)
+                continue;
+            }
+            if (!stream_uniform(sink, static_cast<u32>(stage), index, capture.UboBytes(*ubo),
+                                ubo->size, 0)) {
+                fail_buffers(BufRingFull);
             }
         }
+        u32 stage_ssbos = 0;
         for (; ssbo_cursor < packet.ssbos.size() && packet.ssbos[ssbo_cursor].stage == stage;
              ++ssbo_cursor) {
             const auto& ssbo = packet.ssbos[ssbo_cursor];
             const DAddr device_addr = ssbo.skipped != 0 ? 0 : ssbo.device_addr;
+            const u32 ref_index = buffer_cursor;
             if (!resolve_buffer(KindSsbo, static_cast<u8>(stage), ssbo.index, ssbo.is_written,
                                 device_addr, ssbo.size, ssbo.size)) {
                 return false;
             }
+            ++stage_ssbos;
+            if (ssbo.skipped != 0 && ssbo.device_addr != 0) {
+                // FindBuffer(device_addr, 0) may find a buffer there: the committer's.
+                fail_buffers(BufNullStorage);
+            }
+            if (buffer_fail == BufNone) {
+                BufferCacheRuntime::MakeBufferDescriptor(sink, *buffer_objects[ref_index],
+                                                         buffers[ref_index].offset, ssbo.size);
+            }
         }
+        if (buffer_fail == BufNone &&
+            sink.cursor != payload + stage_base[stage] + stage_buffers[stage]) {
+            fail_buffers(BufLayout);
+        }
+        (void)stage_ssbos;
         const auto read_handle = [&](const auto& desc, u32 array_index) -> std::pair<u32, u32> {
             if (desc.handle_program != ~0U) {
                 return Tegra::Texture::TexturePair(
@@ -639,7 +873,6 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     // PushImageDescriptors: the same entries in the same order, from the resolved objects.
     const ImageView& null_view = texture_cache.NullImageViewObject();
     RescalingPushConstant rescaling;
-    u32 entry_cursor = 0;
     u32 view_index = 0;
     u32 sampler_index = 0;
     for (size_t stage = 0; stage < stage_infos.size(); ++stage) {
@@ -647,6 +880,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             continue;
         }
         const Shader::Info& stage_info = stage_infos[stage];
+        u32 entry_cursor = stage_base[stage] + stage_buffers[stage];
         out.stage_begin[stage] = entry_cursor;
         for (const auto& desc : stage_info.texture_descriptors) {
             bool is_rescaled = false;
@@ -665,7 +899,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
                 if (vk_sampler == VK_NULL_HANDLE) {
                     vk_sampler = sampler.HandleFor(view, desc.is_depth);
                 }
-                image_entries[entry_cursor++] = VkDescriptorImageInfo{
+                payload[entry_cursor++] = VkDescriptorImageInfo{
                     .sampler = vk_sampler,
                     .imageView = vk_view,
                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -686,7 +920,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
                         out.reason = ViewLazyHandle;
                         return false;
                     }
-                    image_entries[entry_cursor++] = VkDescriptorImageInfo{
+                    payload[entry_cursor++] = VkDescriptorImageInfo{
                         .sampler = VK_NULL_HANDLE,
                         .imageView = vk_view,
                         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -699,6 +933,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         out.stage_count[stage] = entry_cursor - out.stage_begin[stage];
     }
     out.rescaling = rescaling.Data();
+    out.buffer_fail = buffer_fail;
     return true;
 }
 
@@ -870,6 +1105,20 @@ inline void Nx2DrawPipeline::PrepareResolvedTextures(const MT::ResolvedDraw& res
     out.rescaling = res.rescaling;
 }
 
+inline void Nx2DrawPipeline::ApplyResolvedBuffers(const MT::ResolvedDraw& res, bool is_indexed) {
+    const u32 mismatches = rasterizer.buffer_cache.MtCommitResolvedBuffers(
+        std::span<const MT::BufferRef>(res.buffers, res.num_buffers),
+        res.pipeline->GetResolveInfo().spec.enabled_stages, is_indexed);
+    if (mismatches != 0) [[unlikely]] {
+        counters.uniform_id_mismatches.fetch_add(mismatches, std::memory_order_relaxed);
+        if (VideoCommon::MT::ResolverChecks() != 0) {
+            VerifyReport(0x5300, fmt::format("MT rcheck: draw {}: {} uniform binding(s) held "
+                                             "another buffer than the resolver's",
+                                             res.seq, mismatches));
+        }
+    }
+}
+
 inline void Nx2DrawPipeline::ShadowCompare(const MT::ResolvedDraw& res, const DrawHeader& header,
                                            const GraphicsPipeline::MtShadowSink& sink) {
     counters.shadow_checks.fetch_add(1, std::memory_order_relaxed);
@@ -927,8 +1176,46 @@ inline void Nx2DrawPipeline::ShadowCompare(const MT::ResolvedDraw& res, const Dr
             }
         }
     }
+    if (res.buffer_fail == MT::BufNone && sink.filled) {
+        // EDEN_NX2_MT_RBUF: the whole payload. Streamed uniforms differ in where the bytes are
+        // (the resolver's ring, the committer's staging): only their sizes are compared.
+        if (sink.payload.size() != res.num_payload) {
+            mismatch(12, fmt::format("payload entries: resolver {} committer {}", res.num_payload,
+                                     sink.payload.size()));
+            return;
+        }
+        const MT::Resolver::UniformRing* const ring =
+            resolvers[res.resolver]->ring ? resolvers[res.resolver]->ring.get() : nullptr;
+        for (u32 i = 0; i < res.num_payload; ++i) {
+            const DescriptorUpdateEntry& a = res.payload[i];
+            const DescriptorUpdateEntry& b = sink.payload[i];
+            if (ring != nullptr) {
+                const bool db = rasterizer.guest_descriptor_queue.SupportsDescriptorBuffer() &&
+                                res.pipeline->GetResolveInfo().uses_descriptor_buffer;
+                const bool in_ring =
+                    db ? (ring->address != 0 && a.address.address >= ring->address &&
+                          a.address.address < ring->address + MT::Resolver::RingBytes)
+                       : a.buffer.buffer == ring->handle;
+                if (in_ring) {
+                    if ((db ? a.address.range != b.address.range
+                            : a.buffer.range != b.buffer.range)) {
+                        mismatch(13, fmt::format("payload entry {}: streamed uniform size", i));
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if (std::memcmp(&a, &b, sizeof(a)) != 0) {
+                mismatch(12, fmt::format("payload entry {} differs", i));
+                return;
+            }
+        }
+    }
     for (u32 i = 0; i < res.num_buffers; ++i) {
         const MT::BufferRef& ref = res.buffers[i];
+        if (ref.kind == MT::KindUboStream) {
+            continue;
+        }
         if (ref.kind == MT::KindIndex && header.is_indexed == 0) {
             continue;
         }
@@ -987,6 +1274,36 @@ inline void Nx2DrawPipeline::LogResolverStats(double seconds) {
         }
     }
     take(counters.validate_fail[0]);
+    {
+        // EDEN_NX2_MT_RBUF: why results left the buffer half to the committer, ring use.
+        std::array<u64, MT::BufFailCount> buffer_fail{};
+        u64 ring_bytes = 0;
+        u64 ring_reuses = 0;
+        u64 ring_streams = 0;
+        for (auto& resolver : resolvers) {
+            MT::ResolverCounters& c = resolver->counters;
+            for (size_t i = 0; i < buffer_fail.size(); ++i) {
+                buffer_fail[i] += take(c.buffer_fail[i]);
+            }
+            ring_bytes += take(c.ring_bytes);
+            ring_reuses += take(c.ring_reuses);
+            ring_streams += take(c.ring_streams);
+        }
+        std::string fail_text;
+        for (size_t i = 1; i < buffer_fail.size(); ++i) {
+            if (buffer_fail[i] != 0) {
+                fail_text += fmt::format(" {} {:.0f}", MT::BufferFailNames[i], rate(buffer_fail[i]));
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "MT resolved buffers/s: committed {:.0f}, resolved {:.0f}, left to the "
+                 "committer:{} | ring {:.0f} streams ({:.0f} reused), {:.2f} MB | uniform id "
+                 "mismatches {}",
+                 rate(take(counters.resolved_buffers)), rate(buffer_fail[MT::BufNone]),
+                 fail_text.empty() ? std::string{" none"} : fail_text, rate(ring_streams),
+                 rate(ring_reuses), static_cast<double>(ring_bytes) / 1e6 / seconds,
+                 counters.uniform_id_mismatches.load(std::memory_order_relaxed));
+    }
     LOG_INFO(Render_Vulkan,
              "MT resolvers/s:{} | ok {:.0f} (committed {:.0f}), slow {:.0f}:{}, missing {:.0f}, stolen {:.0f} | validation "
              "failures:{} | batches {:.0f}, commit wait {:.1f} ms, ring waits {:.0f}, barriers "

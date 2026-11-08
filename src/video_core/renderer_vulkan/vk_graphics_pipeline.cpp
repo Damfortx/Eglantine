@@ -960,6 +960,47 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return ConfigureDraw(rescaling, render_area);
 }
 
+bool GraphicsPipeline::ConfigureResolved(bool is_indexed) {
+    // ConfigureImpl for a draw whose texture and buffer halves a resolver of the multithreaded
+    // back resolved (docs/mt-phase5-spec.md §10.3): only what must happen here, in its order.
+    const MtResolvedDraw& draw = *mt_resolved_draw;
+    texture_cache.SynchronizeDescriptors(false);
+    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    draw.apply_buffers(draw.context, is_indexed);
+    for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+        if (resolve_info.spec.enabled_stages[stage]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(stage);
+        }
+    }
+    const auto& regs{maxwell3d->regs};
+    if (regs.transform_feedback_enabled != 0) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
+    buffer_cache.BindHostGeometryBuffers(is_indexed);
+    guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    guest_descriptor_queue.AddRaw(draw.payload, draw.num_payload);
+    RescalingPushConstant rescaling;
+    rescaling.Assign(draw.textures->rescaling);
+    RenderAreaPushConstant render_area;
+    if (resolve_info.uses_render_area) {
+        render_area.uses_render_area = true;
+        const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
+        const bool clip_set = clip_width != 0 && clip_height != 0;
+        render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
+                             static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
+    }
+    if (buffer_cache.any_buffer_uploaded) {
+        buffer_cache.runtime.PostCopyBarrier();
+        buffer_cache.any_buffer_uploaded = false;
+    }
+    texture_cache.UpdateRenderTargets(false);
+    texture_cache.CheckFeedbackLoop(draw.textures->views);
+    if (IsBuilt() && !pipeline) {
+        return false;
+    }
+    return ConfigureDraw(rescaling, render_area);
+}
+
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
     return ConfigureDrawPayload(

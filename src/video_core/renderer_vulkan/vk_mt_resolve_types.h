@@ -10,6 +10,7 @@
 #include <atomic>
 
 #include "common/common_types.h"
+#include "video_core/mt/resolve_packet.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 
 
@@ -72,21 +73,33 @@ struct SamplerRef {
     u32 gen;
 };
 
-enum BufferKind : u8 { KindUbo, KindSsbo, KindVertex, KindIndex };
+enum BufferKind : u8 { KindUbo, KindSsbo, KindVertex, KindIndex, KindUboStream };
 
-struct BufferRef {
-    u32 buffer;
-    u32 gen;
-    u32 offset;
-    u32 size;
-    u8 kind;
-    u8 written;
-    u8 stage;
-    u8 slot;
-    u32 pad;
-    u64 device_addr;
+/// Why a resolved draw's buffer half (EDEN_NX2_MT_RBUF) was left to the committer.
+enum BufferFail : u8 {
+    BufNone,
+    BufOff,
+    BufIndirect,
+    BufInlineIndex,
+    BufAccurateFences,
+    BufStorageLimit,
+    BufLayout,
+    BufMissingUniform,
+    BufUniformMemo,
+    BufRingFull,
+    BufNullStorage,
+    BufNoRing,
+    BufFailCount,
 };
-static_assert(sizeof(BufferRef) == 32);
+inline constexpr std::array<const char*, BufFailCount> BufferFailNames{
+    "none",           "off",          "indirect",    "inline-index", "accurate-fences",
+    "storage-limit",  "layout",       "missing-ubo", "ubo-memo",     "ring-full",
+    "null-storage",   "no-ring"};
+
+using BufferRef = VideoCommon::MT::ResolvedBufferRef;
+static_assert(u8{KindUbo} == u8{BufferRef::Uniform} && u8{KindSsbo} == u8{BufferRef::Storage} &&
+              u8{KindVertex} == u8{BufferRef::Vertex} && u8{KindIndex} == u8{BufferRef::Index} &&
+              u8{KindUboStream} == u8{BufferRef::UniformStream});
 
 /// One draw's result, in the resolved ring slot of its seq. Written by the owning resolver,
 /// read by the committer after the batch publish.
@@ -96,7 +109,7 @@ struct alignas(64) ResolvedDraw {
     ResolveStatus status;
     u8 reason;
     u8 resolver;
-    u8 pad;
+    u8 buffer_fail; ///< BufNone: `payload` holds every descriptor entry (EDEN_NX2_MT_RBUF)
     u32 channel_gen;
     GraphicsPipeline* pipeline;
     u64 buffer_epoch;
@@ -108,8 +121,13 @@ struct alignas(64) ResolvedDraw {
     u32 num_samplers;
     u32 num_buffers;
     u32 sampler_creations;
-    /// PushImageDescriptors' entries of every stage (stage_begin/count index them).
+    /// PushImageDescriptors' entries of every stage (stage_begin/count index them). With
+    /// EDEN_NX2_MT_RBUF they sit inside the full payload, after each stage's buffer entries.
     const DescriptorUpdateEntry* image_entries;
+    /// The whole descriptor payload in ConfigureImpl's order (valid when buffer_fail == BufNone).
+    const DescriptorUpdateEntry* payload;
+    u32 num_payload;
+    u32 pad2;
     std::array<u32, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> stage_begin;
     std::array<u32, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> stage_count;
     std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling;
@@ -124,6 +142,11 @@ struct ResolverCounters {
     std::atomic<u64> wait_ns{};
     std::atomic<u64> sampler_creations{};
     std::array<std::atomic<u64>, SlowReasonCount> slow{};
+    // EDEN_NX2_MT_RBUF.
+    std::array<std::atomic<u64>, BufFailCount> buffer_fail{};
+    std::atomic<u64> ring_bytes{};
+    std::atomic<u64> ring_reuses{};
+    std::atomic<u64> ring_streams{};
 };
 
 } // namespace Vulkan::MT

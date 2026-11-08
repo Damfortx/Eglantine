@@ -126,6 +126,9 @@ public:
     void AddTransition(GraphicsPipeline* transition);
 
     bool Configure(bool is_indexed) {
+        if (mt_resolved_draw != nullptr) [[unlikely]] {
+            return ConfigureResolved(is_indexed);
+        }
         return configure_func(this, is_indexed);
     }
 
@@ -254,12 +257,28 @@ public:
     };
     static inline thread_local const MtResolvedTextures* mt_resolved_textures = nullptr;
 
+    /// EDEN_NX2_MT_RBUF: the whole of ConfigureImpl from a validated resolver result. The
+    /// textures as above; `apply_buffers` applies the buffer intents (storage and uniform state,
+    /// LRU, usage, written ranges, dirty vertex/index bindings) under the cache locks; the
+    /// payload holds every descriptor entry in ConfigureImpl's order.
+    struct MtResolvedDraw {
+        const MtResolvedTextures* textures;
+        const DescriptorUpdateEntry* payload;
+        u32 num_payload;
+        void (*apply_buffers)(void* context, bool is_indexed);
+        void* context;
+    };
+    static inline thread_local const MtResolvedDraw* mt_resolved_draw = nullptr;
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
 
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
+
+    /// Configure from mt_resolved_draw (EDEN_NX2_MT_RBUF).
+    bool ConfigureResolved(bool is_indexed);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);

@@ -140,6 +140,8 @@ struct Counters {
     std::atomic<u64> barriers{};
     std::atomic<u64> resolved_committed{};
     std::atomic<u64> resolved_stolen{}; ///< EDEN_NX2_MT_STEAL_US: recorded without the result
+    std::atomic<u64> resolved_buffers{}; ///< EDEN_NX2_MT_RBUF: committed with the buffer half too
+    std::atomic<u64> uniform_id_mismatches{};
 };
 
 inline constexpr std::array<const char*, 16> ForcedSerialNames{
@@ -471,6 +473,8 @@ private:
     /// (LRU touch, blacklist rating, storage writes) applied.
     void PrepareResolvedTextures(const MT::ResolvedDraw& res,
                                  GraphicsPipeline::MtResolvedTextures& out);
+    /// Committer (EDEN_NX2_MT_RBUF), inside ConfigureResolved: the buffer intents of a result.
+    void ApplyResolvedBuffers(const MT::ResolvedDraw& res, bool is_indexed);
     void RunEntry(const u64* entry);
     void RunSerial(const u64* entry);
     void Idle(std::stop_token& stop);
@@ -1186,6 +1190,12 @@ inline void Nx2DrawPipeline::RunEntry(const u64* entry) {
         break;
     case MT::StreamEntry::BatchEnd:
         counters.batches.fetch_add(1, std::memory_order_relaxed);
+        if (resolver_count != 0) {
+            // The batch's draws are in command buffers up to the current tick: its streamed
+            // uniforms can go once that tick (ReuseWindow batches later) completes.
+            resolvers[entry[1] % resolver_count]->StampBatch(entry[1],
+                                                             rasterizer.scheduler.CurrentTick());
+        }
         // Objects retired while resolvers looked at this batch can go once they left it.
         CollectEpochs();
         break;
@@ -1953,13 +1963,35 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
             GraphicsPipeline::mt_shadow_sink = &shadow_sink;
         }
         GraphicsPipeline::MtResolvedTextures resolved_textures;
+        GraphicsPipeline::MtResolvedDraw resolved_draw;
+        struct BufferContext {
+            Nx2DrawPipeline* self;
+            const MT::ResolvedDraw* res;
+        } buffer_context{this, res};
+        const bool indirect = header.indirect != 0;
         if (res != nullptr && resolved_commit && shadow == 0 &&
             res->status == MT::ResolveStatus::Ok && fail == MT::FailNone) {
             PrepareResolvedTextures(*res, resolved_textures);
-            GraphicsPipeline::mt_resolved_textures = &resolved_textures;
             counters.resolved_committed.fetch_add(1, std::memory_order_relaxed);
+            if (res->buffer_fail == MT::BufNone && !indirect) {
+                // EDEN_NX2_MT_RBUF: the buffer half too; the committer only applies intents.
+                resolved_draw = GraphicsPipeline::MtResolvedDraw{
+                    .textures = &resolved_textures,
+                    .payload = res->payload,
+                    .num_payload = res->num_payload,
+                    .apply_buffers =
+                        [](void* context, bool draw_indexed) {
+                            const auto& ctx = *static_cast<const BufferContext*>(context);
+                            ctx.self->ApplyResolvedBuffers(*ctx.res, draw_indexed);
+                        },
+                    .context = &buffer_context,
+                };
+                GraphicsPipeline::mt_resolved_draw = &resolved_draw;
+                counters.resolved_buffers.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                GraphicsPipeline::mt_resolved_textures = &resolved_textures;
+            }
         }
-        const bool indirect = header.indirect != 0;
         if (indirect) {
             mirror.draw_manager.indirect_state = header.indirect_params;
             r.buffer_cache.SetDrawIndirect(&mirror.draw_manager.indirect_state);
@@ -1977,6 +2009,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         }
         GraphicsPipeline::mt_shadow_sink = nullptr;
         GraphicsPipeline::mt_resolved_textures = nullptr;
+        GraphicsPipeline::mt_resolved_draw = nullptr;
         if (compare && shadow_sink.filled) {
             ShadowCompare(*res, header, shadow_sink);
         }

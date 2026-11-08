@@ -53,6 +53,11 @@ public:
         return use_descriptor_buffer;
     }
 
+    /// Whether Acquire may turn descriptor buffers on (immutable; any thread).
+    [[nodiscard]] bool SupportsDescriptorBuffer() const noexcept {
+        return supports_descriptor_buffer;
+    }
+
     void TickFrame();
     void Acquire(Scheduler& scheduler, size_t required_entries = 0,
                  bool use_descriptor_buffer_ = false);

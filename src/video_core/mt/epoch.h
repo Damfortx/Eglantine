@@ -24,7 +24,7 @@ public:
     static constexpr u32 MaxReaders = 32;
     static constexpr u64 Inactive = (std::numeric_limits<u64>::max)();
 
-    EpochManager() {
+    EpochManager() : instance_id{NextInstanceId()} {
         for (auto& slot : slots) {
             slot.announce.store(Inactive, std::memory_order_relaxed);
             slot.used.store(false, std::memory_order_relaxed);
@@ -50,6 +50,21 @@ public:
             }
         }
         return -1;
+    }
+
+    /// The calling thread's reader slot, registered on first use and kept for the thread's
+    /// life (threads that read only now and then, e.g. guest write traps). -1 when all are taken.
+    [[nodiscard]] int ThreadReader() {
+        struct Cache {
+            u64 instance = 0;
+            int reader = -1;
+        };
+        thread_local Cache cache;
+        if (cache.instance != instance_id) {
+            cache.instance = instance_id;
+            cache.reader = RegisterReader();
+        }
+        return cache.reader;
     }
 
     void UnregisterReader(int reader) {
@@ -99,6 +114,11 @@ public:
     }
 
 private:
+    static u64 NextInstanceId() {
+        static std::atomic<u64> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+
     [[nodiscard]] u64 MinAnnounced() const {
         u64 min_epoch = Inactive;
         for (const auto& slot : slots) {
@@ -127,6 +147,7 @@ private:
         std::atomic<bool> used;
     };
 
+    const u64 instance_id;
     std::atomic<u64> global{1};
     std::array<Slot, MaxReaders> slots;
     std::mutex retire_mutex;

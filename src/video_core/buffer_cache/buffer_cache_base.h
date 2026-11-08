@@ -44,6 +44,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/mt/capture.h"
+#include "video_core/mt/resolve_packet.h"
 #include "video_core/mt/role.h"
 #include "video_core/mt/stable_slot_vector.h"
 #include "video_core/mt/seq_diet.h"
@@ -274,6 +275,7 @@ public:
     /// the cache.
     void MtSetEpochManager(MT::EpochManager* manager) {
         slot_buffers.SetEpochManager(manager);
+        mt_epochs.store(manager, std::memory_order_release);
     }
 
     // ---- MT resolver reads (buffer_cache_mt.h; docs/mt-phase5-spec.md §7.2) ----
@@ -309,6 +311,15 @@ public:
             return channel_state->index_buffer.buffer_id;
         }
     }
+    /// Committer (EDEN_NX2_MT_RBUF), `mutex` held: what ConfigureImpl's buffer half leaves in the
+    /// channel state and the caches for a draw a resolver resolved: storage bindings, uniform
+    /// fast-bind state, LRU touches, usage marks, written storage ranges, and the dirty vertex and
+    /// index bindings (BindHostGeometryBuffers then binds them). Returns how many uniform bindings
+    /// held another buffer id than the resolver's (MT_RCHECK).
+    u32 MtCommitResolvedBuffers(std::span<const MT::ResolvedBufferRef> refs,
+                                const std::array<bool, NUM_STAGES>& enabled_stages,
+                                bool is_indexed);
+
     /// Committer: whether a resolved buffer is still the one the resolver saw.
     [[nodiscard]] bool MtValidateBuffer(BufferId id, u32 gen) const noexcept {
         return id == NULL_BUFFER_ID || slot_buffers.IsCurrent(id, gen);
@@ -689,6 +700,8 @@ private:
     MT::StableSlotVector<Buffer> slot_buffers;
     /// Bumped when a buffer goes away (DeleteBuffer, including the joins of JoinOverlap).
     std::atomic<u64> buffer_epoch{0};
+    /// The epoch manager slot erasure is deferred through (MtIsRegionRegistered's readers).
+    std::atomic<MT::EpochManager*> mt_epochs{nullptr};
 #ifdef YUZU_LEGACY
     static constexpr size_t TICKS_TO_DESTROY = 6;
 #else

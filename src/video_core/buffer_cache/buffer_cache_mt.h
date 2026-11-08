@@ -9,7 +9,9 @@
 #include <atomic>
 #include <cstring>
 
+#include "common/scope_exit.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/mt/epoch.h"
 
 namespace VideoCommon {
 
@@ -187,7 +189,126 @@ auto BufferCache<P>::TryResolveRange(DAddr device_addr, u32 size, bool sparse_co
 }
 
 template <class P>
+u32 BufferCache<P>::MtCommitResolvedBuffers(std::span<const MT::ResolvedBufferRef> refs,
+                                            const std::array<bool, NUM_STAGES>& enabled_stages,
+                                            bool is_indexed) {
+    using Ref = MT::ResolvedBufferRef;
+    u32 mismatches = 0;
+    // config_stage(1): every enabled stage's storage bindings are rebuilt (no driver limit here).
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (enabled_stages[stage]) {
+            channel_state->enabled_storage_buffers[stage] = 0;
+            channel_state->written_storage_buffers[stage] = 0;
+        }
+    }
+    const Ref* index_ref = nullptr;
+    std::array<const Ref*, NUM_VERTEX_BUFFERS> vertex_refs{};
+    for (const Ref& ref : refs) {
+        const BufferId id{ref.buffer};
+        switch (ref.kind) {
+        case Ref::Uniform: {
+            // UpdateUniformBuffers + BindHostGraphicsUniformBuffer's cached path (binding index 0
+            // on this backend).
+            Binding& binding = channel_state->uniform_buffers[ref.stage][ref.slot];
+            if (!binding.buffer_id) {
+                binding.buffer_id = id;
+            } else if (binding.buffer_id != id) {
+                ++mismatches;
+            }
+            Buffer& buffer = slot_buffers[id];
+            TouchBuffer(buffer, id);
+            buffer.MarkUsage(ref.offset, ref.size);
+            channel_state->fast_bound_uniform_buffers[ref.stage] &= ~1u;
+            break;
+        }
+        case Ref::UniformStream:
+            channel_state->fast_bound_uniform_buffers[ref.stage] |= 1u;
+            channel_state->uniform_buffer_binding_sizes[ref.stage][0] = ref.size;
+            break;
+        case Ref::Storage: {
+            channel_state->enabled_storage_buffers[ref.stage] |= 1U << ref.slot;
+            channel_state->written_storage_buffers[ref.stage] |= (ref.written != 0 ? 1U : 0U)
+                                                                 << ref.slot;
+            channel_state->storage_buffers[ref.stage][ref.slot] = Binding{
+                .device_addr = ref.device_addr,
+                .gpu_addr = 0,
+                .size = ref.size,
+                .buffer_id = id,
+                .segment_first = 0,
+                .segment_count = 0,
+            };
+            Buffer& buffer = slot_buffers[id];
+            TouchBuffer(buffer, id);
+            buffer.MarkUsage(ref.offset, ref.size);
+            if (ref.written != 0) {
+                MarkWrittenBuffer(id, ref.device_addr, ref.size);
+            }
+            break;
+        }
+        case Ref::Vertex:
+            if (ref.slot < NUM_VERTEX_BUFFERS) {
+                vertex_refs[ref.slot] = &ref;
+            }
+            break;
+        case Ref::Index:
+            index_ref = &ref;
+            break;
+        default:
+            break;
+        }
+    }
+    const auto binding_of = [](const Ref* ref) {
+        if (ref == nullptr || ref->size == 0 || ref->device_addr == 0) {
+            return NULL_BINDING;
+        }
+        return Binding{
+            .device_addr = ref->device_addr,
+            .gpu_addr = 0,
+            .size = ref->size,
+            .buffer_id = BufferId{ref->buffer},
+            .segment_first = 0,
+            .segment_count = 0,
+        };
+    };
+    // UpdateIndexBuffer / UpdateVertexBuffers, dirty-gated as they are.
+    auto& flags = maxwell3d->dirty.flags;
+    if (is_indexed && flags[Dirty::IndexBuffer]) {
+        flags[Dirty::IndexBuffer] = false;
+        channel_state->index_buffer = binding_of(index_ref);
+    }
+    if (flags[Dirty::VertexBuffers]) {
+        flags[Dirty::VertexBuffers] = false;
+        for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
+            if (!flags[Dirty::VertexBuffer0 + index]) {
+                continue;
+            }
+            const Binding binding = binding_of(vertex_refs[index]);
+            channel_state->vertex_buffers[index] = binding;
+            UpdateVertexBufferSlot(index, binding);
+        }
+    }
+    return mismatches;
+}
+
+template <class P>
 bool BufferCache<P>::MtIsRegionRegistered(DAddr device_addr, u64 size) {
+    // Game threads (write traps) read slots the committer may erase meanwhile: with deferred
+    // erasure (EDEN_NX2_MT_EBR) they read under an epoch guard of their own reader slot, so a
+    // buffer erased after the page_table load is not destroyed (or its slot reused) under them.
+    MT::EpochManager* const epochs = mt_epochs.load(std::memory_order_acquire);
+    int reader = -1;
+    if (epochs != nullptr) {
+        reader = epochs->ThreadReader();
+        if (reader < 0) {
+            return true; // no reader slot left: treat as registered (the trap marks the pages)
+        }
+        epochs->Enter(reader);
+    }
+    SCOPE_EXIT {
+        if (reader >= 0) {
+            epochs->Exit(reader);
+        }
+    };
     const DAddr end_addr = device_addr + size;
     const u64 page_end = Common::DivCeil(end_addr, CACHING_PAGESIZE);
     for (u64 page = device_addr >> CACHING_PAGEBITS; page < page_end && page < page_table.size();

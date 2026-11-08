@@ -34,4 +34,21 @@ struct GeometryEntry {
 };
 static_assert(sizeof(GeometryEntry) == 16);
 
+/// A buffer a resolver resolved for a draw (uniform, storage, vertex, index or a streamed uniform
+/// in its ring), in the order the committer applies the intents (EDEN_NX2_MT_RBUF).
+struct ResolvedBufferRef {
+    enum Kind : u8 { Uniform = 0, Storage = 1, Vertex = 2, Index = 3, UniformStream = 4 };
+    u32 buffer; ///< BufferId index (the null buffer for streamed uniforms)
+    u32 gen;
+    u32 offset;
+    u32 size;
+    u8 kind;
+    u8 written;
+    u8 stage;
+    u8 slot; ///< uniform index, storage index, vertex stream
+    u32 pad;
+    u64 device_addr;
+};
+static_assert(sizeof(ResolvedBufferRef) == 32);
+
 } // namespace VideoCommon::MT

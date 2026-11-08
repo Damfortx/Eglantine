@@ -19,6 +19,7 @@
 #include "video_core/mt/epoch.h"
 #include "video_core/mt/reg_delta.h"
 #include "video_core/mt/selftest_phase5.h"
+#include "video_core/mt/selftest_mt8.h"
 #include "video_core/mt/spmc_stream.h"
 #include "video_core/mt/stable_slot_vector.h"
 
@@ -355,6 +356,7 @@ inline void Run() {
         Test{"p5_t5_batch_publish", BatchPublishStressTest},
         Test{"p5_t6_variant_array", VariantArrayStressTest},
         Test{"p5_t7_barrier", BarrierStressTest},
+        Test{"t8_uniform_ring", UniformRingStressTest},
     };
     bool all = true;
     for (const Test& test : tests) {
