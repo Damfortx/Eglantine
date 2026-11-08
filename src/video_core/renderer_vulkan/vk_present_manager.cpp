@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
 #include "video_core/renderer_vulkan/vk_present_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -597,6 +598,18 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         }
         if (stats) {
             PresentStatsAdd(PresentWait::Submit, submit_start);
+        }
+    }
+
+    // EDEN_NX2_PRESENT_FENCE_FIRST: wait for the blit on its fence (asleep) before presenting. On
+    // X11/XWayland the NVIDIA driver spins in vkQueuePresentKHR (~2 ms a present, under
+    // submit_mutex) until the GPU is done with the image; on Wayland it returns at once.
+    static const char fence_first = Tegra::Nx2EnvMode("EDEN_NX2_PRESENT_FENCE_FIRST");
+    if (Tegra::Nx2Switch(fence_first, false)) {
+        const u64 fence_start = stats ? PresentStatsNow() : 0;
+        frame->present_done.Wait();
+        if (stats) {
+            PresentStatsAdd(PresentWait::Frame, fence_start);
         }
     }
 
