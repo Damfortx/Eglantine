@@ -46,6 +46,30 @@ public:
         return std::span<T>{storage.get() + (start & (capacity - 1)), count};
     }
 
+    /// Producer, non-blocking: an empty span when the releaser has not freed enough yet.
+    [[nodiscard]] std::span<T> TryAllocate(size_t count, u64& end_position) {
+        if (count > capacity) {
+            return {};
+        }
+        u64 start = head;
+        const size_t offset = static_cast<size_t>(start & (capacity - 1));
+        if (offset + count > capacity) {
+            start += capacity - offset; // skip the tail
+        }
+        const u64 end = start + count;
+        if (end - released.load(std::memory_order_acquire) > capacity) {
+            return {};
+        }
+        head = end;
+        end_position = end;
+        return std::span<T>{storage.get() + (start & (capacity - 1)), count};
+    }
+
+    /// Producer: the position the next allocation starts from (end of everything handed out).
+    [[nodiscard]] u64 Head() const noexcept {
+        return head;
+    }
+
     /// Releaser: everything allocated up to `end_position` may be reused.
     void Release(u64 end_position) {
         u64 current = released.load(std::memory_order_relaxed);
