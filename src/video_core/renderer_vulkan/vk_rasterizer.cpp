@@ -1227,6 +1227,22 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 }
 
 namespace {
+// Whether TextureCache::WriteMemory could find an image in the range. It only reaches images
+// through the map views RegisterImage adds, and RegisterImage/TrackImage set the range's texture
+// page bits before adding them or marking the pages cached; the bits never clear, so a range
+// without any can't hold an image, now or before the caller's write (any image registered after
+// the check uploads from guest memory as if the call had taken the lock first). Lets CPU write
+// traps and invalidations of buffer-only memory skip texture_cache.mutex, which the GPU thread
+// holds for long stretches. Off by default: 2.9 fewer frames a second in title 1 (median, 36
+// A/B windows); EDEN_NX2_TRAP_TEXTURE_SKIP=1 turns it on (=a alternates).
+bool MayHoldTexture(DAddr addr, u64 size) {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_TRAP_TEXTURE_SKIP");
+    if (!Tegra::Nx2Switch(mode, false)) {
+        return true;
+    }
+    return Tegra::Nx2MayHoldTexture(addr, size);
+}
+
 // Whether any page of the range was ever written by the GPU through the buffer cache: GPU-modified
 // buffer data only lies on such pages (Nx2MarkGpuWritten, never cleared, on Switch 2).
 bool MayHoldGpuBufferData(DAddr addr, u64 size) {
@@ -1315,10 +1331,14 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
-    {
+    if (std::ranges::any_of(sequences, [](const auto& seq) {
+            return MayHoldTexture(seq.first, seq.second);
+        })) {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
-            texture_cache.WriteMemory(addr, size);
+            if (MayHoldTexture(addr, size)) {
+                texture_cache.WriteMemory(addr, size);
+            }
         }
     }
     {
@@ -1341,7 +1361,7 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             return true;
         }
     }
-    {
+    if (MayHoldTexture(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
@@ -1354,7 +1374,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         return;
     }
 
-    {
+    if (MayHoldTexture(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
@@ -1376,11 +1396,15 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, std
         Profile::Add(Profile::Counter::InvalidatedBytes, bytes);
         Profile::Add(Profile::Counter::InvalidatedRegions, regions.size());
     }
-    {
+    if (std::ranges::any_of(regions, [](const auto& region) {
+            return MayHoldTexture(region.first, region.second);
+        })) {
         Profile::Scope scope{Profile::Zone::InvalidateTexture};
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : regions) {
-            texture_cache.WriteMemory(addr, size);
+            if (MayHoldTexture(addr, size)) {
+                texture_cache.WriteMemory(addr, size);
+            }
         }
     }
     {

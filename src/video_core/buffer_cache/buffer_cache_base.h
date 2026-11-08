@@ -523,6 +523,46 @@ private:
                                                bool is_written, bool native_pointer = false,
                                                bool mapping_sized = false) const;
 
+    /// StorageBufferBinding's derivation from an already read descriptor (address, next qword).
+    [[nodiscard]] Binding StorageBufferBindingFromDescriptor(GPUVAddr gpu_addr, u64 next_qword,
+                                                             u32 cbuf_index, bool is_written,
+                                                             bool native_pointer,
+                                                             bool mapping_sized) const;
+
+    /// Per-slot memo of a storage buffer binding and of its buffer resolution.
+    struct StorageBufferMemo {
+        // Derivation key: the binding is a pure function of these while the page table holds.
+        // The channel is part of it only to drop memos on a channel switch (conservative).
+        const void* channel = nullptr;
+        const Tegra::MemoryManager* gpu_memory = nullptr;
+        u64 generation = 0; ///< Odd layout generation the binding was derived under (0: empty)
+        GPUVAddr ssbo_addr = 0;
+        u64 descriptor[2]{};
+        u32 flags = 0;
+        Binding binding{}; ///< Unresolved (buffer_id empty), as StorageBufferBinding returns
+        // Resolution memo: FindBuffer result for (device_addr, size), valid while no buffer was
+        // deleted anywhere (deletion_epoch) and the layout holds (no multi-range change).
+        const Tegra::MemoryManager* resolved_gpu_memory = nullptr;
+        u64 resolved_generation = 0;
+        u64 resolved_epoch = 0;
+        DAddr resolved_device_addr = 0;
+        GPUVAddr resolved_gpu_addr = 0;
+        u32 resolved_size = 0;
+        bool resolved_is_written = false;
+        BufferId resolved_buffer_id{};
+    };
+
+    /// StorageBufferBinding through a memo (EDEN_NX2_SSBO_MEMO).
+    [[nodiscard]] Binding MemoStorageBufferBinding(StorageBufferMemo& memo, GPUVAddr ssbo_addr,
+                                                   u32 cbuf_index, bool is_written,
+                                                   bool native_pointer = false,
+                                                   bool mapping_sized = false);
+
+    /// Resolves a storage binding's buffer (FindBuffer + multi-range), reusing the memo's last
+    /// single-range result when nothing it depends on changed.
+    void ResolveStorageBinding(Binding& binding, bool is_written, StorageBufferMemo& memo,
+                               std::vector<MultiRangeSegment>& pool);
+
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
 
@@ -694,6 +734,25 @@ private:
     u64 minimum_memory = 0;
     u64 critical_memory = 0;
     BufferId inline_buffer_id;
+
+    /// Bumped whenever a buffer slot is freed. DeleteBuffer only clears the current channel's
+    /// bindings, so memos holding a BufferId (which slots reuse) require this to be unchanged.
+    u64 buffer_deletion_epoch = 1;
+    std::array<std::array<StorageBufferMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES> graphics_ssbo_memo{};
+    std::array<StorageBufferMemo, NUM_STORAGE_BUFFERS> compute_ssbo_memo{};
+    /// Index buffer memo (EDEN_NX2_INDEX_MEMO): FindBuffer(device_addr, size) returned buffer_id
+    /// for size <= resolved_size; while the epoch and layout hold, any smaller size from the same
+    /// start resolves to the same buffer (it is still the one in page_table and covers it).
+    struct IndexBufferMemo {
+        const void* channel = nullptr;
+        const Tegra::MemoryManager* gpu_memory = nullptr;
+        u64 generation = 0;
+        u64 epoch = 0;
+        GPUVAddr gpu_addr = 0;
+        DAddr device_addr = 0;
+        u32 size = 0;
+        BufferId buffer_id{};
+    } index_buffer_memo{};
 #ifdef YUZU_LEGACY
     bool immediately_free = false;
 #endif

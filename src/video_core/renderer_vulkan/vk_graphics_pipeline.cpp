@@ -32,6 +32,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -389,6 +390,19 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
 
+    // EDEN_NX2_TEX_MEMO (default on): reuse the previous draw's texture bindings when nothing
+    // they depend on changed (see TextureMemo). The handles are still read every draw; with the
+    // memo on, sampler handles are resolved after reading (GetSamplerId only on a miss).
+    static const char tex_memo_mode = Tegra::Nx2EnvMode("EDEN_NX2_TEX_MEMO");
+    const bool use_memo = num_image_elements != 0 && Tegra::Nx2Switch(tex_memo_mode, false);
+    if (!use_memo) {
+        tex_memo.valid = false; // The switch may come back on: whatever happened meanwhile
+    }
+    boost::container::small_vector<u32, 96> sampler_handles;
+    if (use_memo) {
+        sampler_handles.reserve(num_textures);
+    }
+
     namespace Profile = VideoCommon::Nx2Profile;
     {
         Profile::Scope scope{Profile::Zone::SyncDescriptors};
@@ -478,8 +492,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 const auto handle{read_handle(desc, index)};
                 views.push_back({handle.first});
 
-                VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
-                samplers.push_back(sampler);
+                if (use_memo) {
+                    sampler_handles.push_back(handle.second);
+                } else {
+                    VideoCommon::SamplerId sampler{
+                        texture_cache.GetSamplerId(handle.second, false)};
+                    samplers.push_back(sampler);
+                }
             }
         }
         if constexpr (Spec::has_images) {
@@ -576,7 +595,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     ASSERT(views.size() == num_image_elements);
-    ASSERT(samplers.size() == num_textures);
+    ASSERT((use_memo ? sampler_handles.size() : samplers.size()) == num_textures);
     // EDEN_NX2_MEMO_STATS: how often a draw reads the same texture handles as this pipeline's
     // previous draw, and the draw before it used this pipeline too.
     static const bool memo_stats = std::getenv("EDEN_NX2_MEMO_STATS") != nullptr;
@@ -587,6 +606,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         for (const auto sampler : samplers) {
             hash = (hash ^ sampler.index) * 0x100000001b3ULL;
+        }
+        for (const u32 sampler_handle : sampler_handles) {
+            hash = (hash ^ sampler_handle) * 0x100000001b3ULL;
         }
         static const GraphicsPipeline* last_pipeline{};
         static u64 draws{}, same_handles{}, same_consecutive{}, no_images{};
@@ -607,7 +629,40 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             window = std::chrono::steady_clock::now();
         }
     }
-    if (!views_clean) {
+    bool memo_hit = false;
+    if (use_memo) {
+        Profile::Scope scope{Profile::Zone::FillImageViews};
+        const auto same_view_handles = [&] {
+            if (tex_memo.view_handles.size() != views.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < views.size(); ++i) {
+                if (tex_memo.view_handles[i] != views[i].index) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        // Handles first (cheap), then every TIC/TSC entry and image state in the cache.
+        memo_hit = tex_memo.valid && tex_memo.channel == texture_cache.ChannelStateTag() &&
+                   tex_memo.view_epoch == texture_cache.ViewEpoch() &&
+                   tex_memo.bindings_serial == texture_cache.TextureBindingsSerial() &&
+                   same_view_handles() &&
+                   tex_memo.sampler_handles.size() == sampler_handles.size() &&
+                   std::equal(sampler_handles.begin(), sampler_handles.end(),
+                              tex_memo.sampler_handles.begin()) &&
+                   texture_cache.TryReuseGraphicsBindings(
+                       std::span(views.data(), views.size()), tex_memo.view_ids,
+                       std::span<const u32>(sampler_handles.data(), sampler_handles.size()),
+                       tex_memo.sampler_ids, Spec::has_images, tex_memo.touch_tick);
+        if (!memo_hit) {
+            tex_memo.valid = false;
+            for (const u32 sampler_handle : sampler_handles) {
+                samplers.push_back(texture_cache.GetSamplerId(sampler_handle, false));
+            }
+        }
+    }
+    if (!memo_hit && !views_clean) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
@@ -709,15 +764,57 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    const bool fill_memo = use_memo && !memo_hit;
+    if (memo_hit) {
+        // What PushImageDescriptors does besides writing entries: storage image writes.
+        for (const VideoCommon::ImageId image_id : tex_memo.written_images) {
+            texture_cache.MarkModification(image_id);
+        }
+    } else if (fill_memo) {
+        tex_memo.entries.clear();
+        tex_memo.written_images.clear();
+        tex_memo.stage_begin.fill(0);
+        tex_memo.stage_count.fill(0);
+    }
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
             buffer_cache.BindHostStageBuffers(stage);
         }
-        {
+        // The stage's image entries follow its buffer entries in the payload: a memo hit
+        // replays them at the same position.
+        if (memo_hit) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            guest_descriptor_queue.AddRaw(tex_memo.entries.data() + tex_memo.stage_begin[stage],
+                                          tex_memo.stage_count[stage]);
+        } else {
+            Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const DescriptorUpdateEntry* const entries_begin{guest_descriptor_queue.Cursor()};
+            const VideoCommon::ImageViewInOut* const stage_views{views_it};
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it);
+            if (fill_memo) {
+                const DescriptorUpdateEntry* const entries_end{guest_descriptor_queue.Cursor()};
+                tex_memo.stage_begin[stage] = static_cast<u32>(tex_memo.entries.size());
+                tex_memo.stage_count[stage] = static_cast<u32>(entries_end - entries_begin);
+                tex_memo.entries.insert(tex_memo.entries.end(), entries_begin, entries_end);
+                if constexpr (Spec::has_images) {
+                    // The images PushImageDescriptors marked modified, in its order.
+                    const Shader::Info& stage_info{stage_infos[stage]};
+                    const VideoCommon::ImageViewInOut* it{
+                        stage_views + Shader::NumDescriptors(stage_info.texture_buffer_descriptors) +
+                        Shader::NumDescriptors(stage_info.image_buffer_descriptors) +
+                        Shader::NumDescriptors(stage_info.texture_descriptors)};
+                    for (const auto& desc : stage_info.image_descriptors) {
+                        for (u32 index = 0; index < desc.count; ++index, ++it) {
+                            if (desc.is_written) {
+                                tex_memo.written_images.push_back(
+                                    texture_cache.GetImageView(it->id).image_id);
+                            }
+                        }
+                    }
+                }
+            }
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -743,6 +840,27 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
+    }
+    if (memo_hit) {
+        rescaling.Assign(tex_memo.rescaling);
+    } else if (fill_memo) {
+        // Keyed by the state after FillImageViews (which may erase views and loop) and before
+        // UpdateRenderTargets: an erasure from there on advances the epoch and the next draw
+        // misses.
+        tex_memo.rescaling = rescaling.Data();
+        tex_memo.channel = texture_cache.ChannelStateTag();
+        tex_memo.view_epoch = texture_cache.ViewEpoch();
+        tex_memo.bindings_serial = texture_cache.TextureBindingsSerial();
+        tex_memo.touch_tick = texture_cache.FrameTick(); // FillImageViews touched them all
+        tex_memo.view_handles.resize(views.size());
+        tex_memo.view_ids.resize(views.size());
+        for (size_t i = 0; i < views.size(); ++i) {
+            tex_memo.view_handles[i] = views[i].index;
+            tex_memo.view_ids[i] = views[i].id;
+        }
+        tex_memo.sampler_handles.assign(sampler_handles.begin(), sampler_handles.end());
+        tex_memo.sampler_ids.assign(samplers.begin(), samplers.end());
+        tex_memo.valid = true;
     }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();

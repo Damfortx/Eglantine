@@ -605,8 +605,8 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
     const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
-    channel_state->storage_buffers[stage][ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
+    channel_state->storage_buffers[stage][ssbo_index] = MemoStorageBufferBinding(
+        graphics_ssbo_memo[stage][ssbo_index], ssbo_addr, cbuf_index, is_written);
     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
 }
 
@@ -684,9 +684,9 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
 
     const auto& cbufs = launch_desc.const_buffer_config;
     const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
-    channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode(),
-                             kepler_compute->IsDlssDispatch());
+    channel_state->compute_storage_buffers[ssbo_index] = MemoStorageBufferBinding(
+        compute_ssbo_memo[ssbo_index], ssbo_addr, cbuf_index, is_written,
+        kepler_compute->IsNativeMode(), kepler_compute->IsDlssDispatch());
 }
 
 template <class P>
@@ -1594,6 +1594,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
             slot_buffers.erase(inline_buffer_id);
+            ++buffer_deletion_epoch;
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         channel_state->index_buffer = Binding{
@@ -1606,19 +1607,57 @@ void BufferCache<P>::UpdateIndexBuffer() {
 
     const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
     const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
     const u32 size = (std::min)(address_size, draw_size);
+
+    // The draw manager dirties the index buffer on every indexed draw. While the layout (device
+    // address of the start) and the buffer set (no deletion anywhere) hold, the buffer FindBuffer
+    // returned for (start, memo.size) is the page_table entry at start and covers any smaller
+    // size from the same start, so FindBuffer would return it again. Accurate GPU fences make
+    // FindBuffer synchronize writes, so the memo stays off there.
+    static const char index_memo_mode = Tegra::Nx2EnvMode("EDEN_NX2_INDEX_MEMO");
+    const bool use_memo =
+        Tegra::Nx2Switch(index_memo_mode, false) && !Settings::IsGPUFenceBehaviorAccurate();
+    const u64 generation = use_memo ? gpu_memory->LayoutGeneration() : 0;
+    IndexBufferMemo& memo = index_buffer_memo;
+    if (use_memo && size != 0 && memo.buffer_id && memo.generation == generation &&
+        memo.epoch == buffer_deletion_epoch && memo.channel == channel_state &&
+        memo.gpu_memory == gpu_memory && memo.gpu_addr == gpu_addr_begin && size <= memo.size) {
+        channel_state->index_buffer = Binding{
+            .device_addr = memo.device_addr,
+            .size = size,
+            .buffer_id = memo.buffer_id,
+        };
+        return;
+    }
+
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     if (size == 0 || !device_addr) {
         channel_state->index_buffer = NULL_BINDING;
         return;
     }
+    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
     channel_state->index_buffer = Binding{
         .device_addr = *device_addr,
         .size = size,
-        .buffer_id = FindBuffer(*device_addr, size, false),
+        .buffer_id = buffer_id,
     };
+    if (use_memo) {
+        // Only under a stable (odd) generation read before the translation; the epoch is read
+        // after FindBuffer, which may itself delete buffers it merges.
+        const bool stable = (generation & 1) != 0 && buffer_id && buffer_id != NULL_BUFFER_ID;
+        memo = IndexBufferMemo{
+            .channel = stable ? channel_state : nullptr,
+            .gpu_memory = gpu_memory,
+            .generation = generation,
+            .epoch = buffer_deletion_epoch,
+            .gpu_addr = gpu_addr_begin,
+            .device_addr = *device_addr,
+            .size = size,
+            .buffer_id = stable ? buffer_id : BufferId{},
+        };
+    }
 }
 
 template <class P>
@@ -1719,10 +1758,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         // Resolve buffer
         Binding& binding = channel_state->storage_buffers[stage][index];
-        const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
-        binding.buffer_id = buffer_id;
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
-        ResolveMultiRangeStorage(binding, is_written, graphics_segments);
+        ResolveStorageBinding(binding, is_written, graphics_ssbo_memo[stage][index],
+                              graphics_segments);
     });
 }
 
@@ -1788,10 +1826,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
     ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
         // Resolve buffer
         Binding& binding = channel_state->compute_storage_buffers[index];
-        binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
         const bool is_written =
             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-        ResolveMultiRangeStorage(binding, is_written, compute_segments);
+        ResolveStorageBinding(binding, is_written, compute_ssbo_memo[index], compute_segments);
     });
 }
 
@@ -2566,6 +2603,8 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
         delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
 
     slot_buffers.erase(buffer_id);
+    // Other channels' bindings and the per-draw memos may still hold this (reusable) id.
+    ++buffer_deletion_epoch;
 
     if constexpr (HAS_PERSISTENT_UNIFORM_BUFFER_BINDINGS) {
         channel_state->dirty_uniform_buffers.fill(~u32{0});
@@ -2595,7 +2634,16 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
+    const u64 next_qword = mapping_sized ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
+    return StorageBufferBindingFromDescriptor(gpu_addr, next_qword, cbuf_index, is_written,
+                                              native_pointer, mapping_sized);
+}
 
+template <class P>
+Binding BufferCache<P>::StorageBufferBindingFromDescriptor(GPUVAddr gpu_addr, u64 next_qword,
+                                                           u32 cbuf_index, bool is_written,
+                                                           bool native_pointer,
+                                                           bool mapping_sized) const {
     u32 size = [&]() {
         const u32 memory_layout_size =
             static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
@@ -2604,7 +2652,6 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         if (mapping_sized) {
             return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
         }
-        const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
         const u32 packed_size = static_cast<u32>(next_qword);
         const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
                                         packed_size != 0 &&
@@ -2647,6 +2694,89 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         .buffer_id = BufferId{},
     };
     return binding;
+}
+
+template <class P>
+Binding BufferCache<P>::MemoStorageBufferBinding(StorageBufferMemo& memo, GPUVAddr ssbo_addr,
+                                                 u32 cbuf_index, bool is_written,
+                                                 bool native_pointer, bool mapping_sized) {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_SSBO_MEMO");
+    if (!Tegra::Nx2Switch(mode, true)) {
+        return StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer,
+                                    mapping_sized);
+    }
+    // The descriptor bytes are read every draw; everything else the derivation consults
+    // (GetMemoryLayoutSize, MaxContinuousRange, GpuToCpuAddress) depends only on the page table.
+    // The generation is read first, so a change racing with the derivation can't be memoized
+    // under a value that later matches.
+    const u64 generation = gpu_memory->LayoutGeneration();
+    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    if (gpu_addr == 0) {
+        return NULL_BINDING;
+    }
+    const u64 next_qword = mapping_sized ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
+    const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) |
+                      (mapping_sized ? 4U : 0U);
+    if (memo.generation == generation && memo.channel == channel_state &&
+        memo.gpu_memory == gpu_memory && memo.ssbo_addr == ssbo_addr &&
+        memo.descriptor[0] == gpu_addr && memo.descriptor[1] == next_qword &&
+        memo.flags == flags) {
+        return memo.binding;
+    }
+    const Binding binding = StorageBufferBindingFromDescriptor(
+        gpu_addr, next_qword, cbuf_index, is_written, native_pointer, mapping_sized);
+    // Even generations mean a page table change is in progress: don't memoize under them.
+    memo.generation = (generation & 1) != 0 ? generation : 0;
+    memo.channel = channel_state;
+    memo.gpu_memory = gpu_memory;
+    memo.ssbo_addr = ssbo_addr;
+    memo.descriptor[0] = gpu_addr;
+    memo.descriptor[1] = next_qword;
+    memo.flags = flags;
+    memo.binding = binding;
+    return binding;
+}
+
+template <class P>
+void BufferCache<P>::ResolveStorageBinding(Binding& binding, bool is_written,
+                                           StorageBufferMemo& memo,
+                                           std::vector<MultiRangeSegment>& pool) {
+    // FindBuffer(device_addr, size) keeps returning the same buffer while no buffer is deleted:
+    // only a deletion (merge, eviction) can remove the page_table entry covering the range, and
+    // a new overlapping buffer deletes the old one first. Multi-range results depend on the
+    // layout and use the per-draw segment pool, so only single-range results are reused, under
+    // an unchanged layout generation. Accurate GPU fences make FindBuffer synchronize writes.
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_SSBO_MEMO");
+    const bool use_memo = Tegra::Nx2Switch(mode, true) && !Settings::IsGPUFenceBehaviorAccurate();
+    const u64 generation = use_memo ? gpu_memory->LayoutGeneration() : 0;
+    if (use_memo && memo.resolved_buffer_id && memo.resolved_epoch == buffer_deletion_epoch &&
+        memo.resolved_generation == generation && memo.resolved_gpu_memory == gpu_memory &&
+        memo.resolved_device_addr == binding.device_addr &&
+        memo.resolved_gpu_addr == binding.gpu_addr && memo.resolved_size == binding.size &&
+        memo.resolved_is_written == is_written) {
+        binding.buffer_id = memo.resolved_buffer_id;
+        binding.segment_first = 0;
+        binding.segment_count = 0;
+        return;
+    }
+    binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
+    ResolveMultiRangeStorage(binding, is_written, pool);
+    if (!use_memo) {
+        return;
+    }
+    // binding lives in channel_state, so a deletion during the calls above has cleared its id;
+    // the epoch is read afterwards so it includes those deletions.
+    // NULL_BUFFER_ID is truthy (index 0); cleared ids are BufferId{} (falsy).
+    const bool reusable = binding.buffer_id && binding.buffer_id != NULL_BUFFER_ID &&
+                          binding.segment_count == 0 && (generation & 1) != 0;
+    memo.resolved_buffer_id = reusable ? binding.buffer_id : BufferId{};
+    memo.resolved_epoch = buffer_deletion_epoch;
+    memo.resolved_generation = generation;
+    memo.resolved_gpu_memory = gpu_memory;
+    memo.resolved_device_addr = binding.device_addr;
+    memo.resolved_gpu_addr = binding.gpu_addr;
+    memo.resolved_size = binding.size;
+    memo.resolved_is_written = is_written;
 }
 
 template <class P>

@@ -246,6 +246,39 @@ public:
     /// nothing, when any view needs more: the caller runs FillImageViews.
     [[nodiscard]] bool TryFillImageViewsClean(std::span<ImageViewInOut> views, bool blacklist);
 
+    /// Draw-to-draw memo of a graphics pipeline's texture bindings (EDEN_NX2_TEX_MEMO).
+    /// An ImageViewId, and the Vulkan handles behind it, stays the same view only while the
+    /// view epoch is unchanged: it advances whenever image views are erased (InvalidateScale,
+    /// DeleteImage) or a channel is created (its storage may reuse an erased one's address).
+    [[nodiscard]] u64 ViewEpoch() const noexcept {
+        return view_epoch;
+    }
+    /// Advances when a graphics/compute TIC or TSC table moves or changes its limit.
+    [[nodiscard]] u64 TextureBindingsSerial() const noexcept {
+        return texture_bindings_serial;
+    }
+    /// Identifies the bound channel (its tables) for the memo; never dereferenced.
+    [[nodiscard]] const void* ChannelStateTag() const noexcept {
+        return channel_state;
+    }
+    [[nodiscard]] u64 FrameTick() const noexcept {
+        return frame_tick;
+    }
+
+    /// For a memo with the same channel, view epoch and bindings serial: whether FillImageViews
+    /// and GetSamplerId would return memo_views / memo_samplers for these handles while doing
+    /// nothing but LRU touches (and resetting the scale rating of blacklisted views). Every TIC
+    /// and TSC entry is compared against guest memory (PeekUnchanged), and each image must have
+    /// no CPU writes to upload, no aliases to synchronize and, when blacklisted, not be rescaled.
+    /// On success the views take the memo's ids, the blacklisted images get the scale rating
+    /// reset FillImageViews gives them and the images are touched in the LRU once per frame
+    /// (touch_tick); false, having changed nothing, otherwise.
+    [[nodiscard]] bool TryReuseGraphicsBindings(std::span<ImageViewInOut> views,
+                                                std::span<const ImageViewId> memo_views,
+                                                std::span<const u32> sampler_handles,
+                                                std::span<const SamplerId> memo_samplers,
+                                                bool blacklist, u64& touch_tick);
+
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
@@ -548,6 +581,7 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+    u64 view_epoch = 0; ///< See ViewEpoch
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

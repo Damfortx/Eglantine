@@ -336,6 +336,12 @@ public:
         return words;
     }
 
+    /// Replaces the bits with those a previous draw's pushes produced (texture binding memo):
+    /// only valid once every push of the draw is done, as the push cursors are left as they are.
+    void Assign(const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& data) noexcept {
+        words = data;
+    }
+
 private:
     std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> words{};
     u32* texture_ptr{words.data()};

@@ -62,6 +62,12 @@ public:
         return unique_identifier;
     }
 
+    /// Page table generation: odd while stable, even during a change. Results derived from the
+    /// page table under one odd value stay valid while it is unchanged.
+    [[nodiscard]] u64 LayoutGeneration() const noexcept {
+        return layout_generation.load(std::memory_order_acquire);
+    }
+
     /// Binds a renderer to the memory manager.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 

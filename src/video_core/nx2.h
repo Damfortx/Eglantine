@@ -149,6 +149,56 @@ inline void Nx2ClearGpuWrittenPages() {
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+// Device pages that have ever held a texture-cache image's guest memory (same layout as
+// g_nx2_gpu_written_pages), set when an image is registered or tracked and never cleared. A CPU
+// write or invalidation of a range with none of these bits can't reach an image, so the
+// rasterizer skips the texture cache (and its lock) for it (EDEN_NX2_TRAP_TEXTURE_SKIP=0 off).
+inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_texture_pages{};
+
+/// Call before the image's pages are registered or marked cached (the release orders the bits
+/// before them).
+inline void Nx2MarkTexturePages(u64 device_address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const u64 limit = g_nx2_texture_pages.size() * 64;
+    const u64 first = device_address >> Nx2WrittenPageBits;
+    if (first >= limit) {
+        return; // Beyond the bitmap: Nx2MayHoldTexture always answers true there
+    }
+    const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits, limit - 1);
+    for (u64 page = first; page <= last; ++page) {
+        auto& word = g_nx2_texture_pages[page / 64];
+        const u64 bit = u64{1} << (page % 64);
+        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+            word.fetch_or(bit, std::memory_order_release);
+        }
+    }
+}
+
+/// Whether any page of the range has ever held an image (conservatively true outside the bitmap).
+[[nodiscard]] inline bool Nx2MayHoldTexture(u64 device_address, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 limit = g_nx2_texture_pages.size() * 64;
+    const u64 first = device_address >> Nx2WrittenPageBits;
+    const u64 last = (device_address + size - 1) >> Nx2WrittenPageBits;
+    if (last >= limit || last < first) {
+        return true;
+    }
+    for (u64 page = first; page <= last;) {
+        const u64 shift = page % 64;
+        const u64 count = std::min<u64>(64 - shift, last - page + 1);
+        const u64 mask = (count == 64 ? ~u64{0} : ((u64{1} << count) - 1)) << shift;
+        if (g_nx2_texture_pages[page / 64].load(std::memory_order_acquire) & mask) {
+            return true;
+        }
+        page += count;
+    }
+    return false;
+}
+
 // NVN2 queues release their progress values into the second page of a two-page GPU-accessible
 // region and GPU acquires read the same offsets in the first page (the CPU polls the second).
 // Something on the console copies one into the other; until that is known, the puller mirrors

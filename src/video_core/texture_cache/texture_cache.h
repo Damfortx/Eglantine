@@ -591,6 +591,88 @@ bool TextureCache<P>::TryFillImageViewsClean(std::span<ImageViewInOut> views, bo
 }
 
 template <class P>
+bool TextureCache<P>::TryReuseGraphicsBindings(std::span<ImageViewInOut> views,
+                                               std::span<const ImageViewId> memo_views,
+                                               std::span<const u32> sampler_handles,
+                                               std::span<const SamplerId> memo_samplers,
+                                               bool blacklist, u64& touch_tick) {
+    if (views.size() != memo_views.size() || sampler_handles.size() != memo_samplers.size()) {
+        return false;
+    }
+    auto& image_table = channel_state->graphics_image_table;
+    auto& sampler_table = channel_state->graphics_sampler_table;
+    const bool native = gpu_memory->UsesNativeTiling();
+    // Pass 1, no side effects. An entry PeekUnchanged accepts was read since the table was last
+    // invalidated and still matches guest memory, so VisitImageView / GetSamplerId would return
+    // bound_ids[index] without recreating anything; the view epoch (checked by the caller)
+    // guarantees that id still names the view the memoized descriptors were built from.
+    for (size_t i = 0; i < views.size(); ++i) {
+        const ImageViewId memo_id = memo_views[i];
+        const u32 index =
+            Tegra::Texture::TextureHeaderIndex(views[i].index, image_table.current_limit, native);
+        if (index > image_table.current_limit) {
+            if (memo_id != NULL_IMAGE_VIEW_ID) {
+                return false;
+            }
+            continue;
+        }
+        if (!image_table.PeekUnchanged(*gpu_memory, index) ||
+            image_table.bound_ids[index] != memo_id) {
+            return false;
+        }
+        if (!memo_id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[memo_id];
+        if (image_view.IsBuffer()) {
+            continue;
+        }
+        const Image& image = slot_images[image_view.image_id];
+        // PrepareImage would upload (CpuModified) or copy between aliases; a blacklisted view
+        // of a rescaled image would be scaled down (InvalidateScale).
+        if (True(image.flags & ImageFlagBits::CpuModified) || !image.aliased_images.empty() ||
+            (blacklist && views[i].blacklist && True(image.flags & ImageFlagBits::Rescaled))) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < sampler_handles.size(); ++i) {
+        const u32 index = sampler_handles[i];
+        if (index > sampler_table.current_limit) {
+            if (memo_samplers[i] != NULL_SAMPLER_ID) {
+                return false;
+            }
+            continue;
+        }
+        if (!sampler_table.PeekUnchanged(*gpu_memory, index) ||
+            sampler_table.bound_ids[index] != memo_samplers[i]) {
+            return false;
+        }
+    }
+    // Pass 2: what FillImageViews does for clean hits besides returning the ids.
+    const bool touch = touch_tick != frame_tick;
+    for (size_t i = 0; i < views.size(); ++i) {
+        const ImageViewId id = memo_views[i];
+        views[i].id = id;
+        if (!id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[id];
+        if (image_view.IsBuffer()) {
+            continue;
+        }
+        Image& image = slot_images[image_view.image_id];
+        if (blacklist && views[i].blacklist) {
+            image.scale_rating = 0;
+        }
+        if (touch) {
+            lru_cache.Touch(image.lru_index, frame_tick);
+        }
+    }
+    touch_tick = frame_tick;
+    return true;
+}
+
+template <class P>
 void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     if (!Settings::values.barrier_feedback_loops.GetValue()) {
         return;
@@ -2310,6 +2392,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     }
     image.image_view_ids.clear();
     image.image_view_infos.clear();
+    ++view_epoch; // Erased views: memoized ImageViewIds may be reused (TryReuseGraphicsBindings)
     for (size_t c : active_channel_ids) {
         auto& channel_info = channel_storage[c];
 
@@ -3267,6 +3350,9 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
         (*channel_state->gpu_page_table)[page].push_back(image_id);
     });
     if (False(image.flags & ImageFlagBits::Sparse)) {
+        // Before the map views go in: WriteMemory only finds images through them, and the
+        // rasterizer skips it on ranges without these bits (Nx2MayHoldTexture).
+        Tegra::Nx2MarkTexturePages(image.cpu_addr, image.guest_size_bytes);
         auto map_id =
             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
@@ -3277,6 +3363,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     boost::container::small_vector<ImageViewId, 16> sparse_maps;
     ForEachSparseSegment(
         image, [this, image_id, &sparse_maps](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+            Tegra::Nx2MarkTexturePages(cpu_addr, size);
             auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
             ForEachCPUPage(cpu_addr, size,
                            [this, map_id](u64 page) { page_table[page].push_back(map_id); });
@@ -3374,8 +3461,11 @@ template <class P>
 void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
     ASSERT(False(image.flags & ImageFlagBits::Tracked));
     image.flags |= ImageFlagBits::Tracked;
+    // The texture page bits go before the pages are marked cached (and their writes trapped).
+    // RegisterImage set them already; this keeps the order if tracking ever comes first.
     if (False(image.flags & ImageFlagBits::Sparse)) {
         if (image.cpu_addr < ~(1ULL << 40)) {
+            Tegra::Nx2MarkTexturePages(image.cpu_addr, image.guest_size_bytes);
             device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, 1);
         }
         return;
@@ -3388,12 +3478,14 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
             const auto& map = slot_map_views[map_view_id];
             const DAddr cpu_addr = map.cpu_addr;
             const std::size_t size = map.size;
+            Tegra::Nx2MarkTexturePages(cpu_addr, size);
             device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
         }
         return;
     }
     ForEachSparseSegment(image,
                          [this]([[maybe_unused]] GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+                             Tegra::Nx2MarkTexturePages(cpu_addr, size);
                              device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
                          });
 }
@@ -3499,6 +3591,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         }
         slot_image_views.erase(image_view_id);
     }
+    ++view_epoch; // Erased views: memoized ImageViewIds may be reused (TryReuseGraphicsBindings)
     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
                                                        uncommitted_downloads, committed_downloads);
     if (retained) {
@@ -3870,6 +3963,8 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
 template <class P>
 void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel) {
     VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>::CreateChannel(channel);
+    // Its storage may sit where an erased channel's did: memos keyed by the address are stale.
+    ++view_epoch;
     const auto it = channel_map.find(channel.bind_id);
     auto* this_state = &channel_storage[it->second];
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -95,6 +96,17 @@ public:
             .range = base_address == 0 ? VK_WHOLE_SIZE : size,
             .format = VK_FORMAT_UNDEFINED,
         };
+    }
+
+    /// Where the next entry goes: brackets the entries a caller adds, to replay them.
+    [[nodiscard]] const DescriptorUpdateEntry* Cursor() const noexcept {
+        return payload_cursor;
+    }
+
+    /// Appends entries recorded earlier through Cursor, as they were.
+    void AddRaw(const DescriptorUpdateEntry* entries, size_t count) noexcept {
+        std::copy_n(entries, count, payload_cursor);
+        payload_cursor += count;
     }
 
     void AddTexelBuffer(VkBufferView texel_buffer) {

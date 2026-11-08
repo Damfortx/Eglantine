@@ -193,6 +193,30 @@ private:
     u32 num_descriptor_entries{};
     size_t num_image_elements{};
     u64 memo_last_handles{}; ///< EDEN_NX2_MEMO_STATS
+
+    /// EDEN_NX2_TEX_MEMO: the texture bindings of this pipeline's last draw that took the full
+    /// path. A draw reuses them when the channel, the texture cache's view epoch and bindings
+    /// serial match, it read the same handles, and TryReuseGraphicsBindings confirms every
+    /// TIC/TSC entry is unchanged in guest memory and each image needs no preparation. The
+    /// descriptor entries and rescaling bits are a pure function of the view and sampler ids
+    /// (views are immutable until erased, which advances the epoch; rescaling erases them).
+    struct TextureMemo {
+        bool valid{};
+        const void* channel{};
+        u64 view_epoch{};
+        u64 bindings_serial{};
+        u64 touch_tick{~0ULL}; ///< Frame its images were last touched in the LRU
+        std::vector<u32> view_handles;    ///< TIC handle per image element, in views order
+        std::vector<u32> sampler_handles; ///< TSC handle per texture element
+        std::vector<VideoCommon::ImageViewId> view_ids;
+        std::vector<VideoCommon::SamplerId> sampler_ids;
+        std::vector<VideoCommon::ImageId> written_images; ///< PushImageDescriptors marks these
+        std::vector<DescriptorUpdateEntry> entries; ///< Image entries of all stages, in order
+        std::array<u32, NUM_STAGES> stage_begin{}; ///< First of the stage's entries
+        std::array<u32, NUM_STAGES> stage_count{}; ///< How many entries the stage has
+        std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling{};
+    };
+    TextureMemo tex_memo;
     u32 num_textures{};
     bool fragment_has_color0_output{};
 
