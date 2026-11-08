@@ -126,6 +126,7 @@ struct Counters {
     std::atomic<u64> shadow_mismatches{};
     std::atomic<u64> shadow_unvalidated{};
     std::atomic<u64> barriers{};
+    std::atomic<u64> resolved_committed{};
 };
 
 inline constexpr std::array<const char*, 16> ForcedSerialNames{
@@ -420,6 +421,10 @@ private:
                        const GraphicsPipeline::MtShadowSink& sink);
     void StartResolvers();
     void StopResolvers();
+    /// Committer: a validated result as ConfigureImpl's texture half, with the views' intents
+    /// (LRU touch, blacklist rating, storage writes) applied.
+    void PrepareResolvedTextures(const MT::ResolvedDraw& res,
+                                 GraphicsPipeline::MtResolvedTextures& out);
     void RunEntry(const u64* entry);
     void RunSerial(const u64* entry);
     void Idle(std::stop_token& stop);
@@ -503,7 +508,10 @@ private:
     /// Bumped by the committer at each channel bind; resolvers copy it at the barrier.
     std::atomic<u32> channel_gen{0};
     const u32 shadow = VideoCommon::MT::Shadow();
+    const bool resolved_commit = VideoCommon::MT::ResolvedCommit();
     GraphicsPipeline::MtShadowSink shadow_sink;
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> commit_views;
+    boost::container::small_vector<VideoCommon::SamplerId, 96> commit_samplers;
     /// Committer: the seq of the last committed draw packet (sequencer back-pressure).
     alignas(64) std::atomic<u64> committed_seq{0};
 
@@ -1722,7 +1730,16 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
                              res->status == MT::ResolveStatus::Ok && fail == MT::FailNone;
         if (compare) {
             shadow_sink.filled = false;
+            shadow_sink.images_recorded = false;
+            shadow_sink.stage_image_count.fill(0);
             GraphicsPipeline::mt_shadow_sink = &shadow_sink;
+        }
+        GraphicsPipeline::MtResolvedTextures resolved_textures;
+        if (res != nullptr && resolved_commit && shadow == 0 &&
+            res->status == MT::ResolveStatus::Ok && fail == MT::FailNone) {
+            PrepareResolvedTextures(*res, resolved_textures);
+            GraphicsPipeline::mt_resolved_textures = &resolved_textures;
+            counters.resolved_committed.fetch_add(1, std::memory_order_relaxed);
         }
         try {
             if (r.ConfigureDrawPipeline(header.pipeline, is_indexed)) {
@@ -1732,6 +1749,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
             LOG_ERROR(Render_Vulkan, "MT: draw packet threw: {}", e.what());
         }
         GraphicsPipeline::mt_shadow_sink = nullptr;
+        GraphicsPipeline::mt_resolved_textures = nullptr;
         if (compare && shadow_sink.filled) {
             ShadowCompare(*res, header, shadow_sink);
         }

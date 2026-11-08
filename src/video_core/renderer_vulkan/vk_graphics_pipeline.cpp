@@ -430,7 +430,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // they depend on changed (see TextureMemo). The handles are still read every draw; with the
     // memo on, sampler handles are resolved after reading (GetSamplerId only on a miss).
     static const char tex_memo_mode = Tegra::Nx2EnvMode("EDEN_NX2_TEX_MEMO");
-    const bool use_memo = num_image_elements != 0 && Tegra::Nx2Switch(tex_memo_mode, false);
+    const MtResolvedTextures* const resolved_textures = mt_resolved_textures;
+    const bool use_memo = num_image_elements != 0 && resolved_textures == nullptr &&
+                          Tegra::Nx2Switch(tex_memo_mode, false);
     if (!use_memo) {
         tex_memo.valid = false; // The switch may come back on: whatever happened meanwhile
     }
@@ -572,7 +574,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers) {
             auto& helper = VideoCommon::BackHelper::Get();
             if (num_image_elements != 0 && regs.transform_feedback_enabled == 0 &&
-                helper.Enabled()) {
+                resolved_textures == nullptr && helper.Enabled()) {
                 static const bool fork_stats = std::getenv("EDEN_NX2_FORK_STATS") != nullptr;
                 u64 job_ns = 0;
                 auto texture_job = [&] {
@@ -627,7 +629,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         if (!forked) {
-            config_stages(3);
+            if (resolved_textures != nullptr) [[unlikely]] {
+                // A resolver read the handles and resolved the views and samplers.
+                config_stages(1);
+                views.assign(resolved_textures->views.begin(), resolved_textures->views.end());
+                samplers.assign(resolved_textures->samplers.begin(),
+                                resolved_textures->samplers.end());
+                views_clean = true;
+            } else {
+                config_stages(3);
+            }
         }
     }
     ASSERT(views.size() == num_image_elements);
@@ -835,12 +846,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             guest_descriptor_queue.AddRaw(tex_memo.entries.data() + tex_memo.stage_begin[stage],
                                           tex_memo.stage_count[stage]);
+        } else if (resolved_textures != nullptr) {
+            guest_descriptor_queue.AddRaw(resolved_textures->entries +
+                                              resolved_textures->stage_begin[stage],
+                                          resolved_textures->stage_count[stage]);
         } else {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             const DescriptorUpdateEntry* const entries_begin{guest_descriptor_queue.Cursor()};
             const VideoCommon::ImageViewInOut* const stage_views{views_it};
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it);
+            if (MtShadowSink* const sink = mt_shadow_sink) [[unlikely]] {
+                sink->stage_image_begin[stage] = static_cast<u32>(
+                    entries_begin - static_cast<const DescriptorUpdateEntry*>(
+                                        guest_descriptor_queue.UpdateData()));
+                sink->stage_image_count[stage] =
+                    static_cast<u32>(guest_descriptor_queue.Cursor() - entries_begin);
+                sink->images_recorded = true;
+            }
             if (fill_memo) {
                 const DescriptorUpdateEntry* const entries_end{guest_descriptor_queue.Cursor()};
                 tex_memo.stage_begin[stage] = static_cast<u32>(tex_memo.entries.size());
@@ -891,6 +914,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if (memo_hit) {
         rescaling.Assign(tex_memo.rescaling);
+    } else if (resolved_textures != nullptr) {
+        rescaling.Assign(resolved_textures->rescaling);
     } else if (fill_memo) {
         // Keyed by the state after FillImageViews (which may erase views and loop) and before
         // UpdateRenderTargets: an erasure from there on advances the epoch and the next draw

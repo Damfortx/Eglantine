@@ -100,6 +100,9 @@ private:
     Mirrors* current{};
     u32 channel_gen = 0;
     u64 inject_counter = 0;
+    std::vector<const ImageView*> view_objects;
+    std::vector<u8> view_rescaled;
+    std::vector<Sampler*> sampler_objects;
     std::jthread thread;
     std::atomic<bool> ready{false};
 };
@@ -152,6 +155,8 @@ inline void Resolver::Loop(std::stop_token stop) {
             if (stop.stop_requested()) {
                 break;
             }
+            // Hold no guard while idle: the committer's Collect must be able to advance.
+            LeaveBatch();
             const auto begin = timed ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
             pipeline.stream.WaitForData(consumer, [&] { return stop.stop_requested(); });
@@ -373,7 +378,8 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     const size_t view_words = size_t{info.num_image_elements} * sizeof(ViewRef) / 8;
     const size_t sampler_words = size_t{info.num_textures} * sizeof(SamplerRef) / 8;
     const size_t buffer_words = size_t{max_buffers} * sizeof(BufferRef) / 8;
-    const size_t total_words = view_words + sampler_words + buffer_words;
+    const size_t entry_words = size_t{info.num_image_elements} * sizeof(DescriptorUpdateEntry) / 8;
+    const size_t total_words = view_words + sampler_words + buffer_words + entry_words;
     u64 end_position = 0;
     std::span<u64> words;
     if (total_words != 0) {
@@ -387,6 +393,12 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     auto* const views = reinterpret_cast<ViewRef*>(words.data());
     auto* const samplers = reinterpret_cast<SamplerRef*>(words.data() + view_words);
     auto* const buffers = reinterpret_cast<BufferRef*>(words.data() + view_words + sampler_words);
+    auto* const image_entries = reinterpret_cast<DescriptorUpdateEntry*>(
+        words.data() + view_words + sampler_words + buffer_words);
+    view_objects.assign(info.num_image_elements, nullptr);
+    view_rescaled.assign(info.num_image_elements, 0);
+    sampler_objects.assign(info.num_textures, nullptr);
+    out.image_entries = image_entries;
     out.views = views;
     out.samplers = samplers;
     out.buffers = buffers;
@@ -432,6 +444,8 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         TextureCache::MtResolvedView resolved;
         switch (texture_cache.TryResolveViewCaptured(channel, entry, valid, blacklist, resolved)) {
         case TextureCache::MtViewResolve::Ok:
+            view_objects[bit] = resolved.object;
+            view_rescaled[bit] = texture_cache.IsRescalingResolved(resolved) ? 1 : 0;
             ref.view = resolved.view.index;
             ref.view_gen = resolved.view_gen;
             ref.image = resolved.image.index;
@@ -451,8 +465,10 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         return false;
     };
     const auto resolve_sampler = [&](u32 tsc_index) -> bool {
-        SamplerRef& ref = samplers[sampler_cursor++];
+        const u32 slot = sampler_cursor++;
+        SamplerRef& ref = samplers[slot];
         ref = SamplerRef{VideoCommon::NULL_SAMPLER_ID.index, 0};
+        sampler_objects[slot] = texture_cache.MtSamplerObject(VideoCommon::NULL_SAMPLER_ID);
         if (tsc_index > tsc_limit) {
             return true;
         }
@@ -476,6 +492,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             break;
         }
         ref = SamplerRef{id.index, gen};
+        sampler_objects[slot] = texture_cache.MtSamplerObject(id);
         return true;
     };
     const auto resolve_buffer = [&](u8 kind, u8 stage, u8 slot, u8 written, DAddr device_addr,
@@ -605,6 +622,70 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     out.num_views = view_cursor;
     out.num_samplers = sampler_cursor;
     out.num_buffers = buffer_cursor;
+
+    // PushImageDescriptors: the same entries in the same order, from the resolved objects.
+    const ImageView& null_view = texture_cache.NullImageViewObject();
+    RescalingPushConstant rescaling;
+    u32 entry_cursor = 0;
+    u32 view_index = 0;
+    u32 sampler_index = 0;
+    for (size_t stage = 0; stage < stage_infos.size(); ++stage) {
+        if (!info.spec.enabled_stages[stage]) {
+            continue;
+        }
+        const Shader::Info& stage_info = stage_infos[stage];
+        out.stage_begin[stage] = entry_cursor;
+        for (const auto& desc : stage_info.texture_descriptors) {
+            bool is_rescaled = false;
+            for (u32 i = 0; i < desc.count; ++i, ++view_index, ++sampler_index) {
+                const ImageView& view =
+                    view_objects[view_index] != nullptr ? *view_objects[view_index] : null_view;
+                VkImageView vk_view = view.Handle(desc.type);
+                if (vk_view == VK_NULL_HANDLE) {
+                    if (const VkImageView null_handle = null_view.Handle(desc.type);
+                        null_handle != VK_NULL_HANDLE) {
+                        vk_view = null_handle;
+                    }
+                }
+                Sampler& sampler = *sampler_objects[sampler_index];
+                VkSampler vk_sampler = sampler.TryHandleFor(view, desc.is_depth);
+                if (vk_sampler == VK_NULL_HANDLE) {
+                    vk_sampler = sampler.HandleFor(view, desc.is_depth);
+                }
+                image_entries[entry_cursor++] = VkDescriptorImageInfo{
+                    .sampler = vk_sampler,
+                    .imageView = vk_view,
+                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                };
+                is_rescaled |= view_rescaled[view_index] != 0;
+            }
+            rescaling.PushTexture(is_rescaled);
+        }
+        if (info.spec.has_images) {
+            for (const auto& desc : stage_info.image_descriptors) {
+                bool is_rescaled = false;
+                for (u32 i = 0; i < desc.count; ++i, ++view_index) {
+                    const ImageView& view =
+                        view_objects[view_index] != nullptr ? *view_objects[view_index] : null_view;
+                    const VkImageView vk_view = view.TryStorageView(desc.type, desc.format);
+                    if (vk_view == VK_NULL_HANDLE && view.ImageHandle() != VK_NULL_HANDLE) {
+                        // Created on first use: the committer's path makes it.
+                        out.reason = ViewLazyHandle;
+                        return false;
+                    }
+                    image_entries[entry_cursor++] = VkDescriptorImageInfo{
+                        .sampler = VK_NULL_HANDLE,
+                        .imageView = vk_view,
+                        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    };
+                    is_rescaled |= view_rescaled[view_index] != 0;
+                }
+                rescaling.PushImage(is_rescaled);
+            }
+        }
+        out.stage_count[stage] = entry_cursor - out.stage_begin[stage];
+    }
+    out.rescaling = rescaling.Data();
     return true;
 }
 
@@ -719,6 +800,40 @@ inline MT::ValidateFail Nx2DrawPipeline::Validate(const MT::ResolvedDraw& res,
     return MT::FailNone;
 }
 
+inline void Nx2DrawPipeline::PrepareResolvedTextures(const MT::ResolvedDraw& res,
+                                                     GraphicsPipeline::MtResolvedTextures& out) {
+    TextureCache& texture_cache = rasterizer.texture_cache;
+    commit_views.clear();
+    for (u32 i = 0; i < res.num_views; ++i) {
+        const MT::ViewRef& ref = res.views[i];
+        VideoCommon::ImageViewInOut view{};
+        view.blacklist = ref.blacklist != 0;
+        view.id = ref.null != 0 ? VideoCommon::NULL_IMAGE_VIEW_ID : VideoCommon::ImageViewId{ref.view};
+        commit_views.push_back(view);
+        if (ref.null == 0) {
+            const TextureCache::MtResolvedView resolved{
+                .view = view.id,
+                .view_gen = ref.view_gen,
+                .image = VideoCommon::ImageId{ref.image},
+                .image_gen = ref.image_gen,
+                .image_version = ref.image_version,
+                .object = &texture_cache.NullImageViewObject(),
+            };
+            texture_cache.MtApplyViewIntent(resolved, ref.written != 0, ref.blacklist != 0);
+        }
+    }
+    commit_samplers.clear();
+    for (u32 i = 0; i < res.num_samplers; ++i) {
+        commit_samplers.push_back(VideoCommon::SamplerId{res.samplers[i].sampler});
+    }
+    out.views = std::span<const VideoCommon::ImageViewInOut>(commit_views.data(), commit_views.size());
+    out.samplers = std::span<const VideoCommon::SamplerId>(commit_samplers.data(), commit_samplers.size());
+    out.entries = res.image_entries;
+    out.stage_begin = res.stage_begin;
+    out.stage_count = res.stage_count;
+    out.rescaling = res.rescaling;
+}
+
 inline void Nx2DrawPipeline::ShadowCompare(const MT::ResolvedDraw& res, const DrawHeader& header,
                                            const GraphicsPipeline::MtShadowSink& sink) {
     counters.shadow_checks.fetch_add(1, std::memory_order_relaxed);
@@ -750,6 +865,30 @@ inline void Nx2DrawPipeline::ShadowCompare(const MT::ResolvedDraw& res, const Dr
             mismatch(4, fmt::format("sampler {}: resolver {} committer {}", i,
                                     res.samplers[i].sampler, sink.samplers[i].index));
             return;
+        }
+    }
+    if (sink.rescaling != res.rescaling) {
+        mismatch(9, "rescaling words");
+        return;
+    }
+    if (sink.images_recorded) {
+        for (size_t stage = 0; stage < res.stage_count.size(); ++stage) {
+            if (sink.stage_image_count[stage] != res.stage_count[stage]) {
+                mismatch(10, fmt::format("stage {} image entries: resolver {} committer {}", stage,
+                                         res.stage_count[stage], sink.stage_image_count[stage]));
+                return;
+            }
+            for (u32 i = 0; i < res.stage_count[stage]; ++i) {
+                const VkDescriptorImageInfo& a = res.image_entries[res.stage_begin[stage] + i].image;
+                const VkDescriptorImageInfo& b = sink.payload[sink.stage_image_begin[stage] + i].image;
+                if (a.sampler != b.sampler || a.imageView != b.imageView ||
+                    a.imageLayout != b.imageLayout) {
+                    mismatch(11, fmt::format("stage {} image entry {}: resolver {}/{} committer {}/{}",
+                                             stage, i, fmt::ptr(a.imageView), fmt::ptr(a.sampler),
+                                             fmt::ptr(b.imageView), fmt::ptr(b.sampler)));
+                    return;
+                }
+            }
         }
     }
     for (u32 i = 0; i < res.num_buffers; ++i) {
@@ -813,10 +952,11 @@ inline void Nx2DrawPipeline::LogResolverStats(double seconds) {
     }
     take(counters.validate_fail[0]);
     LOG_INFO(Render_Vulkan,
-             "MT resolvers/s:{} | ok {:.0f}, slow {:.0f}:{}, missing {:.0f} | validation "
+             "MT resolvers/s:{} | ok {:.0f} (committed {:.0f}), slow {:.0f}:{}, missing {:.0f} | validation "
              "failures:{} | batches {:.0f}, commit wait {:.1f} ms, ring waits {:.0f}, barriers "
              "{:.0f} | shadow {:.0f} checks, {} mismatches, {:.0f} unvalidated | EBR pending {}",
-             per_resolver, rate(take(counters.resolved_ok)), rate(take(counters.resolved_slow)),
+             per_resolver, rate(take(counters.resolved_ok)), rate(take(counters.resolved_committed)),
+             rate(take(counters.resolved_slow)),
              slow_text, rate(take(counters.resolved_missing)), fail_text,
              rate(take(counters.batches)), static_cast<double>(take(counters.commit_wait_ns)) / 1e6 / seconds,
              rate(take(counters.ring_waits)), rate(take(counters.barriers)),

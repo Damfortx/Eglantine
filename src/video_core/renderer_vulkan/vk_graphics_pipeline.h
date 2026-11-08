@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -233,8 +234,25 @@ public:
         std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling{};
         bool uses_render_area = false;
         std::array<f32, 4> render_area{};
+        /// Each stage's image entries within `payload` (PushImageDescriptors' range).
+        std::array<u32, NUM_STAGES> stage_image_begin{};
+        std::array<u32, NUM_STAGES> stage_image_count{};
+        bool images_recorded = false;
     };
     static inline thread_local MtShadowSink* mt_shadow_sink = nullptr;
+
+    /// EDEN_NX2_MT_RCOMMIT: the texture half of ConfigureImpl from a validated resolver result
+    /// (views, samplers, each stage's image descriptor entries and the rescaling words), like a
+    /// texture memo hit. The committer applied the views' intents (LRU, storage writes) already.
+    struct MtResolvedTextures {
+        std::span<const VideoCommon::ImageViewInOut> views;
+        std::span<const VideoCommon::SamplerId> samplers;
+        const DescriptorUpdateEntry* entries;
+        std::array<u32, NUM_STAGES> stage_begin;
+        std::array<u32, NUM_STAGES> stage_count;
+        std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling;
+    };
+    static inline thread_local const MtResolvedTextures* mt_resolved_textures = nullptr;
 
 private:
     /// Builds the pipeline once, on whichever thread gets here first.

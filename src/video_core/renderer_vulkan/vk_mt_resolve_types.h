@@ -10,10 +10,8 @@
 #include <atomic>
 
 #include "common/common_types.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 
-namespace Vulkan {
-class GraphicsPipeline;
-}
 
 namespace Vulkan::MT {
 
@@ -110,7 +108,13 @@ struct alignas(64) ResolvedDraw {
     u32 num_samplers;
     u32 num_buffers;
     u32 sampler_creations;
+    /// PushImageDescriptors' entries of every stage (stage_begin/count index them).
+    const DescriptorUpdateEntry* image_entries;
+    std::array<u32, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> stage_begin;
+    std::array<u32, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> stage_count;
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling;
 };
+static_assert(sizeof(DescriptorUpdateEntry) % 8 == 0);
 
 /// Per-resolver counters (relaxed; read by the stats logger).
 struct ResolverCounters {

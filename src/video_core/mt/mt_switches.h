@@ -92,11 +92,12 @@ namespace VideoCommon::MT {
     return on;
 }
 
-/// EDEN_NX2_MT_RCOMMIT: record validated resolver results (default on with resolvers; off keeps
-/// the resolvers running and every draw on the phase-4 path, without the shadow compare).
+/// EDEN_NX2_MT_RCOMMIT=1: record validated resolver results (the texture half of ConfigureImpl
+/// from the resolver). Off by default until EDEN_NX2_MT_SHADOW runs show no mismatches; off,
+/// the resolvers still run and every draw takes the phase-4 path.
 [[nodiscard]] inline bool ResolvedCommit() {
     static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_RCOMMIT");
-    static const bool on = Tegra::Nx2Switch(mode, true);
+    static const bool on = Tegra::Nx2Switch(mode, false);
     return on;
 }
 
