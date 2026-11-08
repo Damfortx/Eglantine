@@ -206,15 +206,30 @@ bool Passes(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
 
 using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
 
+struct FoundSpec {
+    ConfigureFuncPtr func;
+    GraphicsPipeline::SpecFlags flags;
+};
+
 template <typename Spec, typename... Specs>
-ConfigureFuncPtr FindSpec(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
-                          const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
+FoundSpec FindSpec(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+                   const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
     if constexpr (sizeof...(Specs) > 0) {
         if (!Passes<Spec>(modules, stage_infos)) {
             return FindSpec<Specs...>(modules, stage_infos);
         }
     }
-    return GraphicsPipeline::MakeConfigureSpecFunc<Spec>();
+    return FoundSpec{
+        .func = GraphicsPipeline::MakeConfigureSpecFunc<Spec>(),
+        .flags =
+            GraphicsPipeline::SpecFlags{
+                .enabled_stages = Spec::enabled_stages,
+                .has_storage_buffers = Spec::has_storage_buffers,
+                .has_texture_buffers = Spec::has_texture_buffers,
+                .has_image_buffers = Spec::has_image_buffers,
+                .has_images = Spec::has_images,
+            },
+    };
 }
 
 struct SimpleVertexFragmentSpec {
@@ -257,8 +272,8 @@ struct DefaultSpec {
     static constexpr bool has_images = true;
 };
 
-ConfigureFuncPtr ConfigureFunc(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
-                               const std::array<Shader::Info, NUM_STAGES>& infos) {
+FoundSpec ConfigureFunc(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+                        const std::array<Shader::Info, NUM_STAGES>& infos) {
     return FindSpec<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec, SimpleImageSpec,
                     DefaultSpec>(modules, infos);
 }
@@ -359,7 +374,28 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }};
     // Before the build: it frees the modules this looks at.
-    configure_func = ConfigureFunc(spv_modules, stage_infos);
+    const FoundSpec found = ConfigureFunc(spv_modules, stage_infos);
+    configure_func = found.func;
+    resolve_info = ResolveInfo{
+        .stage_infos = &stage_infos,
+        .enabled_uniform_buffer_masks = enabled_uniform_buffer_masks,
+        .uniform_buffer_sizes = &uniform_buffer_sizes,
+        .num_descriptor_entries = num_descriptor_entries,
+        .num_image_elements = static_cast<u32>(num_image_elements),
+        .num_textures = num_textures,
+        .uses_descriptor_buffer = uses_descriptor_buffer,
+        .uses_push_descriptor = uses_push_descriptor,
+        .has_descriptor_set_layout = static_cast<bool>(descriptor_set_layout),
+        .spec = found.flags,
+        .descriptor_buffer_layout = &descriptor_buffer_layout,
+        .is_mesh = IsMeshPipeline(),
+    };
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const Shader::Info& info = stage_infos[stage];
+        resolve_info.has_texture_buffers |= !info.texture_buffer_descriptors.empty() ||
+                                            !info.image_buffer_descriptors.empty();
+        resolve_info.uses_render_area |= info.uses_render_area;
+    }
     build_task = std::move(func);
     if (worker_thread) {
         worker_thread->QueueWork([this] { RunBuild(); });
@@ -881,12 +917,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
-    const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+    return ConfigureDrawPayload(
+        static_cast<const DescriptorUpdateEntry*>(guest_descriptor_queue.UpdateData()), rescaling,
+        render_area);
+}
 
+bool GraphicsPipeline::ConfigureDrawPayload(const DescriptorUpdateEntry* payload,
+                                            const RescalingPushConstant& rescaling,
+                                            const RenderAreaPushConstant& render_area) {
     VkDeviceSize descriptor_buffer_offset{};
     u32 descriptor_buffer_chunk{};
     if (descriptor_set_layout && uses_descriptor_buffer) {
-        const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+        const DescriptorUpdateEntry* const entries = payload;
         const bool reuse_allocation =
             last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
             last_descriptor_payload.size() == num_descriptor_entries &&
@@ -912,7 +954,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
     }
+    return ConfigureDrawCommon(payload, descriptor_buffer_offset, descriptor_buffer_chunk,
+                               rescaling.Data(), render_area);
+}
 
+bool GraphicsPipeline::ConfigureDrawCommon(
+    const DescriptorUpdateEntry* payload, VkDeviceSize descriptor_buffer_offset,
+    u32 descriptor_buffer_chunk,
+    const std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>& rescaling_words,
+    const RenderAreaPushConstant& render_area) {
+    const void* const descriptor_data{payload};
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
@@ -949,7 +1000,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     }
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
-                      rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
+                      rescaling_data = rescaling_words, is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
                       render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {

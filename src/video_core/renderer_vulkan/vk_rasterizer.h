@@ -203,6 +203,8 @@ private:
     bool MeshDrawAllowed(GraphicsPipeline* pipeline);
     /// PrepareDraw from Configure to the query segment, under both cache locks.
     bool ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is_indexed);
+    /// ConfigureDrawPipeline's vertex repack layout and the dirty flags it implies.
+    void ApplyVertexRepack(GraphicsPipeline* pipeline);
     void RecordDraw(bool is_indexed, u32 instance_count);
     void ClearBody(u32 layer_count);
     /// DispatchCompute from the cache locks on, with the pipeline looked up.

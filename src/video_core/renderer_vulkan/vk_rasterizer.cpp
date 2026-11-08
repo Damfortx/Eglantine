@@ -520,12 +520,7 @@ bool RasterizerVulkan::MeshDrawAllowed(GraphicsPipeline* pipeline) {
     return true;
 }
 
-bool RasterizerVulkan::ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is_indexed) {
-    namespace Profile = VideoCommon::Nx2Profile;
-    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-    // update engine as channel may be different. The real engine, never this thread's mirror:
-    // the pipeline is shared and other threads resolve it through their own overrides.
-    pipeline->SetEngine(maxwell3d.Real(), gpu_memory);
+void RasterizerVulkan::ApplyVertexRepack(GraphicsPipeline* pipeline) {
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
         maxwell3d->regs, pipeline->HasDynamicVertexInput());
     if (repack_dirty) {
@@ -538,6 +533,15 @@ bool RasterizerVulkan::ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is
             }
         }
     }
+}
+
+bool RasterizerVulkan::ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is_indexed) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // update engine as channel may be different. The real engine, never this thread's mirror:
+    // the pipeline is shared and other threads resolve it through their own overrides.
+    pipeline->SetEngine(maxwell3d.Real(), gpu_memory);
+    ApplyVertexRepack(pipeline);
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         ReportDrawFailure("configure failed");
         return false;

@@ -166,6 +166,63 @@ public:
         gpu_memory = gpu_memory_;
     }
 
+    /// The Spec ConfigureImpl was instantiated with (which stages and descriptor kinds it
+    /// visits).
+    struct SpecFlags {
+        std::array<bool, 5> enabled_stages;
+        bool has_storage_buffers;
+        bool has_texture_buffers;
+        bool has_image_buffers;
+        bool has_images;
+    };
+
+    /// What a resolver thread of the multithreaded back reads from the pipeline (immutable
+    /// after construction; docs/mt-phase5-spec.md §7.3).
+    struct ResolveInfo {
+        const std::array<Shader::Info, NUM_STAGES>* stage_infos;
+        std::array<u32, 5> enabled_uniform_buffer_masks;
+        const VideoCommon::UniformBufferSizes* uniform_buffer_sizes;
+        u32 num_descriptor_entries;
+        u32 num_image_elements;
+        u32 num_textures;
+        bool uses_descriptor_buffer;
+        bool uses_push_descriptor;
+        bool has_descriptor_set_layout;
+        SpecFlags spec;
+        const DescriptorBufferLayout* descriptor_buffer_layout;
+        bool is_mesh;
+        bool has_texture_buffers{}; ///< any texture or image buffer descriptor
+        bool uses_render_area{};
+    };
+
+    [[nodiscard]] const ResolveInfo& GetResolveInfo() const noexcept {
+        return resolve_info;
+    }
+
+    /// The real engine the pipeline was last configured against (MT_RCHECK).
+    [[nodiscard]] Tegra::Engines::Maxwell3D* StoredEngine() const noexcept {
+        return maxwell3d.Real();
+    }
+
+    /// ConfigureDraw from a payload built elsewhere (a resolver's arena): the descriptor-buffer
+    /// write and reuse memo, then the shared tail.
+    bool ConfigureDrawPayload(const DescriptorUpdateEntry* payload,
+                              const RescalingPushConstant& rescaling,
+                              const RenderAreaPushConstant& render_area);
+
+    /// ConfigureDraw's tail: render pass, build wait, pipeline/descriptor binds and the record.
+    /// `descriptor_buffer_offset/chunk` were allocated and written by the caller.
+    bool ConfigureDrawCommon(
+        const DescriptorUpdateEntry* payload, VkDeviceSize descriptor_buffer_offset,
+        u32 descriptor_buffer_chunk,
+        const std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>&
+            rescaling_words,
+        const RenderAreaPushConstant& render_area);
+
+    [[nodiscard]] bool HasPipeline() const noexcept {
+        return static_cast<bool>(pipeline);
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
@@ -205,6 +262,7 @@ private:
     u32 num_descriptor_entries{};
     size_t num_image_elements{};
     u64 memo_last_handles{}; ///< EDEN_NX2_MEMO_STATS
+    ResolveInfo resolve_info{};
 
     /// EDEN_NX2_TEX_MEMO: the texture bindings of this pipeline's last draw that took the full
     /// path. A draw reuses them when the channel, the texture cache's view epoch and bindings
