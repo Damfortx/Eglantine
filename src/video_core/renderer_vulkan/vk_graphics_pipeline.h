@@ -223,6 +223,19 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    /// EDEN_NX2_MT_SHADOW: what ConfigureImpl resolved for the draw the committer records, for
+    /// the comparison with a resolver's result. Set (thread_local) by the committer around it.
+    struct MtShadowSink {
+        bool filled = false;
+        std::vector<VideoCommon::ImageViewId> views;
+        std::vector<VideoCommon::SamplerId> samplers;
+        std::vector<DescriptorUpdateEntry> payload;
+        std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling{};
+        bool uses_render_area = false;
+        std::array<f32, 4> render_area{};
+    };
+    static inline thread_local MtShadowSink* mt_shadow_sink = nullptr;
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();

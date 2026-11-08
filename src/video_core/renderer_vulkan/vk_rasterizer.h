@@ -54,6 +54,9 @@ struct FramebufferTextureInfo;
 
 class StateTracker;
 class Nx2DrawPipeline;
+namespace MT {
+class Resolver;
+}
 
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
 public:
@@ -184,6 +187,7 @@ public:
 
 private:
     friend class Nx2DrawPipeline;
+    friend class MT::Resolver;
 
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU

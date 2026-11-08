@@ -293,6 +293,20 @@ public:
     [[nodiscard]] u64 MtBufferEpoch() const noexcept {
         return buffer_epoch.load(std::memory_order_acquire);
     }
+    /// Committer (EDEN_NX2_MT_SHADOW): the buffer id the last configured draw bound for a
+    /// uniform (0), storage (1), vertex (2) or index (3) binding.
+    [[nodiscard]] BufferId MtBindingBufferId(u32 kind, size_t stage, u32 slot) const noexcept {
+        switch (kind) {
+        case 0:
+            return channel_state->uniform_buffers[stage][slot].buffer_id;
+        case 1:
+            return channel_state->storage_buffers[stage][slot].buffer_id;
+        case 2:
+            return channel_state->vertex_buffers[slot].buffer_id;
+        default:
+            return channel_state->index_buffer.buffer_id;
+        }
+    }
     /// Committer: whether a resolved buffer is still the one the resolver saw.
     [[nodiscard]] bool MtValidateBuffer(BufferId id, u32 gen) const noexcept {
         return id == NULL_BUFFER_ID || slot_buffers.IsCurrent(id, gen);

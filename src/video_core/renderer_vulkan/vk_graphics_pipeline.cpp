@@ -796,6 +796,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
     }
 
+    if (MtShadowSink* const sink = mt_shadow_sink) [[unlikely]] {
+        sink->filled = true;
+        sink->views.clear();
+        for (const auto& view : views) {
+            sink->views.push_back(view.id);
+        }
+        if (memo_hit) {
+            sink->samplers.assign(tex_memo.sampler_ids.begin(), tex_memo.sampler_ids.end());
+        } else {
+            sink->samplers.assign(samplers.begin(), samplers.end());
+        }
+    }
     RescalingPushConstant rescaling;
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
@@ -907,6 +919,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.UpdateRenderTargets(false);
         texture_cache.CheckFeedbackLoop(
             std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
+    }
+    if (MtShadowSink* const sink = mt_shadow_sink) [[unlikely]] {
+        const auto* const begin =
+            static_cast<const DescriptorUpdateEntry*>(guest_descriptor_queue.UpdateData());
+        sink->payload.assign(begin, guest_descriptor_queue.Cursor());
+        sink->rescaling = rescaling.Data();
+        sink->uses_render_area = render_area.uses_render_area;
+        sink->render_area = render_area.words;
     }
     if (IsBuilt() && !pipeline) {
         return false;

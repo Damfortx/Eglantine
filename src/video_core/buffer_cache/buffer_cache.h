@@ -2667,8 +2667,6 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
-    // Resolved buffer ranges recorded with an older epoch are re-validated at commit.
-    buffer_epoch.fetch_add(1, std::memory_order_release);
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
@@ -2722,6 +2720,10 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
             delayed_destruction_ring.Push(std::move(buffer));
         }
     });
+    // Resolved buffer ranges recorded with an older epoch are re-validated at commit. After the
+    // page table was cleared (Unregister) and the slot erased: a resolver that reads the new
+    // epoch can no longer find this buffer.
+    buffer_epoch.fetch_add(1, std::memory_order_release);
     // Other channels' bindings and the per-draw memos may still hold this (reusable) id.
     ++buffer_deletion_epoch;
 

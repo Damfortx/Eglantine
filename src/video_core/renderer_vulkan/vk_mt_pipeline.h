@@ -53,6 +53,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/renderer_vulkan/vk_mt_resolve_types.h"
 
 namespace Vulkan {
 
@@ -60,6 +61,7 @@ class RasterizerVulkan;
 
 namespace MT {
 
+class Resolver;
 using VideoCommon::MT::StreamEntry;
 
 /// What a Serial or Command entry is, for the statistics.
@@ -115,6 +117,15 @@ struct Counters {
     // Phase 5.
     std::atomic<u64> ring_waits{};
     std::atomic<u64> batches{};
+    std::atomic<u64> commit_wait_ns{};
+    std::atomic<u64> resolved_ok{};      ///< results that validated
+    std::atomic<u64> resolved_slow{};    ///< results the resolver gave up on
+    std::atomic<u64> resolved_missing{}; ///< draws without a result (wait aborted, overrun)
+    std::array<std::atomic<u64>, ValidateFailCount> validate_fail{};
+    std::atomic<u64> shadow_checks{};
+    std::atomic<u64> shadow_mismatches{};
+    std::atomic<u64> shadow_unvalidated{};
+    std::atomic<u64> barriers{};
 };
 
 inline constexpr std::array<const char*, 16> ForcedSerialNames{
@@ -133,9 +144,7 @@ class Nx2DrawPipeline final : public VideoCommon::MtBackInterface {
 public:
     explicit Nx2DrawPipeline(RasterizerVulkan& rasterizer_) : rasterizer{rasterizer_} {}
 
-    ~Nx2DrawPipeline() override {
-        Stop();
-    }
+    ~Nx2DrawPipeline() override;
 
     Nx2DrawPipeline(const Nx2DrawPipeline&) = delete;
     Nx2DrawPipeline& operator=(const Nx2DrawPipeline&) = delete;
@@ -256,6 +265,8 @@ public:
     MT::Counters counters;
 
 private:
+    friend class MT::Resolver;
+
     struct ChannelMirrors {
         Maxwell3D* real3d{};
         KeplerCompute* real_compute{};
@@ -396,6 +407,19 @@ private:
     }
 
     void CommitterLoop(std::stop_token stop);
+    /// Applies a Deltas, ComputeDeltas, CbBind or RootTable entry to mirrors (committer and
+    /// resolvers). False for other kinds.
+    static bool ApplyMirrorEntry(Maxwell3D* mirror3d, KeplerCompute* mirror_compute,
+                                 const u64* entry);
+    /// Committer: the resolver result of a draw packet (waits for its batch), or null.
+    MT::ResolvedDraw* WaitResolved(const DrawHeader& header);
+    /// Committer: I4, under both cache locks.
+    MT::ValidateFail Validate(const MT::ResolvedDraw& res, const DrawHeader& header) const;
+    /// Committer: EDEN_NX2_MT_SHADOW comparison after the phase-4 path recorded the draw.
+    void ShadowCompare(const MT::ResolvedDraw& res, const DrawHeader& header,
+                       const GraphicsPipeline::MtShadowSink& sink);
+    void StartResolvers();
+    void StopResolvers();
     void RunEntry(const u64* entry);
     void RunSerial(const u64* entry);
     void Idle(std::stop_token& stop);
@@ -406,6 +430,7 @@ private:
     ChannelMirrors* FindMirrors(const Maxwell3D* real3d);
     void VerifyMirror(const char* where);
     void LogStats();
+    void LogResolverStats(double seconds);
 
     RasterizerVulkan& rasterizer;
     SpmcStream stream{size_t{1} << 21}; // 16 MiB
@@ -473,6 +498,12 @@ private:
     // Shared.
     /// Resolver threads running (0: phase 4, the committer resolves every draw).
     u32 resolver_count = 0;
+    std::vector<std::unique_ptr<MT::Resolver>> resolvers;
+    VideoCommon::MT::SeqSlotRing<MT::ResolvedDraw, ResolvedSlots> resolved;
+    /// Bumped by the committer at each channel bind; resolvers copy it at the barrier.
+    std::atomic<u32> channel_gen{0};
+    const u32 shadow = VideoCommon::MT::Shadow();
+    GraphicsPipeline::MtShadowSink shadow_sink;
     /// Committer: the seq of the last committed draw packet (sequencer back-pressure).
     alignas(64) std::atomic<u64> committed_seq{0};
 
@@ -485,6 +516,9 @@ private:
 };
 
 } // namespace Vulkan
+
+// Resolver threads (phase 5); they use the declaration above.
+#include "video_core/renderer_vulkan/vk_mt_resolve.h"
 
 // ---------------------------------------------------------------------------------------------
 // Implementation (needs RasterizerVulkan complete).
@@ -531,6 +565,7 @@ inline void Nx2DrawPipeline::Start() {
     while (!start_ready.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
+    StartResolvers();
     running = true;
     VideoCommon::MT::g_write_hook_on.store(true, std::memory_order_seq_cst);
     VideoCommon::MT::g_active.store(true, std::memory_order_seq_cst);
@@ -538,8 +573,10 @@ inline void Nx2DrawPipeline::Start() {
         VideoCommon::MT::g_check.store(true, std::memory_order_seq_cst);
         VideoCommon::GpuSplit::check_owner = true;
     }
-    LOG_INFO(Render_Vulkan, "MT: committer started (lockstep {}, verify {}, compute {})",
-             lockstep, verify, VideoCommon::MT::ComputePackets() ? "packet" : "serial");
+    LOG_INFO(Render_Vulkan,
+             "MT: committer started (lockstep {}, verify {}, compute {}, resolvers {}, shadow {})",
+             lockstep, verify, VideoCommon::MT::ComputePackets() ? "packet" : "serial",
+             resolver_count, shadow);
 }
 
 inline void Nx2DrawPipeline::Stop() {
@@ -549,9 +586,11 @@ inline void Nx2DrawPipeline::Stop() {
     // The sequencer is stopped: this thread may produce. A batch left open would keep the
     // committer waiting for its resolver.
     CloseBatch();
+    // The committer drains first (it needs the resolvers' last batches), then the resolvers.
     committer.request_stop();
     stream.WakeAll();
     committer.join();
+    StopResolvers();
     VideoCommon::MT::g_active.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_check.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_write_hook_on.store(false, std::memory_order_seq_cst);
@@ -658,12 +697,16 @@ inline void Nx2DrawPipeline::SerialRaw(MT::Kind kind, void (*fn)(void*), void* a
     CloseBatch();
     EmitDeltas();
     std::atomic<u32> done{0};
+    // A channel bind also stops the resolvers: they copy the new channel's state before the
+    // sequencer touches the engines again.
+    VideoCommon::MT::BarrierAcks acks;
+    const bool barrier = kind == MT::Kind::Channel && resolver_count != 0;
     u64* const out = stream.Reserve(5);
     out[0] = SpmcStream::MakeHeader(static_cast<u8>(MT::StreamEntry::Serial), 5, static_cast<u32>(kind));
     out[1] = reinterpret_cast<u64>(fn);
     out[2] = reinterpret_cast<u64>(arg);
     out[3] = reinterpret_cast<u64>(&done);
-    out[4] = 0;
+    out[4] = barrier ? reinterpret_cast<u64>(&acks) : 0;
     stream.Commit();
     Count(counters.serials, kind);
     const bool timed = VideoCommon::MT::Stats();
@@ -680,6 +723,16 @@ inline void Nx2DrawPipeline::SerialRaw(MT::Kind kind, void (*fn)(void*), void* a
             break;
         }
         serial_word.wait(seen, std::memory_order_seq_cst);
+    }
+    if (barrier) {
+        counters.barriers.fetch_add(1, std::memory_order_relaxed);
+        for (u32 spins = 0; acks.acks.load(std::memory_order_acquire) != resolver_count; ++spins) {
+            if (spins < 4096) {
+                MTDetail::Pause();
+            } else {
+                std::this_thread::yield();
+            }
+        }
     }
     if (timed) {
         counters.serial_wait_ns.fetch_add(
@@ -795,6 +848,7 @@ inline void Nx2DrawPipeline::BindCurrentChannel() {
     pair->mirror3d->GetNativeMacroEngine().native_turing =
         real3d->GetNativeMacroEngine().native_turing;
     current = pair;
+    channel_gen.fetch_add(1, std::memory_order_release);
     rasterizer.state_tracker.SetFlags(&pair->mirror3d->dirty.flags);
     rasterizer.state_tracker.InvalidateState();
 }
@@ -912,37 +966,49 @@ inline void Nx2DrawPipeline::Idle(std::stop_token& stop) {
     });
 }
 
+inline bool Nx2DrawPipeline::ApplyMirrorEntry(Maxwell3D* mirror3d, KeplerCompute* mirror_compute,
+                                               const u64* entry) {
+    const u64 head = entry[0];
+    const u32 aux = SpmcStream::HeaderAux(head);
+    switch (static_cast<MT::StreamEntry>(SpmcStream::HeaderKind(head))) {
+    case MT::StreamEntry::Deltas:
+        VideoCommon::MT::MirrorApplier<Maxwell3D>::ApplyPairs(*mirror3d, entry + 1, aux);
+        return true;
+    case MT::StreamEntry::ComputeDeltas:
+        if (mirror_compute != nullptr) {
+            VideoCommon::MT::MirrorApplier<KeplerCompute>::ApplyPairs(*mirror_compute, entry + 1,
+                                                                      aux);
+        }
+        return true;
+    case MT::StreamEntry::CbBind:
+        for (u32 i = 0; i < aux; ++i) {
+            VideoCommon::MT::CbBindDelta bind;
+            std::memcpy(&bind, entry + 1 + i * 2, sizeof(bind));
+            Maxwell3D::ApplyCbBind(mirror3d->state, bind);
+        }
+        return true;
+    case MT::StreamEntry::RootTable:
+        for (u32 i = 0; i < aux; ++i) {
+            const u64 op = entry[1 + i];
+            Maxwell3D::ApplyRootTableMethod(mirror3d->root_tables, static_cast<u32>(op),
+                                            static_cast<u32>(op >> 32));
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
 inline void Nx2DrawPipeline::RunEntry(const u64* entry) {
     const u64 head = entry[0];
     const u32 aux = SpmcStream::HeaderAux(head);
     switch (static_cast<MT::StreamEntry>(SpmcStream::HeaderKind(head))) {
     case MT::StreamEntry::Deltas:
-        if (current != nullptr) {
-            VideoCommon::MT::MirrorApplier<Maxwell3D>::ApplyPairs(*current->mirror3d, entry + 1, aux);
-        }
-        break;
     case MT::StreamEntry::ComputeDeltas:
-        if (current != nullptr && current->mirror_compute) {
-            VideoCommon::MT::MirrorApplier<KeplerCompute>::ApplyPairs(*current->mirror_compute,
-                                                                      entry + 1, aux);
-        }
-        break;
     case MT::StreamEntry::CbBind:
-        if (current != nullptr) {
-            for (u32 i = 0; i < aux; ++i) {
-                VideoCommon::MT::CbBindDelta bind;
-                std::memcpy(&bind, entry + 1 + i * 2, sizeof(bind));
-                Maxwell3D::ApplyCbBind(current->mirror3d->state, bind);
-            }
-        }
-        break;
     case MT::StreamEntry::RootTable:
         if (current != nullptr) {
-            for (u32 i = 0; i < aux; ++i) {
-                const u64 op = entry[1 + i];
-                Maxwell3D::ApplyRootTableMethod(current->mirror3d->root_tables,
-                                                static_cast<u32>(op), static_cast<u32>(op >> 32));
-            }
+            ApplyMirrorEntry(current->mirror3d.get(), current->mirror_compute.get(), entry);
         }
         break;
     case MT::StreamEntry::Command: {
@@ -965,6 +1031,8 @@ inline void Nx2DrawPipeline::RunEntry(const u64* entry) {
         break;
     case MT::StreamEntry::BatchEnd:
         counters.batches.fetch_add(1, std::memory_order_relaxed);
+        // Objects retired while resolvers looked at this batch can go once they left it.
+        CollectEpochs();
         break;
     case MT::StreamEntry::Mark:
         last_mark = entry[1];
@@ -1064,6 +1132,7 @@ inline void Nx2DrawPipeline::LogStats() {
              static_cast<double>(take(counters.verify_checks)) / seconds,
              counters.verify_mismatches.load(std::memory_order_relaxed),
              counters.verify_cpu_writes.load(std::memory_order_relaxed));
+    LogResolverStats(seconds);
 }
 
 } // namespace Vulkan
@@ -1571,7 +1640,11 @@ inline Nx2DrawPipeline::PacketView Nx2DrawPipeline::ParsePacket(const u64* entry
 inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
     const PacketView packet = ParsePacket(entry);
     const DrawHeader& header = packet.header;
+    MT::ResolvedDraw* const res = WaitResolved(header);
     SCOPE_EXIT {
+        if (res != nullptr && res->result_end != 0) {
+            resolvers[res->resolver]->results.Release(res->result_end);
+        }
         // The sequencer may reuse this draw's resolved slot from here on.
         committed_seq.store(header.seq, std::memory_order_release);
     };
@@ -1625,12 +1698,42 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         };
         r.mesh_draw = header.pipeline->IsMeshPipeline();
         const bool is_indexed = header.is_indexed != 0;
+        // I4 before anything of this draw changes the caches (uploads were applied: a buffer
+        // they joined fails here).
+        MT::ValidateFail fail = MT::FailNone;
+        if (res != nullptr && res->status == MT::ResolveStatus::Ok) {
+            fail = Validate(*res, header);
+            counters.validate_fail[fail].fetch_add(1, std::memory_order_relaxed);
+            if (fail == MT::FailNone) {
+                counters.resolved_ok.fetch_add(1, std::memory_order_relaxed);
+            } else if (shadow != 0) {
+                counters.shadow_unvalidated.fetch_add(1, std::memory_order_relaxed);
+                if (shadow >= 2) {
+                    VerifyReport(0x5100 | fail,
+                                 fmt::format("MT shadow: draw {} batch {} failed validation: {}",
+                                             header.seq, header.batch,
+                                             MT::ValidateFailNames[fail]));
+                }
+            }
+        } else if (res != nullptr) {
+            counters.resolved_slow.fetch_add(1, std::memory_order_relaxed);
+        }
+        const bool compare = res != nullptr && shadow != 0 &&
+                             res->status == MT::ResolveStatus::Ok && fail == MT::FailNone;
+        if (compare) {
+            shadow_sink.filled = false;
+            GraphicsPipeline::mt_shadow_sink = &shadow_sink;
+        }
         try {
             if (r.ConfigureDrawPipeline(header.pipeline, is_indexed)) {
                 r.RecordDraw(is_indexed, header.instance_count);
             }
         } catch (const std::exception& e) {
             LOG_ERROR(Render_Vulkan, "MT: draw packet threw: {}", e.what());
+        }
+        GraphicsPipeline::mt_shadow_sink = nullptr;
+        if (compare && shadow_sink.filled) {
+            ShadowCompare(*res, header, shadow_sink);
         }
     }
     if (verify) {
