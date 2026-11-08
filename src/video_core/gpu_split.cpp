@@ -31,6 +31,8 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
+#include "video_core/mt/mt_switches.h"
+#include "video_core/mt/selftest.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include <random>
@@ -254,6 +256,10 @@ void GpuSplit::CheckOwner(const char* where) {
 GpuSplit GpuSplit::instance;
 
 void GpuSplit::MaybeStart(Core::System& system_) {
+    if (MT::SelftestEnabled()) [[unlikely]] {
+        static std::once_flag selftest_once;
+        std::call_once(selftest_once, [] { MT::Selftest::Run(); });
+    }
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
         return value != nullptr ? value[0] : '2';
