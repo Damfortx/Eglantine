@@ -80,7 +80,7 @@ bool Scheduler::DeferFlush() {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
         return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
     }();
-    if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
+    if (interval_us <= 0 || !VideoCommon::GpuSplit::OnIdleHookThread() ||
         static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()) - last_flush_ns >=
             static_cast<u64>(interval_us) * 1000) {
         return false;
@@ -106,7 +106,7 @@ bool Scheduler::WaitSubmitted(u64 tick) {
     const auto start = std::chrono::steady_clock::now();
     auto next_log = start + std::chrono::seconds{2};
     for (u32 spins = 0; !IsSubmitted(tick); ++spins) {
-        if (!split.BackRunning()) {
+        if (!split.IdleHookThreadRunning()) {
             return IsSubmitted(tick);
         }
         if (const auto now = std::chrono::steady_clock::now(); now >= next_log) {

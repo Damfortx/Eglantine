@@ -25,6 +25,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/mt/role.h"
 
 namespace Tegra {
 bool MemoryManager::IsShuttingDown() const {
@@ -316,6 +317,11 @@ T MemoryManager::Read(GPUVAddr addr) const {
 
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
+    if (VideoCommon::MT::g_write_hook_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        if (const auto device_addr = GpuToCpuAddress(addr)) {
+            VideoCommon::MT::BeforeGuestWrite(*device_addr, sizeof(T));
+        }
+    }
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(page_pointer, &data, sizeof(T));
@@ -507,6 +513,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     };
     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
+        VideoCommon::MT::BeforeGuestWrite(dev_addr_base, copy_amount);
         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
         }
@@ -518,6 +525,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+        VideoCommon::MT::BeforeGuestWrite(dev_addr_base, copy_amount);
         u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
                                                              : nullptr;
         if (physical != nullptr) [[likely]] {

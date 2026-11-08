@@ -66,10 +66,53 @@ private:
     std::jthread thread;
 };
 
+/// The multithreaded back's pipeline as the split sees it (renderer_vulkan/vk_mt_pipeline.h,
+/// EDEN_NX2_MT): the back becomes the sequencer and a committer thread records.
+class MtBackInterface {
+public:
+    virtual ~MtBackInterface() = default;
+    /// Front, before the back thread starts: starts the committer.
+    virtual void Start() = 0;
+    /// After the back thread stopped: drains and joins the committer.
+    virtual void Stop() = 0;
+    /// Back: everything before ring position `position` was executed.
+    virtual void SeqMark(u64 position) = 0;
+    /// Any thread: run the committer's idle hook soon.
+    virtual void RequestHook() = 0;
+    /// Whether the committer ran its idle hook and has nothing queued.
+    [[nodiscard]] virtual bool Quiet() const = 0;
+};
+
 class GpuSplit {
 public:
     static GpuSplit& Get() {
         return instance;
+    }
+
+    /// Registers the calling thread with the emulated system (a thread that may run guest
+    /// callbacks, like the back).
+    void RegisterHostThread();
+    /// Set by the rasterizer when EDEN_NX2_MT is on (before the split starts).
+    void SetMtBack(MtBackInterface* back) {
+        mt_back = back;
+    }
+    /// Whether the back runs as the sequencer of the multithreaded back (any thread).
+    [[nodiscard]] bool MtActive() const {
+        return mt_active.load(std::memory_order_acquire);
+    }
+    /// Ring position whose effects are committed (== consumed without the multithreaded back).
+    [[nodiscard]] u64 SettledPosition() const {
+        return MtActive() ? settled.load(std::memory_order_acquire)
+                          : consumed.load(std::memory_order_acquire);
+    }
+    /// Committer: everything before `position` is committed.
+    void StoreSettled(u64 position);
+    /// Committer thread start/stop (the scheduler owner under the multithreaded back).
+    static void MarkCommitterThread(bool on) {
+        on_committer_thread = on;
+    }
+    [[nodiscard]] static bool OnCommitterThread() {
+        return on_committer_thread;
     }
 
     /// Whether the front sends work to the back (front thread only).
@@ -97,7 +140,19 @@ public:
     /// Whether the calling thread owns the Vulkan scheduler: the back while it runs, else the
     /// GPU thread. Other threads (CPU cores, services) must not record or submit work.
     [[nodiscard]] static bool OwnsScheduler() {
+        if (Get().MtActive()) {
+            return on_committer_thread;
+        }
         return Get().BackRunning() ? on_back_thread : on_gpu_thread;
+    }
+    /// Whether the calling thread runs the idle hook (submits deferred flushes): the back, or the
+    /// committer under the multithreaded back.
+    [[nodiscard]] static bool OnIdleHookThread() {
+        return Get().MtActive() ? on_committer_thread : on_back_thread;
+    }
+    /// Whether the thread that runs the idle hook is running.
+    [[nodiscard]] bool IdleHookThreadRunning() const {
+        return MtActive() ? committer_running.load(std::memory_order_acquire) : BackRunning();
     }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
     void SetIdleHook(void (*hook)(void*), void* argument) {
@@ -110,6 +165,10 @@ public:
     }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
+        if (MtActive()) {
+            mt_back->RequestHook();
+            return;
+        }
         hook_requested.store(true, std::memory_order_seq_cst);
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
@@ -324,7 +383,7 @@ public:
         }
         if (pending_write_count == pending_writes.size()) {
             // Drop the ones the back has run.
-            const u64 done = consumed.load(std::memory_order_acquire);
+            const u64 done = SettledPosition();
             size_t kept = 0;
             for (size_t i = 0; i < pending_write_count; ++i) {
                 if (pending_writes[i].known != WriteKnown::Position ||
@@ -384,7 +443,7 @@ public:
         if (pending_write_overflow) {
             return false;
         }
-        const u64 done = consumed.load(std::memory_order_acquire);
+        const u64 done = SettledPosition();
         for (size_t i = 0; i < pending_write_count; ++i) {
             const auto& write = pending_writes[i];
             if (!(address < write.end && write.begin < address + size)) {
@@ -443,7 +502,7 @@ public:
         if (it == pending_adds.end()) {
             return 0;
         }
-        const u64 done = consumed.load(std::memory_order_acquire);
+        const u64 done = SettledPosition();
         auto& adds = it->second;
         while (!adds.empty() && adds.front().position < done) {
             adds.pop_front();
@@ -552,6 +611,8 @@ private:
     }
     void WaitForSpace(size_t words);
     void WaitConsumed(u64 target);
+    /// WaitConsumed's twin over `settled` (multithreaded back).
+    void WaitSettled(u64 target);
     void StoreConsumed(u64 position);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
@@ -625,13 +686,25 @@ private:
     /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
     /// idle hook ran, cleared before it executes entries.
     [[nodiscard]] bool BackQuiet() const {
-        return back_quiet.load(std::memory_order_acquire) ||
-               !back_running.load(std::memory_order_acquire);
+        if (!back_running.load(std::memory_order_acquire)) {
+            return true;
+        }
+        return back_quiet.load(std::memory_order_acquire) && (!MtActive() || mt_back->Quiet());
     }
 
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
     static inline thread_local bool on_gpu_thread{};
+    static inline thread_local bool on_committer_thread{};
+    MtBackInterface* mt_back{};
+    std::atomic<bool> mt_active{};
+    alignas(128) std::atomic<u64> settled{};
+
+public:
+    /// Set by the committer while its thread runs.
+    std::atomic<bool> committer_running{};
+
+private:
     void (*idle_hook)(void*){};
     void* idle_argument{};
     alignas(64) std::atomic<bool> hook_requested{};

@@ -105,7 +105,7 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     // in four bands, three on helper threads (title 1 refreshes 8192x8192 layers, ~70 ms each on
     // one thread). EDEN_NX2_PARALLEL_SWIZZLE=0 does it in order.
     static const char parallel_mode = Tegra::Nx2EnvMode("EDEN_NX2_PARALLEL_SWIZZLE");
-    if (depth == 1 && height >= 1024 && VideoCommon::GpuSplit::OnBackThread() &&
+    if (depth == 1 && height >= 1024 && (VideoCommon::GpuSplit::OnBackThread() || VideoCommon::GpuSplit::OnCommitterThread()) &&
         Tegra::Nx2Switch(parallel_mode, true)) {
         static Common::ThreadWorker pool{3, "Swizzle"};
         const u32 band = Common::AlignUp(Common::DivCeil(height, 4U), 64U);

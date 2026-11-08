@@ -17,6 +17,7 @@
 #include "video_core/mt/maxwell3d_reg_names.h"
 #include "video_core/mt/mt_switches.h"
 #include "video_core/mt/reg_delta.h"
+#include "video_core/mt/role.h"
 
 /// EDEN_NX2_MT_MIRROR=N (docs/mt-plan.md phase 3): a Maxwell3D mirror fed only by the deltas the
 /// multithreaded back would send (registers marked in mt_written, constant buffer binds, root
@@ -135,7 +136,7 @@ private:
 /// Called by the back at each draw (before the draw reads any state).
 inline void MirrorCheckDraw(Tegra::Engines::Maxwell3D& real) {
     const u32 interval = MirrorInterval();
-    if (interval == 0) {
+    if (interval == 0 || Active()) {
         return;
     }
     // Back thread only.
@@ -226,7 +227,7 @@ private:
 /// Called by the back at each compute dispatch (before it reads any state).
 inline void MirrorCheckCompute(Tegra::Engines::KeplerCompute& real) {
     const u32 interval = MirrorInterval();
-    if (interval == 0) {
+    if (interval == 0 || Active()) {
         return;
     }
     static std::unordered_map<const Tegra::Engines::KeplerCompute*, std::unique_ptr<MirrorCompute>>

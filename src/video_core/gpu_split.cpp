@@ -32,6 +32,7 @@
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
 #include "video_core/mt/mt_switches.h"
+#include "video_core/mt/role.h"
 #include "video_core/mt/selftest.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -297,6 +298,12 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
+    // EDEN_NX2_MT: the back becomes the sequencer; a committer thread records (vk_mt_pipeline.h).
+    if (mt_back != nullptr && MT::Enabled()) {
+        settled.store(0, std::memory_order_relaxed);
+        mt_back->Start();
+        mt_active.store(true, std::memory_order_seq_cst);
+    }
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
 #ifdef ARCHITECTURE_x86_64
@@ -335,6 +342,13 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
+    if (mt_active.load(std::memory_order_acquire)) {
+        // The committer finishes what the sequencer emitted, then the scheduler goes back to
+        // whoever owns it without the split.
+        mt_back->Stop();
+        mt_active.store(false, std::memory_order_seq_cst);
+        settled.store(0, std::memory_order_relaxed);
+    }
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a
@@ -422,6 +436,45 @@ void GpuSplit::WaitConsumed(u64 target) {
     consumed_cache = consumed.load(std::memory_order_acquire);
 }
 
+void GpuSplit::RegisterHostThread() {
+    if (system != nullptr) {
+        system->RegisterHostThread();
+    }
+}
+
+void GpuSplit::WaitSettled(u64 target) {
+    for (u32 spins = 0; spins < 16384; ++spins) {
+        if (settled.load(std::memory_order_acquire) >= target) {
+            return;
+        }
+        if ((spins & 1023) == 1023 && !committer_running.load(std::memory_order_acquire)) {
+            return;
+        }
+        Pause();
+    }
+    front_waiting.store(true, std::memory_order_seq_cst);
+    while (true) {
+        const u32 seen = front_wake.load(std::memory_order_seq_cst);
+        if (settled.load(std::memory_order_seq_cst) >= target ||
+            !committer_running.load(std::memory_order_seq_cst)) {
+            break;
+        }
+        front_wake.wait(seen, std::memory_order_seq_cst);
+    }
+    front_waiting.store(false, std::memory_order_relaxed);
+}
+
+void GpuSplit::StoreSettled(u64 position) {
+    u64 current = settled.load(std::memory_order_relaxed);
+    while (current < position &&
+           !settled.compare_exchange_weak(current, position, std::memory_order_seq_cst)) {
+    }
+    if (front_waiting.load(std::memory_order_seq_cst)) {
+        front_wake.fetch_add(1, std::memory_order_seq_cst);
+        front_wake.notify_one();
+    }
+}
+
 void GpuSplit::StoreConsumed(u64 position) {
     consumed.store(position, std::memory_order_seq_cst);
     if (front_waiting.load(std::memory_order_seq_cst)) {
@@ -491,7 +544,7 @@ void GpuSplit::Drain(DrainReason reason) {
     pending_write_count = 0;
     pending_write_overflow = false;
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache == write_position && BackQuiet()) {
+    if (consumed_cache == write_position && SettledPosition() >= write_position && BackQuiet()) {
         CountWait(reason, false, 0);
         return;
     }
@@ -499,6 +552,9 @@ void GpuSplit::Drain(DrainReason reason) {
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     WaitConsumed(write_position);
+    if (MtActive()) {
+        WaitSettled(write_position);
+    }
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
     if (!BackQuiet()) {
@@ -519,7 +575,7 @@ void GpuSplit::Drain(DrainReason reason) {
 void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
     FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache >= position) {
+    if (consumed_cache >= position && SettledPosition() >= position) {
         CountWait(reason, false, 0);
         return;
     }
@@ -528,6 +584,9 @@ void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
     wait_target.store(position, std::memory_order_seq_cst);
     Publish();
     WaitConsumed(position);
+    if (MtActive()) {
+        WaitSettled(position);
+    }
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
@@ -536,7 +595,7 @@ bool GpuSplit::WaitForWriters(DrainReason reason) {
     FlushState();
     const u64 target = std::min(last_writer_position, write_position);
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache >= target) {
+    if (consumed_cache >= target && SettledPosition() >= target) {
         CountWait(reason, false, 0);
         return false;
     }
@@ -545,6 +604,9 @@ bool GpuSplit::WaitForWriters(DrainReason reason) {
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     WaitConsumed(target);
+    if (MtActive()) {
+        WaitSettled(target);
+    }
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
     return true;
@@ -612,7 +674,9 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
     auto* const heap = new std::function<void()>(std::move(func));
     Defer([heap] {
-        (*heap)();
+        // Under the multithreaded back: after everything before is committed, with the
+        // sequencer waiting (page table changes, "GPU done" signals).
+        MT::RunOnCommitter([heap] { (*heap)(); });
         delete heap;
     });
 }
@@ -725,6 +789,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadName("GPUBack");
     Tegra::Nx2ApplyTimerSlack();
     on_back_thread = true;
+    const bool mt = mt_active.load(std::memory_order_acquire);
+    if (mt) {
+        MT::g_role = MT::Role::Sequencer;
+    }
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
@@ -762,7 +830,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // The front may already see everything consumed: Drain() waits for back_quiet
                 // too, so the deferred submit can't overlap whatever the front does next.
                 if (!back_quiet.load(std::memory_order_relaxed)) {
-                    if (idle_hook != nullptr) {
+                    // The committer runs the idle hook under the multithreaded back.
+                    if (idle_hook != nullptr && !mt) {
                         idle_hook(idle_argument);
                     }
                     back_quiet.store(true, std::memory_order_release);
@@ -796,8 +865,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const size_t index = read_position & RingMask;
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
-            if (hook_requested.load(std::memory_order_relaxed) &&
-                idle_hook != nullptr) [[unlikely]] {
+            if (hook_requested.load(std::memory_order_relaxed) && idle_hook != nullptr &&
+                !mt) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 idle_hook(idle_argument);
             }
@@ -806,6 +875,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
+                if (mt) {
+                    mt_back->SeqMark(read_position);
+                }
                 StoreConsumed(read_position);
                 last_store = read_position;
             }
@@ -816,6 +888,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                                  std::chrono::steady_clock::now() - busy_begin)
                                  .count()),
             std::memory_order_relaxed);
+        if (mt) {
+            mt_back->SeqMark(read_position);
+        }
         StoreConsumed(read_position);
     }
     back_running.store(false, std::memory_order_seq_cst);

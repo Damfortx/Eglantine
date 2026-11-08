@@ -45,7 +45,7 @@ void InnerFence::Wait() {
     // split's back may submit; other threads (the fencing thread) ask it to and wait. If the back
     // has stopped, nothing else uses the scheduler and Wait below submits it.
     if (!scheduler.IsSubmitted(wait_tick) && VideoCommon::GpuSplit::Get().Active() &&
-        !VideoCommon::GpuSplit::OnBackThread() && scheduler.WaitSubmitted(wait_tick)) {
+        !VideoCommon::GpuSplit::OnIdleHookThread() && scheduler.WaitSubmitted(wait_tick)) {
         scheduler.GetMasterSemaphore().Wait(wait_tick);
         return;
     }

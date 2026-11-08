@@ -465,7 +465,7 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     // back for it rather than waiting for the back's next submission. If the back has stopped,
     // nothing else uses the scheduler and Wait submits it.
     if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
-        !VideoCommon::GpuSplit::OnBackThread() && !scheduler.WaitSubmitted(tick)) {
+        !VideoCommon::GpuSplit::OnIdleHookThread() && !scheduler.WaitSubmitted(tick)) {
         scheduler.Wait(tick);
         return;
     }

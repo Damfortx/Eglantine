@@ -60,6 +60,19 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/mt/mirror_3d.h"
+#include "video_core/renderer_vulkan/vk_mt_pipeline.h"
+
+// The multithreaded back's routing (vk_mt_pipeline.h): on the sequencer, run the call on the
+// committer and wait (Serial) or queue it there (Command). Elsewhere these do nothing.
+#define MT_SERIAL(kind, ...)                                                                       \
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {                                             \
+        return mt->Serial(MT::Kind::kind, [&] { return __VA_ARGS__; });                            \
+    }
+#define MT_COMMAND(kind, ...)                                                                      \
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {                                             \
+        mt->Command(MT::Kind::kind, __VA_ARGS__);                                                  \
+        return;                                                                                    \
+    }
 
 namespace Vulkan {
 
@@ -246,10 +259,19 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
+    if (VideoCommon::MT::Enabled()) {
+        mt = std::make_unique<Nx2DrawPipeline>(*this);
+        accelerate_dma.mt_pipeline = mt.get();
+        VideoCommon::GpuSplit::Get().SetMtBack(mt.get());
+    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
+    if (mt) {
+        VideoCommon::GpuSplit::Get().SetMtBack(nullptr);
+        mt.reset();
+    }
     scheduler.WaitWorker();
     scheduler.Finish();
 }
@@ -590,6 +612,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    MT_SERIAL(Draw, Draw(is_indexed, instance_count))
     Tegra::g_nx2_draws.fetch_add(1, std::memory_order_relaxed);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
@@ -764,6 +787,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
+    MT_SERIAL(DrawIndirect, DrawIndirect())
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
@@ -840,6 +864,7 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 void RasterizerVulkan::DrawTexture() {
+    MT_SERIAL(DrawTexture, DrawTexture())
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -887,6 +912,7 @@ void RasterizerVulkan::DrawTexture() {
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    MT_SERIAL(Clear, Clear(layer_count))
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
@@ -1091,6 +1117,7 @@ bool SyncFixEnabled() {
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {
+    MT_SERIAL(Dispatch, DispatchCompute())
     VideoCommon::MT::MirrorCheckCompute(*kepler_compute);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     // As PrepareDraw: both cache locks once for the dispatch.
@@ -1206,6 +1233,7 @@ void RasterizerVulkan::DispatchCompute() {
 }
 
 void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
+    MT_COMMAND(Query, [this, type] { ResetCounter(type); })
     switch (type) {
     case VideoCommon::QueryType::ZPassPixelCount64:
     case VideoCommon::QueryType::StreamingByteCount:
@@ -1221,15 +1249,22 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    MT_COMMAND(Query, [this, gpu_addr, type, flags, payload, subreport] {
+        Query(gpu_addr, type, flags, payload, subreport);
+    })
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 
 void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                  u32 size) {
+    MT_COMMAND(Uniform, [this, stage, index, gpu_addr, size] {
+        BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
+    })
     buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
 }
 
 void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
+    MT_COMMAND(Uniform, [this, stage, index] { DisableGraphicsUniformBuffer(stage, index); })
     buffer_cache.DisableGraphicsUniformBuffer(stage, index);
 }
 
@@ -1262,6 +1297,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     if (addr == 0 || size == 0) {
         return;
     }
+    MT_SERIAL(FlushRegion, FlushRegion(addr, size, which))
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);
@@ -1360,6 +1396,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     if (addr == 0 || size == 0) {
         return;
     }
+    MT_SERIAL(InvalidateRegion, InvalidateRegion(addr, size, which))
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
@@ -1377,6 +1414,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    MT_SERIAL(InvalidateRegion, InnerInvalidation(sequences))
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
@@ -1483,6 +1521,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    MT_SERIAL(InvalidateRegion, OnCacheInvalidation(addr, size))
 
     if (MayHoldTexture(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
@@ -1496,6 +1535,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, std::size_t>> regions) {
+    MT_SERIAL(InvalidateRegion, OnCacheInvalidations(regions))
     // What OnCacheInvalidation does for each region, with each cache's lock taken once.
     namespace Profile = VideoCommon::Nx2Profile;
     if (Profile::Enabled()) [[unlikely]] {
@@ -1545,10 +1585,12 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
+    MT_SERIAL(InvalidateGPUCache, InvalidateGPUCache())
     gpu.InvalidateGPUCache();
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
+    MT_SERIAL(Unmap, UnmapMemory(addr, size))
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapMemory(addr, size);
@@ -1561,6 +1603,7 @@ void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
+    MT_SERIAL(Unmap, ModifyGPUMemory(as_id, addr, size))
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapGPUMemory(as_id, addr, size);
@@ -1569,27 +1612,47 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        auto* const heap = new std::function<void()>(std::move(func));
+        mt->Command(MT::Kind::Fence, [this, heap] {
+            SignalFence(std::move(*heap));
+            delete heap;
+        });
+        return;
+    }
     fence_manager.SignalFence(std::move(func));
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        auto* const heap = new std::function<void()>(std::move(func));
+        mt->Command(MT::Kind::Fence, [this, heap] {
+            SyncOperation(std::move(*heap));
+            delete heap;
+        });
+        return;
+    }
     fence_manager.SyncOperation(std::move(func));
 }
 
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
+    MT_COMMAND(Fence, [this, value] { SignalSyncPoint(value); })
     fence_manager.SignalSyncPoint(value);
 }
 
 void RasterizerVulkan::SignalReference() {
+    MT_COMMAND(Fence, [this] { SignalReference(); })
     fence_manager.SignalReference();
 }
 
 void RasterizerVulkan::ReleaseFences(bool force) {
+    MT_COMMAND(Fence, [this, force] { ReleaseFences(force); })
     fence_manager.WaitPendingFences(force);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
+    MT_SERIAL(FlushRegion, FlushAndInvalidateRegion(addr, size, which))
     if (Settings::IsGPULevelHigh()) {
         FlushRegion(addr, size, which);
     }
@@ -1597,6 +1660,7 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
 }
 
 void RasterizerVulkan::WaitForIdle() {
+    MT_COMMAND(Barrier, [this] { WaitForIdle(); })
     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
     // fragment shaders can still write storage buffers.
     VkPipelineStageFlags flags =
@@ -1633,6 +1697,7 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
+    MT_COMMAND(Barrier, [this] { FragmentBarrier(); })
     // We already put barriers when a render pass finishes
     scheduler.RequestOutsideRenderPassOperationContext();
 }
@@ -1642,6 +1707,7 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
+    MT_COMMAND(Barrier, [this] { FlushCommands(); })
     if (draw_counter == 0) {
         return;
     }
@@ -1672,6 +1738,7 @@ void RasterizerVulkan::TickFrame() {
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {
+    MT_SERIAL(ConditionalRendering, AccelerateConditionalRendering())
     gpu_memory->FlushCaching();
     return query_cache.AccelerateHostConditionalRendering();
 }
@@ -1683,6 +1750,7 @@ bool RasterizerVulkan::HasDrawTransformFeedback() {
 bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                              const Tegra::Engines::Fermi2D::Surface& dst,
                                              const Tegra::Engines::Fermi2D::Config& copy_config) {
+    MT_SERIAL(Blit, AccelerateSurfaceCopy(src, dst, copy_config))
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.BlitImage(dst, src, copy_config);
 }
@@ -1698,6 +1766,7 @@ bool RasterizerVulkan::SupportsGameDlssNetwork() const {
 
 std::optional<VideoCore::GameDlssProbe> RasterizerVulkan::ProbeGameDlssOutput(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+    MT_SERIAL(Blit, ProbeGameDlssOutput(src, dst))
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.ProbeGameDlssOutput(dst, src);
 }
@@ -1706,6 +1775,7 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
     std::array<f32, 2> jitter, std::array<f32, 2> motion_scale) {
+    MT_SERIAL(Blit, AccelerateTemporalUpscale(src, dst, motion_vectors, depth, jitter, motion_scale))
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale);
 }
@@ -1716,6 +1786,7 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
+    MT_SERIAL(InlineToMemory, AccelerateInlineToMemory(address, copy_size, memory))
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (gpu_memory->UsesNativeTiling()) {
         u32 first_word{};
@@ -1880,11 +1951,19 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        return mt_pipeline->Serial(MT::Kind::Dma,
+                                   [&] { return BufferClear(src_address, amount, value); });
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     return buffer_cache.DMAClear(src_address, amount, value);
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        return mt_pipeline->Serial(MT::Kind::Dma,
+                                   [&] { return BufferCopy(src_address, dest_address, amount); });
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
@@ -1899,6 +1978,11 @@ template <bool IS_IMAGE_UPLOAD>
 bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                                        const Tegra::DMA::BufferOperand& buffer_operand,
                                        const Tegra::DMA::ImageOperand& image_operand) {
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        return mt_pipeline->Serial(MT::Kind::Dma, [&] {
+            return DmaBufferImageCopy<IS_IMAGE_UPLOAD>(copy_info, buffer_operand, image_operand);
+        });
+    }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     const auto image_id = texture_cache.DmaImageId(image_operand, IS_IMAGE_UPLOAD);
     if (image_id == VideoCommon::NULL_IMAGE_ID) {
@@ -2835,6 +2919,7 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
 }
 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
+    MT_SERIAL(Channel, BindChannel(channel))
     const s32 channel_id = channel.bind_id;
     BindToChannel(channel_id);
     {
@@ -2849,6 +2934,7 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
 }
 
 void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
+    MT_SERIAL(Channel, ReleaseChannel(channel_id))
     EraseChannel(channel_id);
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};

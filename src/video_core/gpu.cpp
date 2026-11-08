@@ -40,6 +40,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/mt/role.h"
 
 namespace Tegra {
 
@@ -240,6 +241,7 @@ struct GPU::Impl {
         std::unique_lock lck{sync_request_mutex};
         const u64 fence = ++last_sync_fence;
         sync_requests.emplace_back(std::forward<Func>(action));
+        requested_sync_fence.store(fence, std::memory_order_release);
         return fence;
     }
 
@@ -485,6 +487,9 @@ struct GPU::Impl {
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
     u64 last_sync_fence{};
+    /// last_sync_fence for lock-free readers (the multithreaded back's sequencer).
+    std::atomic<u64> requested_sync_fence{};
+    std::atomic<bool> mt_tick_posted{};
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
 
@@ -564,6 +569,22 @@ void GPU::WaitForSyncOperation(u64 fence) {
 }
 
 void GPU::TickWork() {
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        // The sync requests (CPU reads, composites, captures) use the committer's state: run
+        // them there, in order, once per batch of requests.
+        if (impl->requested_sync_fence.load(std::memory_order_acquire) >
+                impl->current_sync_fence.load(std::memory_order_acquire) &&
+            !impl->mt_tick_posted.exchange(true, std::memory_order_acq_rel)) {
+            VideoCommon::MT::PostToCommitter(
+                [](void* gpu, void*) {
+                    auto* const self = static_cast<GPU*>(gpu);
+                    self->impl->mt_tick_posted.store(false, std::memory_order_release);
+                    self->impl->TickWork();
+                },
+                this, nullptr);
+        }
+        return;
+    }
     impl->TickWork();
 }
 

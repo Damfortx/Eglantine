@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 
 #include <boost/container/static_vector.hpp>
 
@@ -14,6 +15,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/mt/role.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -50,6 +52,7 @@ namespace Vulkan {
 struct FramebufferTextureInfo;
 
 class StateTracker;
+class Nx2DrawPipeline;
 
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
 public:
@@ -75,6 +78,10 @@ private:
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
     Scheduler& scheduler;
+
+public:
+    /// The multithreaded back's pipeline: the sequencer runs these on the committer.
+    Nx2DrawPipeline* mt_pipeline = nullptr;
 };
 
 class RasterizerVulkan final : public VideoCore::RasterizerInterface,
@@ -113,9 +120,16 @@ public:
     bool OnCPUWrite(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
     void LockCaches() override {
+        // The multithreaded back's sequencer takes them where it needs them.
+        if (VideoCommon::MT::OnSequencer()) {
+            return;
+        }
         std::lock(texture_cache.mutex, buffer_cache.mutex);
     }
     void UnlockCaches() override {
+        if (VideoCommon::MT::OnSequencer()) {
+            return;
+        }
         buffer_cache.mutex.unlock();
         texture_cache.mutex.unlock();
     }
@@ -168,6 +182,8 @@ public:
                                                             u32 pixel_stride);
 
 private:
+    friend class Nx2DrawPipeline;
+
     static constexpr const u64 NEEDS_D24[] = {
         0x01006A800016E000ULL, // SSBU
         0x0100E95004038000ULL, // XC2
@@ -260,6 +276,9 @@ private:
 
     u32 draw_counter = 0;
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+
+    /// EDEN_NX2_MT: the committer pipeline (null when off).
+    std::unique_ptr<Nx2DrawPipeline> mt;
 };
 
 } // namespace Vulkan

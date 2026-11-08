@@ -22,6 +22,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#include "video_core/mt/role.h"
 
 namespace VideoCommon::GPUThread {
 
@@ -160,7 +161,18 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     ASSERT(false);
                 }
                 split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
-                    SignalCommand(*state_ptr, fence, block);
+                    // Under the multithreaded back the command has run once the committer
+                    // reaches this point.
+                    const bool posted = VideoCommon::MT::PostToCommitter(
+                        [](void* state_arg, void* packed) {
+                            const u64 value = reinterpret_cast<u64>(packed);
+                            SignalCommand(*static_cast<SynchState*>(state_arg), value >> 1,
+                                          (value & 1) != 0);
+                        },
+                        state_ptr, reinterpret_cast<void*>((fence << 1) | (block ? 1 : 0)));
+                    if (!posted) {
+                        SignalCommand(*state_ptr, fence, block);
+                    }
                 });
                 split.Publish();
                 continue;
