@@ -19,6 +19,14 @@
 
 namespace Vulkan {
 
+namespace MTDetail {
+/// Released before returning: never hold it across a Serial (the committer takes it).
+inline bool SeqGpuModified(BufferCache& buffer_cache, DAddr device_addr, u64 size) {
+    SeqTrackerLock lock{buffer_cache};
+    return buffer_cache.IsRegionGpuModified(device_addr, size);
+}
+} // namespace MTDetail
+
 inline Nx2DrawPipeline::HeapUploads* Nx2DrawPipeline::TakeHeapUploads(
     std::span<const std::pair<DAddr, u32>> ranges) {
     ClearCapture();
@@ -168,8 +176,7 @@ inline bool Nx2DrawPipeline::SeqConditionalRendering() {
         if (Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, *device_addr, 8)) {
             return serial();
         }
-        MTDetail::SeqTrackerLock lock{r.buffer_cache};
-        if (r.buffer_cache.IsRegionGpuModified(*device_addr, 8)) {
+        if (MTDetail::SeqGpuModified(r.buffer_cache, *device_addr, 8)) {
             return serial();
         }
     }
@@ -283,19 +290,21 @@ inline bool Nx2DrawPipeline::SeqDmaCopy(GPUVAddr src_address, GPUVAddr dest_addr
     }
     BufferCache& buffer_cache = r.buffer_cache;
     bool held = false;
+    bool dst_gpu_data = false;
     {
         MTDetail::SeqTrackerLock lock{buffer_cache};
         // GPU data at the destination may still come back to guest memory from a download taken
         // before this copy, after the copy below wrote it: only the old path orders those.
-        if (buffer_cache.IsRegionGpuModified(*dst, amount)) {
-            counters.dma_serial.fetch_add(1, std::memory_order_relaxed);
-            return serial();
-        }
+        dst_gpu_data = buffer_cache.IsRegionGpuModified(*dst, amount);
         // DMACopy only acts on ranges the buffer cache holds (or GPU writes still in flight
         // will create); otherwise MaxwellDMA copies guest memory, as when it returns false.
         held = buffer_cache.MtIsRegionRegistered(*src, amount) ||
                buffer_cache.MtIsRegionRegistered(*dst, amount) ||
                buffer_cache.IsRegionGpuModified(*src, amount);
+    }
+    if (dst_gpu_data) {
+        counters.dma_serial.fetch_add(1, std::memory_order_relaxed);
+        return serial();
     }
     if (!held) {
         return false;
@@ -357,12 +366,9 @@ inline bool Nx2DrawPipeline::SeqDmaClear(GPUVAddr dst_address, u64 amount, u32 v
     if (!dst) {
         return false;
     }
-    {
-        MTDetail::SeqTrackerLock lock{r.buffer_cache};
-        if (r.buffer_cache.IsRegionGpuModified(*dst, amount * sizeof(u32))) {
-            counters.dma_serial.fetch_add(1, std::memory_order_relaxed);
-            return serial();
-        }
+    if (MTDetail::SeqGpuModified(r.buffer_cache, *dst, amount * sizeof(u32))) {
+        counters.dma_serial.fetch_add(1, std::memory_order_relaxed);
+        return serial();
     }
     // DMAClear reads no guest memory; MaxwellDMA ignores its result and fills guest memory next.
     struct DmaClearCommand {
