@@ -69,6 +69,11 @@ public:
 
     void InvalidateRegions(std::span<const std::pair<DAddr, size_t>> sequences);
 
+    /// Whether a write to the range could reach a registered or rejected program: false only if
+    /// no page of it ever held a registered program (g_nx2_shader_pages) and it misses the span
+    /// of rejected addresses.
+    [[nodiscard]] bool MayHoldProgram(DAddr addr, size_t size) const;
+
     /// @brief Unmarks a memory region as cached and marks it for removal
     /// @param addr Start address of the CPU write operation
     /// @param size Number of bytes of the CPU write operation
@@ -177,6 +182,8 @@ private:
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
+    /// marked_for_removal is not empty (written under invalidation_mutex).
+    std::atomic<bool> nx2_pending_removal{false};
 };
 
 } // namespace VideoCommon

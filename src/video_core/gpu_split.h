@@ -252,6 +252,11 @@ public:
         DmaRead,             ///< MME DMA read (indirect arguments)
         Verify,              ///< EDEN_NX2_SPLIT_VERIFY
         Puller,              ///< semaphores, syncpoints, puller reads
+        // Partial waits (not full drains), counted on the same log line:
+        WritersCommands,     ///< WaitForWriters before reading a command list
+        WritersDmaRead,      ///< WaitForWriters before an MME DMA read
+        Position,            ///< WaitForPosition
+        RingFull,            ///< the ring has no room (WaitForSpace)
         Count,
     };
     void Drain(DrainReason reason = DrainReason::Other);
@@ -352,7 +357,7 @@ public:
         return wait.drain || wait.writers || wait.position != 0;
     }
     /// Waits until the back has run everything sent before `position`.
-    void WaitForPosition(u64 position);
+    void WaitForPosition(u64 position, DrainReason reason = DrainReason::Position);
 
     /// A QMD release that adds `payload` to the word at `address` was just sent to the back.
     u64 noted_adds{}; ///< EDEN_NX2_ACQUIRE_STATS
@@ -433,9 +438,16 @@ public:
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    bool WaitForWriters(DrainReason reason = DrainReason::WritersCommands);
 
 private:
+    /// EDEN_NX2_GPU_PROFILE: counts a front wait (`waited`: it found the back behind) and logs
+    /// the counts by reason every 10 s ("GPU split drains per second:").
+    void CountWait(DrainReason reason, bool waited, u64 wait_ns);
+    std::array<u64, static_cast<size_t>(DrainReason::Count)> stat_waits{}, stat_wait_ns{},
+        stat_calls{};
+    u64 stat_window_start{};
+
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1

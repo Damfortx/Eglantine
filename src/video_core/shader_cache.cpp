@@ -25,6 +25,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -41,11 +42,31 @@ void ShaderCache::InvalidateRegions(std::span<const std::pair<DAddr, size_t>> se
     if (sequences.empty()) {
         return;
     }
+    // EDEN_NX2_INVAL_FAST: FlushCaching's ranges (constant buffer and inline writes before every
+    // draw) almost never reach a program. Skip the lock and the per-page lookups when no range
+    // touches a page a program was ever registered on (bits set in Register before the entry
+    // goes in, never cleared) nor the span of rejected programs, and no removal is pending (an
+    // OnCacheInvalidation left entries for RemovePendingShaders, which this call would run).
+    if (Tegra::Nx2InvalFast() && !nx2_pending_removal.load(std::memory_order_acquire) &&
+        std::ranges::none_of(sequences, [this](const auto& seq) {
+            return MayHoldProgram(seq.first, seq.second);
+        })) {
+        return;
+    }
     std::scoped_lock lock{invalidation_mutex};
     for (const auto& [addr, size] : sequences) {
         InvalidatePagesInRegion(addr, size);
     }
     RemovePendingShaders();
+}
+
+bool ShaderCache::MayHoldProgram(DAddr addr, size_t size) const {
+    // The same test InvalidatePagesInRegion makes before it looks at rejected programs.
+    if (addr + size > rejected_lowest.load(std::memory_order_relaxed) &&
+        addr <= rejected_highest.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    return Tegra::Nx2AnyPage(Tegra::g_nx2_shader_pages, addr, size);
 }
 
 void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
@@ -263,6 +284,8 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
     std::scoped_lock lock{invalidation_mutex, lookup_mutex};
 
     const VAddr addr_end = addr + size;
+    // Before the entry is reachable from invalidation_cache (InvalidateRegions' skip).
+    Tegra::Nx2MarkPages(Tegra::g_nx2_shader_pages, addr, std::max<size_t>(size, 1));
     Entry* const entry = NewEntry(addr, addr_end, data.get());
 
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
@@ -314,6 +337,7 @@ void ShaderCache::RemovePendingShaders() {
         lookup_cache.erase(it);
     }
     marked_for_removal.clear();
+    nx2_pending_removal.store(false, std::memory_order_release);
 
     if (!removed_shaders.empty()) {
         if (removed_shaders.size() > 16) {
@@ -342,6 +366,7 @@ void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr
         UnmarkMemory(entry);
         RemoveEntryFromInvalidationCache(entry);
         marked_for_removal.push_back(entry);
+        nx2_pending_removal.store(true, std::memory_order_release);
     }
 }
 

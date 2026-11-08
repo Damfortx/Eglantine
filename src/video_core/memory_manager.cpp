@@ -951,7 +951,27 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 
 void MemoryManager::FlushCaching() {
     // Flush from the invalidate accumulator
-    if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
+    // EDEN_NX2_INVAL_FAST: most ranges (constant buffer updates, small inline writes) lie in one
+    // small page, which is within one big page and maps to contiguous device memory: translate it
+    // with the entry checks GetSubmappedRangeImpl makes for it (big page mapped: its address; big
+    // page free: the small page's if mapped; else nothing) instead of its generic page walk.
+    const bool fast = Nx2InvalFast();
+    if (accumulator.InvalidateAll([this, fast](GPUVAddr addr, size_t size) {
+        if (fast && size != 0 && (addr >> page_bits) == ((addr + size - 1) >> page_bits)) {
+            const EntryType big = GetEntry(addr, true);
+            if (big == EntryType::Mapped) {
+                const DAddr dev_addr =
+                    (static_cast<DAddr>(big_page_table_dev[addr >> big_page_bits]) << cpu_page_bits) +
+                    (addr & big_page_mask);
+                page_stash2.emplace_back(dev_addr, size);
+            } else if (big == EntryType::Free && GetEntry(addr, false) == EntryType::Mapped) {
+                const DAddr dev_addr =
+                    (static_cast<DAddr>(page_table[addr >> page_bits]) << cpu_page_bits) +
+                    (addr & page_mask);
+                page_stash2.emplace_back(dev_addr, size);
+            }
+            return;
+        }
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);
     })) {
         // EDEN_NX2_INVAL_STATS: ranges per flush and how many 4 KiB pages they fall on.

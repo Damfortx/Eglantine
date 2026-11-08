@@ -1331,12 +1331,24 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
-    if (std::ranges::any_of(sequences, [](const auto& seq) {
-            return MayHoldTexture(seq.first, seq.second);
+    // EDEN_NX2_INVAL_FAST: these run before every draw (Mario Kart World: ~90,000 a second, ~5
+    // ranges each, constant buffer updates and deferred inline writes). Each cache below is only
+    // skipped for a range none of its entries can lie on:
+    // - texture cache: no page ever held an image (Nx2MayHoldTexture, see MayHoldTexture; its
+    //   bits are kept whatever EDEN_NX2_TRAP_TEXTURE_SKIP says, only the CPU trap use is off);
+    // - query cache: no page ever held a query (g_nx2_query_pages, set before the insertion);
+    // - shader cache: in ShaderCache::InvalidateRegions (g_nx2_shader_pages).
+    // The buffer cache always sees every range (constant buffers live there).
+    const bool fast = Tegra::Nx2InvalFast();
+    const auto may_hold_texture = [fast](DAddr addr, u64 size) {
+        return fast ? Tegra::Nx2MayHoldTexture(addr, size) : MayHoldTexture(addr, size);
+    };
+    if (std::ranges::any_of(sequences, [&](const auto& seq) {
+            return may_hold_texture(seq.first, seq.second);
         })) {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
-            if (MayHoldTexture(addr, size)) {
+            if (may_hold_texture(addr, size)) {
                 texture_cache.WriteMemory(addr, size);
             }
         }
@@ -1348,6 +1360,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
         }
     }
     for (const auto& [addr, size] : sequences) {
+        if (fast && !Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, addr, size)) {
+            continue;
+        }
         query_cache.InvalidateRegion(addr, size);
     }
     pipeline_cache.InvalidateRegions(sequences);

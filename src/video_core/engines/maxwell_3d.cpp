@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <vector>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -1294,15 +1295,58 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                          Tegra::Nx2Switch(partial_mode, false);
     const bool skipped = !always_drain && !on_gpu_written && !pending.drain &&
                          !pending.writers && pending.position == 0;
+    // A read that only waits for the copy and compute work queued before it (skipped) did so
+    // for title 1's ~1,000 reads a second: each one left the back without work while the front
+    // waited, so the two took turns. As DmaPusher does for command lists (IsKnownCpuCommandList),
+    // pages a read found unwritten by the GPU after such a wait skip it next time; a page the
+    // back has since marked GPU-written drains above (marks are never cleared). The risk is a
+    // dispatch still queued writing such a page for the first time. EDEN_NX2_DMA_READ_KNOWN=1
+    // skips (=a alternates; off by default).
+    static const char known_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_KNOWN");
+    static std::vector<u64> known_source_pages; // Front thread only; one bit a device page.
+    const auto known_source = [&](bool note) {
+        if (known_source_pages.empty()) {
+            known_source_pages.resize((u64{1} << (36 - 12)) / 64);
+        }
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes;
+             page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            if (!device || (*device >> 12) / 64 >= known_source_pages.size()) {
+                return false;
+            }
+            const u64 index = *device >> 12;
+            u64& word = known_source_pages[index / 64];
+            if (note) {
+                word |= u64{1} << (index % 64);
+            } else if (((word >> (index % 64)) & 1) == 0) {
+                return false;
+            }
+        }
+        return true;
+    };
     if (partial) {
         split.WaitForPosition(pending.position);
-        split.WaitForWriters();
+        split.WaitForWriters(VideoCommon::GpuSplit::DrainReason::WritersDmaRead);
         if (check) [[unlikely]] {
             memory_manager.ReadBlockUnsafe(source, before.data(), checked * sizeof(u32));
             split.Drain(VideoCommon::GpuSplit::DrainReason::DmaRead);
         }
     } else if (skipped) {
-        split.WaitForWriters();
+        if (!(Tegra::Nx2Switch(known_mode, false) && known_source(false))) {
+            split.WaitForWriters(VideoCommon::GpuSplit::DrainReason::WritersDmaRead);
+            // Still not GPU-written with the writers run: a CPU-written page (so far).
+            bool written = false;
+            for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes;
+                 page += 0x1000) {
+                if (const auto device = memory_manager.GpuToCpuAddress(page);
+                    !device || Tegra::Nx2IsGpuWritten(*device)) {
+                    written = true;
+                }
+            }
+            if (!written) {
+                known_source(true);
+            }
+        }
         if (check) [[unlikely]] {
             // What the read sees without the drain, compared below with what it sees after one.
             memory_manager.ReadBlockUnsafe(source, before.data(), checked * sizeof(u32));

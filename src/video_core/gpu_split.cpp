@@ -359,7 +359,11 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     WaitConsumed(write_position + words - RingWords);
+    if (Nx2Profile::Enabled()) {
+        CountWait(DrainReason::RingFull, true, Nx2Profile::Now() - begin);
+    }
 }
 
 // The front waits for the back to pass `target`: a short spin, then asleep until the back
@@ -367,11 +371,10 @@ void GpuSplit::WaitForSpace(size_t words) {
 // pauses and then yielded in a loop: ~20% of the front's samples in title 1, and a busy hardware
 // thread slows its SMT sibling (often the back or a game core). EDEN_NX2_SPLIT_FUTEX=1 sleeps;
 // off by default: in title 1's attract demo it cost ~5% (the wake-ups are slower than the spin).
+// =a alternates (Tegra::Nx2AltOn), to A/B it within a run.
 void GpuSplit::WaitConsumed(u64 target) {
-    static const bool futex = [] {
-        const char* value = std::getenv("EDEN_NX2_SPLIT_FUTEX");
-        return value != nullptr && value[0] == '1';
-    }();
+    static const char futex_mode = Tegra::Nx2EnvMode("EDEN_NX2_SPLIT_FUTEX");
+    const bool futex = Tegra::Nx2Switch(futex_mode, false);
     for (u32 spins = 0; spins < (futex ? 256U : ~0U); ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
@@ -421,54 +424,60 @@ void GpuSplit::Publish() {
     }
 }
 
-void GpuSplit::Drain(DrainReason reason) {
-    // Front thread only: waits per reason, logged every 10 s with EDEN_NX2_GPU_PROFILE.
-    static std::array<u64, static_cast<size_t>(DrainReason::Count)> waits{}, wait_ns{}, calls{};
-    static u64 window_start{};
+void GpuSplit::CountWait(DrainReason reason, bool waited, u64 wait_ns) {
+    // Front thread only: logged every 10 s with EDEN_NX2_GPU_PROFILE.
     const auto index = static_cast<size_t>(reason);
-    ++calls[index];
-    FlushState();
-    if (Nx2Profile::Enabled()) {
-        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                             std::chrono::steady_clock::now().time_since_epoch())
-                                             .count());
-        if (window_start == 0) {
-            window_start = now;
-        } else if (now - window_start >= 10'000'000'000ULL) {
-            static constexpr std::array<const char*, static_cast<size_t>(DrainReason::Count)>
-                names{"other", "sync", "gpu-written commands", "front state", "dma read",
-                      "verify", "puller"};
-            const double seconds = static_cast<double>(now - window_start) / 1e9;
-            std::string line;
-            for (size_t i = 0; i < names.size(); ++i) {
-                if (calls[i] != 0) {
-                    line += fmt::format(" | {} {:.0f}/s ({:.0f} waited, {:.1f} ms)", names[i],
-                                        static_cast<double>(calls[i]) / seconds,
-                                        static_cast<double>(waits[i]) / seconds,
-                                        static_cast<double>(wait_ns[i]) / 1e6 / seconds);
-                }
-            }
-            line += fmt::format(" | predicted acquires {:.0f}/s",
-                                static_cast<double>(predicted_acquires) / seconds);
-            predicted_acquires = 0;
-            LOG_INFO(HW_GPU, "GPU split drains per second:{}", line);
-            waits = {};
-            wait_ns = {};
-            calls = {};
-            window_start = now;
+    ++stat_calls[index];
+    stat_waits[index] += waited ? 1 : 0;
+    stat_wait_ns[index] += wait_ns;
+    if (!Nx2Profile::Enabled()) {
+        return;
+    }
+    const u64 now = Nx2Profile::Now();
+    if (stat_window_start == 0) {
+        stat_window_start = now;
+        return;
+    }
+    if (now - stat_window_start < 10'000'000'000ULL) {
+        return;
+    }
+    static constexpr std::array<const char*, static_cast<size_t>(DrainReason::Count)> names{
+        "other",   "sync",   "gpu-written commands", "front state",       "dma read",
+        "verify",  "puller", "writers (commands)",   "writers (dma read)", "position",
+        "ring full"};
+    const double seconds = static_cast<double>(now - stat_window_start) / 1e9;
+    std::string line;
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (stat_calls[i] != 0) {
+            line += fmt::format(" | {} {:.0f}/s ({:.0f} waited, {:.1f} ms)", names[i],
+                                static_cast<double>(stat_calls[i]) / seconds,
+                                static_cast<double>(stat_waits[i]) / seconds,
+                                static_cast<double>(stat_wait_ns[i]) / 1e6 / seconds);
         }
     }
+    line += fmt::format(" | predicted acquires {:.0f}/s",
+                        static_cast<double>(predicted_acquires) / seconds);
+    predicted_acquires = 0;
+    LOG_INFO(HW_GPU, "GPU split drains per second:{}", line);
+    stat_waits = {};
+    stat_wait_ns = {};
+    stat_calls = {};
+    stat_window_start = now;
+}
+
+void GpuSplit::Drain(DrainReason reason) {
+    FlushState();
     // Everything sent so far has run once this returns: so have the writes it noted.
     pending_write_count = 0;
     pending_write_overflow = false;
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position && BackQuiet()) {
+        CountWait(reason, false, 0);
         return;
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
-    const auto begin = std::chrono::steady_clock::now();
-    ++waits[index];
+    const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     WaitConsumed(write_position);
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
@@ -484,34 +493,40 @@ void GpuSplit::Drain(DrainReason reason) {
         }
     }
     publish_every = 8;
-    wait_ns[index] += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now() - begin)
-                                           .count());
+    CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
 
-void GpuSplit::WaitForPosition(u64 position) {
+void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
     FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= position) {
+        CountWait(reason, false, 0);
         return;
     }
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     wait_target.store(position, std::memory_order_seq_cst);
     Publish();
     WaitConsumed(position);
     wait_target.store(~u64{0}, std::memory_order_relaxed);
+    CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
 
-bool GpuSplit::WaitForWriters() {
+bool GpuSplit::WaitForWriters(DrainReason reason) {
     FlushState();
     const u64 target = std::min(last_writer_position, write_position);
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
+        CountWait(reason, false, 0);
         return false;
     }
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     WaitConsumed(target);
     wait_target.store(~u64{0}, std::memory_order_relaxed);
+    CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
     return true;
 }
 

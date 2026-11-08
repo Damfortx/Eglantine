@@ -329,6 +329,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);
     {
         std::scoped_lock lock(cache_mutex);
+        // Before the entry goes in: InnerInvalidation skips ranges without these bits.
+        Tegra::Nx2MarkPages(Tegra::g_nx2_query_pages, cpu_addr, sizeof(u32));
         auto it1 = cached_queries.try_emplace(cont_addr);
         auto& sub_container = it1.first->second;
         auto it_current = sub_container.find(base);

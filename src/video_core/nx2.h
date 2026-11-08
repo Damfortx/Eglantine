@@ -215,6 +215,69 @@ inline void Nx2MarkTexturePages(u64 device_address, u64 size) {
     }
     return false;
 }
+
+// EDEN_NX2_INVAL_FAST (off by default, '1' on, 'a' alternates): the invalidations FlushCaching
+// sends before every draw (constant buffer updates, deferred inline-to-memory writes, cached DMA
+// writes) walked the query cache and the shader cache (each with its lock and hash lookups per
+// page) for ranges that almost never hold a query or a program. Device pages that have ever held
+// a query result (QueryCacheBase::cached_queries) or a registered program (ShaderCache), same
+// layout as g_nx2_gpu_written_pages. Set before the entry goes into its cache (under that cache's
+// lock), never cleared, so a range with none of these bits holds no entry of that cache.
+using Nx2PageBitmap = std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64>;
+inline Nx2PageBitmap g_nx2_query_pages{};
+inline Nx2PageBitmap g_nx2_shader_pages{};
+
+/// Sets the bits of every page of the range (pages beyond the bitmap are always "may hold").
+inline void Nx2MarkPages(Nx2PageBitmap& bitmap, u64 device_address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const u64 limit = bitmap.size() * 64;
+    const u64 first = device_address >> Nx2WrittenPageBits;
+    if (first >= limit) {
+        return;
+    }
+    const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits, limit - 1);
+    for (u64 page = first; page <= last;) {
+        const u64 shift = page % 64;
+        const u64 count = std::min<u64>(64 - shift, last - page + 1);
+        const u64 mask = (count == 64 ? ~u64{0} : ((u64{1} << count) - 1)) << shift;
+        auto& word = bitmap[page / 64];
+        if ((word.load(std::memory_order_relaxed) & mask) != mask) {
+            word.fetch_or(mask, std::memory_order_seq_cst);
+        }
+        page += count;
+    }
+}
+
+/// Whether any page of the range has its bit set (conservatively true outside the bitmap).
+[[nodiscard]] inline bool Nx2AnyPage(const Nx2PageBitmap& bitmap, u64 device_address, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 limit = bitmap.size() * 64;
+    const u64 first = device_address >> Nx2WrittenPageBits;
+    const u64 last = (device_address + size - 1) >> Nx2WrittenPageBits;
+    if (last >= limit || last < first) {
+        return true;
+    }
+    for (u64 page = first; page <= last;) {
+        const u64 shift = page % 64;
+        const u64 count = std::min<u64>(64 - shift, last - page + 1);
+        const u64 mask = (count == 64 ? ~u64{0} : ((u64{1} << count) - 1)) << shift;
+        if (bitmap[page / 64].load(std::memory_order_seq_cst) & mask) {
+            return true;
+        }
+        page += count;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool Nx2InvalFast() {
+    static const char mode = Nx2EnvMode("EDEN_NX2_INVAL_FAST");
+    return Nx2Switch(mode, false);
+}
+
 // EDEN_NX2_CPUWRITE_FAST (on by default, '0' off, 'a' alternates): guest CPU writes to cached pages
 // (RasterizerVulkan::OnCPUWrite) took the buffer cache lock even when the buffer cache does not
 // protect the page (it is trapped for an image or a shader, e.g. layered/sparse images, which
