@@ -33,6 +33,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include <random>
 
 namespace Tegra {
 bool Nx2AltOn() {
@@ -48,21 +49,34 @@ bool Nx2AltOn() {
             u64 draws = g_nx2_draws.load(), busy = g_nx2_back_busy_ns.load(),
                 presents = g_nx2_presents.load();
             auto begin = std::chrono::steady_clock::now();
+            // EDEN_NX2_ALT_RANDOM=1: windows go in blocks of two, on and off in a random order,
+            // so the A/B can't line up with periodic patterns in the workload (a switch with no
+            // effect measured +7 fps alternating strictly). Each window logs its block.
+            static const bool random_order = std::getenv("EDEN_NX2_ALT_RANDOM") != nullptr;
+            std::mt19937 rng{std::random_device{}()};
+            u64 window = 0;
+            if (random_order) {
+                state.store((rng() & 1) != 0, std::memory_order_relaxed);
+            }
             for (;;) {
                 std::this_thread::sleep_for(period);
                 const bool was = state.load(std::memory_order_relaxed);
-                state.store(!was, std::memory_order_relaxed);
+                const u64 block = window / 2;
+                ++window;
+                const bool next = random_order && (window % 2) == 0 ? (rng() & 1) != 0 : !was;
+                state.store(next, std::memory_order_relaxed);
                 const auto now = std::chrono::steady_clock::now();
                 const double seconds = std::chrono::duration<double>(now - begin).count();
                 const u64 d = g_nx2_draws.load() - draws, b = g_nx2_back_busy_ns.load() - busy,
                           p = g_nx2_presents.load() - presents;
                 LOG_INFO(HW_GPU,
                          "Nx2 alt window {}: {:.1f} fps, {:.0f} draws/s, back busy {:.0f} ms/s, "
-                         "{:.3f} us/draw",
+                         "{:.3f} us/draw, block {}",
                          was ? "on" : "off", static_cast<double>(p) / seconds,
                          static_cast<double>(d) / seconds, static_cast<double>(b) / 1e6 / seconds,
-                         d != 0 ? static_cast<double>(b) / 1e3 / static_cast<double>(d) : 0.0);
-                LOG_INFO(HW_GPU, "Nx2 alt: {}", !was ? "on" : "off");
+                         d != 0 ? static_cast<double>(b) / 1e3 / static_cast<double>(d) : 0.0,
+                         block);
+                LOG_INFO(HW_GPU, "Nx2 alt: {}", next ? "on" : "off");
                 draws += d;
                 busy += b;
                 presents += p;

@@ -707,6 +707,11 @@ bool PresentManager::CopyToSwapchainImpl(Frame* frame) {
     // semaphore is per swapchain image; it is signalled again only after this image is acquired
     // again, which needs this present to have been submitted first (and we drain before every
     // acquire anyway).
+    // EDEN_NX2_NULL=a: a switch that does nothing, to measure the A/B windows' noise.
+    static const char null_mode = Tegra::Nx2EnvMode("EDEN_NX2_NULL");
+    if (null_mode == 'a') [[unlikely]] {
+        (void)Tegra::Nx2Switch(null_mode, false);
+    }
     static const char present_defer = Tegra::Nx2EnvMode("EDEN_NX2_PRESENT_DEFER");
     if (!use_present_thread && Tegra::Nx2Switch(present_defer, true)) {
         QueueDeferredPresent({

@@ -1793,9 +1793,18 @@ void RasterizerVulkan::FlushWork() {
         }
         return static_cast<u32>(std::clamp(parsed, 32UL, 1'048'576UL));
     }();
-    const u32 draws_to_dispatch = Tegra::g_nx2_ampere.load(std::memory_order_relaxed)
-                                     ? native_flush_draws
-                                     : DRAWS_TO_DISPATCH;
+    // EDEN_NX2_FLUSH_ALT=1 uses EDEN_NX2_FLUSH_DRAWS_B (default 512) instead (=a alternates):
+    // each flush is a submit the back makes, ~450 a second at 128 for title 1.
+    static const char flush_alt_mode = Tegra::Nx2EnvMode("EDEN_NX2_FLUSH_ALT");
+    static const u32 flush_draws_b = [] {
+        const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS_B");
+        const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        return parsed >= 32 ? static_cast<u32>(std::min(parsed, 1'048'576UL)) : 512U;
+    }();
+    const u32 draws_to_dispatch =
+        Tegra::g_nx2_ampere.load(std::memory_order_relaxed)
+            ? (Tegra::Nx2Switch(flush_alt_mode, false) ? flush_draws_b : native_flush_draws)
+            : DRAWS_TO_DISPATCH;
     if (draw_counter < draws_to_dispatch) {
         scheduler.DispatchWork();
         return;
