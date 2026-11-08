@@ -342,6 +342,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         }
     };
     namespace Profile = VideoCommon::Nx2Profile;
+    // Both cache locks once for the whole draw: the invalidation (FlushCaching) took each and
+    // the draw both again, four contended acquisitions a draw against the fencing thread and
+    // the game threads' write traps (the back spun ~3% of its time on them). They are recursive:
+    // the inner ones only count. EDEN_NX2_EARLY_LOCK=0 takes them as before (=a alternates).
+    static const char early_mode = Tegra::Nx2EnvMode("EDEN_NX2_EARLY_LOCK");
+    std::unique_lock early_buffer{buffer_cache.mutex, std::defer_lock};
+    std::unique_lock early_texture{texture_cache.mutex, std::defer_lock};
+    if (Tegra::Nx2Switch(early_mode, true)) {
+        std::lock(early_buffer, early_texture);
+    }
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
@@ -1053,6 +1063,13 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    // As PrepareDraw: both cache locks once for the dispatch.
+    static const char early_mode = Tegra::Nx2EnvMode("EDEN_NX2_EARLY_LOCK");
+    std::unique_lock early_texture{texture_cache.mutex, std::defer_lock};
+    std::unique_lock early_buffer{buffer_cache.mutex, std::defer_lock};
+    if (Tegra::Nx2Switch(early_mode, true)) {
+        std::lock(early_texture, early_buffer);
+    }
     FlushWork();
     gpu_memory->FlushCaching();
 

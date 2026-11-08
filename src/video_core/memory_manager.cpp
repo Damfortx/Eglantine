@@ -953,6 +953,30 @@ void MemoryManager::FlushCaching() {
     if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);
     })) {
+        // EDEN_NX2_INVAL_STATS: ranges per flush and how many 4 KiB pages they fall on.
+        static const bool inval_stats = std::getenv("EDEN_NX2_INVAL_STATS") != nullptr;
+        if (inval_stats) [[unlikely]] {
+            static u64 flushes{}, ranges{}, pages{}, bytes{};
+            static auto window = std::chrono::steady_clock::now();
+            ++flushes;
+            ranges += page_stash2.size();
+            DAddr last_page = ~DAddr{0};
+            for (const auto& [address, size] : page_stash2) {
+                bytes += size;
+                if ((address >> 12) != last_page) {
+                    ++pages;
+                    last_page = address >> 12;
+                }
+            }
+            if (std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
+                LOG_INFO(HW_GPU, "Invalidation flushes: {}/s, {} ranges/s ({:.1f} a flush), {} page "
+                         "changes/s, {} KiB/s",
+                         flushes / 10, ranges / 10, static_cast<double>(ranges) / flushes,
+                         pages / 10, bytes / 10240);
+                flushes = ranges = pages = bytes = 0;
+                window = std::chrono::steady_clock::now();
+            }
+        }
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();
     }
