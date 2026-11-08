@@ -388,17 +388,26 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-    const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+    bool forked = false;     ///< Buffers bound and updated beside the helper's texture work
+    bool views_clean = false; ///< The helper resolved the views (else FillImageViews does)
+    // parts: 1 binds the stage's storage buffers (buffer cache), 2 reads its texture handles and
+    // samplers (texture cache); the split back's helper may do the second (see below).
+    const auto config_stage{[&](size_t stage, int parts = 3) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
-        buffer_cache.UnbindGraphicsStorageBuffers(stage);
-        if constexpr (Spec::has_storage_buffers) {
-            size_t ssbo_index{};
-            for (const auto& desc : info.storage_buffers_descriptors) {
-                ASSERT(desc.count == 1);
-                buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written);
-                ++ssbo_index;
+        if (parts & 1) {
+            buffer_cache.UnbindGraphicsStorageBuffers(stage);
+            if constexpr (Spec::has_storage_buffers) {
+                size_t ssbo_index{};
+                for (const auto& desc : info.storage_buffers_descriptors) {
+                    ASSERT(desc.count == 1);
+                    buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
+                                                           desc.cbuf_offset, desc.is_written);
+                    ++ssbo_index;
+                }
             }
+        }
+        if (!(parts & 2)) {
+            return true;
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
@@ -472,20 +481,87 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }};
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
-        if constexpr (Spec::enabled_stages[0]) {
-            config_stage(0);
+        const auto config_stages = [&](int parts) LAMBDA_FORCEINLINE {
+            if constexpr (Spec::enabled_stages[0]) {
+                config_stage(0, parts);
+            }
+            if constexpr (Spec::enabled_stages[1]) {
+                config_stage(1, parts);
+            }
+            if constexpr (Spec::enabled_stages[2]) {
+                config_stage(2, parts);
+            }
+            if constexpr (Spec::enabled_stages[3]) {
+                config_stage(3, parts);
+            }
+            if constexpr (Spec::enabled_stages[4]) {
+                config_stage(4, parts);
+            }
+        };
+        // With no texture buffers (bound through the buffer cache once the views are known), the
+        // split back's helper reads the texture handles and samplers and resolves the views while
+        // this thread binds and updates the buffers: the caches share nothing on these paths, and
+        // the helper only takes views that are clean hits (TryFillImageViewsClean), so no Vulkan
+        // work runs on it. The texture cache is only touched there meanwhile.
+        if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers) {
+            auto& helper = VideoCommon::BackHelper::Get();
+            if (num_image_elements != 0 && regs.transform_feedback_enabled == 0 &&
+                helper.Enabled()) {
+                static const bool fork_stats = std::getenv("EDEN_NX2_FORK_STATS") != nullptr;
+                u64 job_ns = 0;
+                auto texture_job = [&] {
+                    const auto job_begin = fork_stats ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+                    config_stages(2);
+                    views_clean = texture_cache.TryFillImageViewsClean(
+                        std::span(views.data(), views.size()), Spec::has_images);
+                    if (fork_stats) {
+                        job_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      std::chrono::steady_clock::now() - job_begin)
+                                                      .count());
+                    }
+                };
+                const auto fork_begin = fork_stats ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
+                helper.Post(
+                    [](void* context) { (*static_cast<decltype(texture_job)*>(context))(); },
+                    &texture_job);
+                config_stages(1);
+                for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+                    if (Spec::enabled_stages[stage]) {
+                        buffer_cache.UnbindGraphicsTextureBuffers(stage);
+                    }
+                }
+                {
+                    Profile::Scope update_scope{Profile::Zone::UpdateBuffers};
+                    buffer_cache.UpdateGraphicsBuffers(is_indexed);
+                    buffer_cache.BindHostGeometryBuffers(is_indexed);
+                }
+                const auto join_begin = fork_stats ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
+                helper.Join();
+                forked = true;
+                if (fork_stats) [[unlikely]] {
+                    const auto now = std::chrono::steady_clock::now();
+                    static u64 forks{}, clean{}, back_ns{}, wait_ns{}, helper_ns{};
+                    static auto window = now;
+                    ++forks;
+                    clean += views_clean ? 1 : 0;
+                    back_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(join_begin - fork_begin).count());
+                    wait_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - join_begin).count());
+                    helper_ns += job_ns;
+                    if (now - window > std::chrono::seconds{10}) {
+                        LOG_INFO(Render_Vulkan, "Back helper: {} forks, {} clean; per fork: back {} ns, "
+                                 "helper job {} ns, join wait {} ns",
+                                 forks, clean, back_ns / forks, helper_ns / forks, wait_ns / forks);
+                        forks = clean = back_ns = wait_ns = helper_ns = 0;
+                        window = now;
+                    }
+                }
+            }
         }
-        if constexpr (Spec::enabled_stages[1]) {
-            config_stage(1);
-        }
-        if constexpr (Spec::enabled_stages[2]) {
-            config_stage(2);
-        }
-        if constexpr (Spec::enabled_stages[3]) {
-            config_stage(3);
-        }
-        if constexpr (Spec::enabled_stages[4]) {
-            config_stage(4);
+        if (!forked) {
+            config_stages(3);
         }
     }
     ASSERT(views.size() == num_image_elements);
@@ -520,46 +596,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             window = std::chrono::steady_clock::now();
         }
     }
-    // With no texture buffers (which bind through the buffer cache once the views are known), the
-    // views are resolved on the split back's helper thread while this thread updates the vertex,
-    // index and other buffers: the two caches share nothing on that path, and the helper only
-    // takes views that are clean hits (TryFillImageViewsClean), so no Vulkan work runs on it.
-    bool buffers_updated = false;
-    if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers) {
-        auto& helper = VideoCommon::BackHelper::Get();
-        if (!views.empty() && regs.transform_feedback_enabled == 0 && helper.Enabled()) {
-            struct Job {
-                TextureCache* texture_cache;
-                std::span<VideoCommon::ImageViewInOut> views;
-                bool blacklist;
-                bool clean;
-            } job{&texture_cache, std::span(views.data(), views.size()), Spec::has_images, false};
-            helper.Post(
-                [](void* context) {
-                    auto* const j = static_cast<Job*>(context);
-                    j->clean = j->texture_cache->TryFillImageViewsClean(j->views, j->blacklist);
-                },
-                &job);
-            for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
-                if (Spec::enabled_stages[stage]) {
-                    buffer_cache.UnbindGraphicsTextureBuffers(stage);
-                }
-            }
-            {
-                Profile::Scope scope{Profile::Zone::UpdateBuffers};
-                buffer_cache.UpdateGraphicsBuffers(is_indexed);
-                buffer_cache.BindHostGeometryBuffers(is_indexed);
-            }
-            helper.Join();
-            if (!job.clean) {
-                Profile::Scope scope{Profile::Zone::FillImageViews};
-                texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
-                                             Spec::has_images);
-            }
-            buffers_updated = true;
-        }
-    }
-    if (!buffers_updated) {
+    if (!views_clean) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
@@ -646,7 +683,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
 
-    if (!buffers_updated) {
+    if (!forked) {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
