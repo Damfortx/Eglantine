@@ -742,8 +742,29 @@ inline MT::ResolvedDraw* Nx2DrawPipeline::WaitResolved(const DrawHeader& header)
     }
     MT::Resolver& resolver = *resolvers[header.batch % resolver_count];
     if (!resolver.cursor.Done(header.batch)) {
+        if (adaptive_batches) {
+            wanted_batch.store(header.batch + 1, std::memory_order_relaxed);
+        }
         const bool timed = VideoCommon::MT::Stats();
         const auto begin = std::chrono::steady_clock::now();
+        if (steal_us != 0) {
+            // Record this draw ourselves rather than wait longer for the resolver.
+            const auto deadline = begin + std::chrono::microseconds{steal_us};
+            for (u32 spins = 0; !resolver.cursor.Done(header.batch); ++spins) {
+                if ((spins & 63) == 63 && std::chrono::steady_clock::now() >= deadline) {
+                    counters.resolved_stolen.fetch_add(1, std::memory_order_relaxed);
+                    if (timed) {
+                        counters.commit_wait_ns.fetch_add(
+                            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - begin)
+                                                 .count()),
+                            std::memory_order_relaxed);
+                    }
+                    return nullptr;
+                }
+                VideoCommon::MT::CpuPause();
+            }
+        }
         bool warned = false;
         VideoCommon::MT::WaitWatch::Scope watch_scope{watch, VideoCommon::MT::WaitSite::CommitResolved,
                                                       header.batch};
@@ -967,12 +988,13 @@ inline void Nx2DrawPipeline::LogResolverStats(double seconds) {
     }
     take(counters.validate_fail[0]);
     LOG_INFO(Render_Vulkan,
-             "MT resolvers/s:{} | ok {:.0f} (committed {:.0f}), slow {:.0f}:{}, missing {:.0f} | validation "
+             "MT resolvers/s:{} | ok {:.0f} (committed {:.0f}), slow {:.0f}:{}, missing {:.0f}, stolen {:.0f} | validation "
              "failures:{} | batches {:.0f}, commit wait {:.1f} ms, ring waits {:.0f}, barriers "
              "{:.0f} | shadow {:.0f} checks, {} mismatches, {:.0f} unvalidated | EBR pending {}",
              per_resolver, rate(take(counters.resolved_ok)), rate(take(counters.resolved_committed)),
              rate(take(counters.resolved_slow)),
-             slow_text, rate(take(counters.resolved_missing)), fail_text,
+             slow_text, rate(take(counters.resolved_missing)),
+             rate(take(counters.resolved_stolen)), fail_text,
              rate(take(counters.batches)), static_cast<double>(take(counters.commit_wait_ns)) / 1e6 / seconds,
              rate(take(counters.ring_waits)), rate(take(counters.barriers)),
              rate(take(counters.shadow_checks)),

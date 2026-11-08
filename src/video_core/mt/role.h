@@ -59,11 +59,11 @@ inline std::atomic<bool> g_active{};
     static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_CHECK");
     return Tegra::Nx2Switch(mode, false);
 }
-/// EDEN_NX2_MT_COMPUTE=packet: compute dispatches as packets (default serial).
+/// EDEN_NX2_MT_COMPUTE=packet|serial: compute dispatches as packets (default) or Serials.
 [[nodiscard]] inline bool ComputePackets() {
     static const bool packet = [] {
         const char* value = std::getenv("EDEN_NX2_MT_COMPUTE");
-        return value != nullptr && value[0] == 'p';
+        return value == nullptr || value[0] != 's';
     }();
     return packet;
 }

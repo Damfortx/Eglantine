@@ -266,14 +266,20 @@ public:
     struct MtDispatchState {
         bool native_mode;
         bool dlss_active;
+        /// DispatchIndirect's argument address (0: a direct dispatch).
+        GPUVAddr indirect_address;
     };
     [[nodiscard]] MtDispatchState MtGetDispatchState() const {
-        return {native_mode, dlss_chain.active};
+        return {native_mode, dlss_chain.active, indirect_compute.value_or(GPUVAddr{})};
     }
     void MtSetDispatchState(const MtDispatchState& state) {
         native_mode = state.native_mode;
         dlss_chain.active = state.dlss_active;
-        indirect_compute.reset();
+        if (state.indirect_address != 0) {
+            indirect_compute = state.indirect_address;
+        } else {
+            indirect_compute.reset();
+        }
     }
     /// Whether the current native dispatch belongs to a recognized game DLSS evaluation.
     bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }

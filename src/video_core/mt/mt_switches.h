@@ -92,13 +92,29 @@ namespace VideoCommon::MT {
     return on;
 }
 
-/// EDEN_NX2_MT_RCOMMIT=1: record validated resolver results (the texture half of ConfigureImpl
-/// from the resolver). Off by default until EDEN_NX2_MT_SHADOW runs show no mismatches; off,
-/// the resolvers still run and every draw takes the phase-4 path.
+/// EDEN_NX2_MT_RCOMMIT (on): record validated resolver results (the texture half of
+/// ConfigureImpl from the resolver; EDEN_NX2_MT_SHADOW turns it off). =0: the resolvers still run
+/// and every draw takes the phase-4 path.
 [[nodiscard]] inline bool ResolvedCommit() {
     static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_RCOMMIT");
-    static const bool on = Tegra::Nx2Switch(mode, false);
+    static const bool on = Tegra::Nx2Switch(mode, true);
     return on;
+}
+
+/// EDEN_NX2_MT_ADAPTIVE (on): a committer waiting for an open batch asks the sequencer to close
+/// it after its next draw (batches shrink when the committer is ahead, grow up to
+/// EDEN_NX2_MT_BATCH when it lags).
+[[nodiscard]] inline bool AdaptiveBatches() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_ADAPTIVE");
+    static const bool on = Tegra::Nx2Switch(mode, true);
+    return on;
+}
+
+/// EDEN_NX2_MT_STEAL_US=N (default 0 = off): a committer that waited N us for a resolver's batch
+/// records the draw itself (phase-4 path) instead of waiting longer.
+[[nodiscard]] inline u32 StealMicros() {
+    static const u32 us = EnvNumber("EDEN_NX2_MT_STEAL_US", 0);
+    return us;
 }
 
 /// EDEN_NX2_MT_REPLAY=1: per-render-pass POD replay closures (phase 5b); 2 also records the old

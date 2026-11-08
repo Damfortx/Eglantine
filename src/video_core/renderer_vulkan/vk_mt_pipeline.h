@@ -139,6 +139,7 @@ struct Counters {
     std::atomic<u64> shadow_unvalidated{};
     std::atomic<u64> barriers{};
     std::atomic<u64> resolved_committed{};
+    std::atomic<u64> resolved_stolen{}; ///< EDEN_NX2_MT_STEAL_US: recorded without the result
 };
 
 inline constexpr std::array<const char*, 16> ForcedSerialNames{
@@ -569,6 +570,11 @@ private:
     boost::container::small_vector<VideoCommon::SamplerId, 96> commit_samplers;
     /// Committer: the seq of the last committed draw packet (sequencer back-pressure).
     alignas(64) std::atomic<u64> committed_seq{0};
+    /// Committer: 1 + the batch it waits for (EDEN_NX2_MT_ADAPTIVE: the sequencer closes it
+    /// after its next draw).
+    alignas(64) std::atomic<u64> wanted_batch{0};
+    const bool adaptive_batches = VideoCommon::MT::AdaptiveBatches();
+    const u32 steal_us = VideoCommon::MT::StealMicros();
 
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> committer_quiet{true};
@@ -1761,7 +1767,9 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     stream.Commit();
     counters.packets.fetch_add(1, std::memory_order_relaxed);
     counters.packet_words.fetch_add(words, std::memory_order_relaxed);
-    if (Batching() && ++batch_draws >= VideoCommon::MT::BatchSize()) {
+    if (Batching() && (++batch_draws >= VideoCommon::MT::BatchSize() ||
+                       (adaptive_batches &&
+                        wanted_batch.load(std::memory_order_relaxed) == batch_id + 1))) {
         CloseBatch();
     }
     if (lockstep) {
@@ -2343,11 +2351,15 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
         verify_cpu_writes_since.store(VideoCommon::MT::GuestCpuWrites().Snapshot(),
                                       std::memory_order_release);
     }
-    if (real.GetIndirectComputeAddress()) {
-        return 12;
-    }
-    if (!info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
-        return 2;
+    // DispatchIndirect: the committer reads the arguments from the buffer cache (GPU data, or
+    // the CPU-modified bytes taken below).
+    DAddr indirect_device_addr = 0;
+    if (const auto indirect = real.GetIndirectComputeAddress()) {
+        const auto translated = memory.GpuToCpuAddress(*indirect);
+        if (!translated || !memory.IsContinuousRange(*indirect, 12)) {
+            return 12;
+        }
+        indirect_device_addr = *translated;
     }
     const auto enabled = [&](u32 cbuf) { return ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0; };
     const bool native = real.IsNativeMode();
@@ -2432,6 +2444,53 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
             capture_view(read_handle(desc, index).first);
         }
     }
+    // Texture and image buffers: their TIC entries, and the CPU-modified bytes of the ranges
+    // they name (ComputePipeline::Configure binds them through the buffer cache).
+    struct BufferViewCapture {
+        DAddr device_addr;
+        u32 size;
+        bool is_written;
+    };
+    boost::container::small_vector<BufferViewCapture, 8> buffer_views;
+    const auto capture_buffer_view = [&](u32 handle, bool is_written) {
+        const u32 index = Tegra::Texture::TextureHeaderIndex(handle, tic_limit, native_tiling);
+        if (index > tic_limit) {
+            return true;
+        }
+        const GPUVAddr tic_addr = real.regs.tic.Address() + u64{index} * 32;
+        SeqReadDescriptor(tic_addr);
+        Tegra::Texture::TICEntry tic{};
+        memory.ReadBlockUnsafe(tic_addr, &tic, sizeof(tic));
+        const VideoCommon::ImageInfo view_info{tic};
+        if (view_info.type != VideoCommon::ImageType::Buffer) {
+            return false;
+        }
+        const GPUVAddr gpu_addr = tic.Address();
+        const u32 size = VideoCommon::CalculateGuestSizeInBytes(view_info);
+        if (gpu_addr == 0 || size == 0) {
+            return true;
+        }
+        const auto translated = memory.GpuToCpuAddress(gpu_addr);
+        if (!translated || !memory.IsContinuousRange(gpu_addr, size)) {
+            return false;
+        }
+        buffer_views.push_back({*translated, size, is_written});
+        return true;
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            if (!capture_buffer_view(read_handle(desc, index).first, false)) {
+                return 2;
+            }
+        }
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            if (!capture_buffer_view(read_handle(desc, index).first, desc.is_written)) {
+                return 2;
+            }
+        }
+    }
 
     MTDetail::SeqTrackerLock lock{rasterizer.buffer_cache};
     const u32 alignment = rasterizer.buffer_cache.MtUniformBufferAlignment();
@@ -2477,6 +2536,15 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
         if (ssbo.is_written) {
             rasterizer.buffer_cache.MtCaptureWrittenRange(ssbo.device_addr, ssbo.size);
         }
+    }
+    for (const BufferViewCapture& view : buffer_views) {
+        SeqTakeUploads(view.device_addr, view.size);
+        if (view.is_written) {
+            rasterizer.buffer_cache.MtCaptureWrittenRange(view.device_addr, view.size);
+        }
+    }
+    if (indirect_device_addr != 0) {
+        SeqTakeUploads(indirect_device_addr, 12);
     }
     FinishOverlay();
     return -1;
