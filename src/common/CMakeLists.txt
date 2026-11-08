@@ -48,7 +48,6 @@ add_library(
     elf.h
     error.cpp
     error.h
-    event_wait.h
     fiber.cpp
     fiber.h
     fixed_point.h
