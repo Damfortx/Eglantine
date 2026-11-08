@@ -187,6 +187,35 @@ public:
         });
     }
 
+    /// erase, handing the object to `on_reclaim(T&&)` right before its destructor runs: at once
+    /// without an EpochManager, else in the reclaim callback (on the thread that Collects), so
+    /// a reader that still holds the object never sees it moved from.
+    template <typename Func>
+    void erase_then(Common::SlotId id, Func&& on_reclaim) noexcept {
+        const u32 index = id.Value();
+        Entry& entry = EntryAt(index);
+        entry.generation.fetch_add(1, std::memory_order_release);
+        ResetStorageBit(index);
+        --live_count;
+        if (epoch == nullptr) {
+            on_reclaim(std::move(entry.object));
+            entry.object.~T();
+            free_list.push_back(index);
+            return;
+        }
+        epoch->Retire([this, index, fn = std::forward<Func>(on_reclaim)]() mutable {
+            T& object = EntryAt(index).object;
+            fn(std::move(object));
+            object.~T();
+            std::scoped_lock lock{deferred_mutex};
+            deferred_free.push_back(index);
+        });
+    }
+
+    [[nodiscard]] EpochManager* GetEpochManager() const noexcept {
+        return epoch;
+    }
+
     [[nodiscard]] Iterator begin() noexcept {
         const auto it = std::ranges::find_if(stored_bitset, [](u64 value) { return value != 0; });
         if (it == stored_bitset.end()) {

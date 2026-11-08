@@ -72,7 +72,7 @@ public:
     void Retire(std::function<void()> fn) {
         std::scoped_lock lock{retire_mutex};
         retired.emplace_back(global.fetch_add(1, std::memory_order_seq_cst), std::move(fn));
-        if (retired.size() >= 64) {
+        if (auto_collect && retired.size() >= 64) {
             CollectLocked();
         }
     }
@@ -81,6 +81,12 @@ public:
     size_t Collect() {
         std::scoped_lock lock{retire_mutex};
         return CollectLocked();
+    }
+
+    /// Off: reclaim callbacks run only in Collect (they then run on the collecting thread,
+    /// under whatever locks it holds, never inside a Retire).
+    void SetAutoCollect(bool on) noexcept {
+        auto_collect = on;
     }
 
     [[nodiscard]] u64 CurrentEpoch() const {
@@ -125,6 +131,7 @@ private:
     std::array<Slot, MaxReaders> slots;
     std::mutex retire_mutex;
     std::vector<std::pair<u64, std::function<void()>>> retired;
+    bool auto_collect = true;
 };
 
 /// RAII critical section of a registered reader.

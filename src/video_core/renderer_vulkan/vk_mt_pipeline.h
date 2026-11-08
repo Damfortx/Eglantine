@@ -36,6 +36,7 @@
 #include "video_core/mt/capture.h"
 #include "video_core/mt/draw_packet.h"
 #include "video_core/mt/engine_ptr.h"
+#include "video_core/mt/epoch.h"
 #include "video_core/mt/maxwell3d_reg_names.h"
 #include "video_core/mt/reg_delta.h"
 #include "video_core/mt/role.h"
@@ -397,6 +398,20 @@ public:
 private:
     std::chrono::steady_clock::time_point last_stats{std::chrono::steady_clock::now()};
 
+    /// Reclamation for the caches' slots and twin maps (EDEN_NX2_MT_EBR): retired by the
+    /// committer, collected by the committer, read under guards by the resolvers.
+    VideoCommon::MT::EpochManager epochs;
+    bool epochs_attached = false;
+    u32 collect_countdown = 0;
+    void AttachEpochs(bool attach);
+    /// Committer: run reclaim callbacks whose grace period passed.
+    void CollectEpochs() {
+        if (epochs_attached) {
+            std::scoped_lock lock{rasterizer.buffer_cache.mutex, rasterizer.texture_cache.mutex};
+            epochs.Collect();
+        }
+    }
+
     // Committer-owned.
     std::vector<std::unique_ptr<ChannelMirrors>> mirrors;
     ChannelMirrors* current{};
@@ -452,6 +467,7 @@ inline void Nx2DrawPipeline::Start() {
     hooks.before_write = [](void* context, u64 device_addr, u64 size) {
         static_cast<Nx2DrawPipeline*>(context)->BeforeWrite(device_addr, size);
     };
+    AttachEpochs(VideoCommon::MT::DeferredFree());
     start_ready.store(false, std::memory_order_relaxed);
     committer = std::jthread([this](std::stop_token stop) { CommitterLoop(stop); });
     while (!start_ready.load(std::memory_order_acquire)) {
@@ -480,8 +496,25 @@ inline void Nx2DrawPipeline::Stop() {
     VideoCommon::MT::g_write_hook_on.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_hooks = {};
     stream.RemoveConsumer(consumer);
+    AttachEpochs(false);
     running = false;
     LOG_INFO(Render_Vulkan, "MT: committer stopped");
+}
+
+inline void Nx2DrawPipeline::AttachEpochs(bool attach) {
+    if (attach == epochs_attached) {
+        return;
+    }
+    std::scoped_lock lock{rasterizer.buffer_cache.mutex, rasterizer.texture_cache.mutex};
+    if (!attach) {
+        // No reader is left: everything retired runs now, then erase destroys at once again.
+        epochs.Collect();
+    }
+    epochs.SetAutoCollect(false);
+    VideoCommon::MT::EpochManager* const manager = attach ? &epochs : nullptr;
+    rasterizer.texture_cache.MtSetEpochManager(manager);
+    rasterizer.buffer_cache.MtSetEpochManager(manager);
+    epochs_attached = attach;
 }
 
 inline void Nx2DrawPipeline::SeqMark(u64 position) {
@@ -795,6 +828,7 @@ inline void Nx2DrawPipeline::Idle(std::stop_token& stop) {
     if (!committer_quiet.load(std::memory_order_relaxed) ||
         hook_requested.load(std::memory_order_relaxed)) {
         hook_requested.store(false, std::memory_order_seq_cst);
+        CollectEpochs();
         rasterizer.scheduler.FlushDeferred();
         committer_quiet.store(true, std::memory_order_seq_cst);
     }
@@ -1429,6 +1463,10 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
     }
     if (verify) {
         ReportView(header.seq, view);
+    }
+    if (++collect_countdown >= 16) {
+        collect_countdown = 0;
+        CollectEpochs();
     }
 }
 

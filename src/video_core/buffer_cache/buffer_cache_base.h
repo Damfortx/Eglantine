@@ -268,6 +268,11 @@ public:
     void MtCaptureWrittenRange(DAddr device_addr, u32 size);
     /// Committer: copies captured bytes into the buffers that hold their ranges.
     void MtApplyUploads(std::span<const MT::UploadEntry> uploads, const u8* blob);
+    /// Defer slot erasure through `manager` (nullptr detaches). Only while no other thread uses
+    /// the cache.
+    void MtSetEpochManager(MT::EpochManager* manager) {
+        slot_buffers.SetEpochManager(manager);
+    }
 
     bool OnCPUWrite(DAddr device_addr, u64 size);
 

@@ -398,6 +398,10 @@ public:
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
 
+    /// EDEN_NX2_MT (texture_cache_mt.h): defer slot erasure and retired twin tables through
+    /// `manager` (nullptr detaches). Only while no other thread uses the cache.
+    void MtSetEpochManager(MT::EpochManager* manager);
+
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
@@ -629,6 +633,8 @@ private:
     };
 
     using PendingDownload = PendingImageDownload<Image>;
+
+    MT::EpochManager* mt_epoch = nullptr;
 
     // Stable storage: resolver threads hold references across inserts (docs/mt-plan.md).
     MT::StableSlotVector<Image> slot_images;

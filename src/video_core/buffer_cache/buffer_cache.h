@@ -2712,12 +2712,16 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 
     Unregister(buffer_id);
 
+    bool sentence = true;
 #ifdef YUZU_LEGACY
-    if (!do_not_mark || !immediately_free)
+    sentence = !do_not_mark || !immediately_free;
 #endif
-        delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
-
-    slot_buffers.erase(buffer_id);
+    // With an EpochManager attached (EDEN_NX2_MT) the move-out runs at reclaim.
+    slot_buffers.erase_then(buffer_id, [this, sentence](Buffer&& buffer) {
+        if (sentence) {
+            delayed_destruction_ring.Push(std::move(buffer));
+        }
+    });
     // Other channels' bindings and the per-draw memos may still hold this (reusable) id.
     ++buffer_deletion_epoch;
 

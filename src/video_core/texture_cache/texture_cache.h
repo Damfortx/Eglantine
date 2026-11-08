@@ -2420,9 +2420,12 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     }
     RemoveImageViewReferences(image_view_ids);
     RemoveFramebuffers(image_view_ids);
+    // The version first: a resolver that loads it after a view erase sees it changed.
+    image.BumpVersion();
     for (const ImageViewId image_view_id : image_view_ids) {
-        sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
-        slot_image_views.erase(image_view_id);
+        slot_image_views.erase_then(image_view_id, [this](ImageView&& view) {
+            sentenced_image_view.Push(std::move(view));
+        });
     }
     image.image_view_ids.clear();
     image.image_view_infos.clear();
@@ -3656,30 +3659,37 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         ASSERT_MSG(num_removed_overlaps == 1, "Invalid number of removed overlapps: {}",
                    num_removed_overlaps);
     }
-    for (const ImageViewId image_view_id : image_view_ids) {
-        if (!immediate_delete) {
-            sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
-        }
-        slot_image_views.erase(image_view_id);
-    }
-    ++view_epoch; // Erased views: memoized ImageViewIds may be reused (TryReuseGraphicsBindings)
+    // Dead and the version before the views go: a resolver that loads the version after a view
+    // erase sees it changed.
     image.flags |= ImageFlagBits::Dead;
     image.BumpVersion();
-    const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
-                                                       uncommitted_downloads, committed_downloads);
-    if (retained) {
-        LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
-    } else if (!immediate_delete) {
-        if constexpr (requires { runtime.CurrentTick(); }) {
-            gpu_sentenced_images.push_back(
-                {runtime.CurrentTick(), freed_bytes, std::move(slot_images[image_id])});
-            gpu_sentenced_bytes += freed_bytes;
+    for (const ImageViewId image_view_id : image_view_ids) {
+        if (!immediate_delete) {
+            slot_image_views.erase_then(image_view_id, [this](ImageView&& view) {
+                sentenced_image_view.Push(std::move(view));
+            });
         } else {
-            sentenced_images.Push(std::move(slot_images[image_id]));
-            sentenced_image_bytes[sentenced_image_index] += freed_bytes;
+            slot_image_views.erase(image_view_id);
         }
     }
-    slot_images.erase(image_id);
+    ++view_epoch; // Erased views: memoized ImageViewIds may be reused (TryReuseGraphicsBindings)
+    // With an EpochManager attached (EDEN_NX2_MT) the move-out runs at reclaim, once no
+    // resolver can still read the image; until then it stays in its slot.
+    slot_images.erase_then(image_id, [this, image_id, freed_bytes, immediate_delete](Image&& object) {
+        const bool retained = RetainPendingImageDownloads(image_id, object, uncommitted_downloads,
+                                                           committed_downloads);
+        if (retained) {
+            LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
+        } else if (!immediate_delete) {
+            if constexpr (requires { runtime.CurrentTick(); }) {
+                gpu_sentenced_images.push_back({runtime.CurrentTick(), freed_bytes, std::move(object)});
+                gpu_sentenced_bytes += freed_bytes;
+            } else {
+                sentenced_images.Push(std::move(object));
+                sentenced_image_bytes[sentenced_image_index] += freed_bytes;
+            }
+        }
+    });
 
     alloc_images.erase(alloc_image_it);
     if (alloc_images.empty()) {
@@ -4045,6 +4055,8 @@ void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];
     this_state->gpu_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2];
     this_state->sparse_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2 + 1];
+    this_state->image_views_mt.SetEpochManager(mt_epoch);
+    this_state->samplers_mt.SetEpochManager(mt_epoch);
 }
 
 /// Bind a channel for execution.
@@ -4055,3 +4067,5 @@ void TextureCache<P>::OnGPUASRegister([[maybe_unused]] size_t map_id) {
 }
 
 } // namespace VideoCommon
+
+#include "video_core/texture_cache/texture_cache_mt.h"
