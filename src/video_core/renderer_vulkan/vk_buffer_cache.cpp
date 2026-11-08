@@ -249,9 +249,11 @@ public:
         const size_t sub_first_offset = static_cast<size_t>(first % 4) * GetQuadsNum(num_indices);
         const size_t offset =
             (sub_first_offset + GetQuadsNum(first)) * 6ULL * BytesPerIndex(index_type);
-        scheduler.Record([buffer_ = *buffer, index_type_, offset](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindIndexBuffer(buffer_, offset, index_type_);
-        });
+        scheduler.RecordReplayable(
+            [buffer_ = *buffer, index_type_, offset](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindIndexBuffer(buffer_, offset, index_type_);
+            },
+            ReplayClass::IndexBuffer);
     }
 
 protected:
@@ -656,9 +658,11 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
     bound_index_offset = vk_offset;
     bound_index_type = vk_index_type;
     bound_index_epoch = epoch;
-    scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
-        cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
-    });
+    scheduler.RecordReplayable(
+        [vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
+        },
+        ReplayClass::IndexBuffer);
 }
 
 /// Bind the quad index buffer and drop any cached index bind.
@@ -666,9 +670,11 @@ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 fir
     bound_index_valid = false;
     if (count == 0) {
         ReserveNullBuffer();
-        scheduler.Record([this](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindIndexBuffer(*null_buffer, 0, VK_INDEX_TYPE_UINT32);
-        });
+        scheduler.RecordReplayable(
+            [this](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindIndexBuffer(*null_buffer, 0, VK_INDEX_TYPE_UINT32);
+            },
+            ReplayClass::IndexBuffer);
         return;
     }
 
@@ -697,21 +703,25 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
         stride = 72;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
-        scheduler.Record([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
-            const VkDeviceSize vk_offset = buffer != VK_NULL_HANDLE ? offset : 0;
-            const VkDeviceSize vk_size = buffer != VK_NULL_HANDLE ? size : VK_WHOLE_SIZE;
-            const VkDeviceSize vk_stride = stride;
-            cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &vk_offset, &vk_size, &vk_stride);
-        });
+        scheduler.RecordReplayable(
+            [index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
+                const VkDeviceSize vk_offset = buffer != VK_NULL_HANDLE ? offset : 0;
+                const VkDeviceSize vk_size = buffer != VK_NULL_HANDLE ? size : VK_WHOLE_SIZE;
+                const VkDeviceSize vk_stride = stride;
+                cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &vk_offset, &vk_size, &vk_stride);
+            },
+            ReplayClass::VertexBuffers);
     } else {
         if (!device.HasNullDescriptor() && buffer == VK_NULL_HANDLE) {
             ReserveNullBuffer();
             buffer = *null_buffer;
             offset = 0;
         }
-        scheduler.Record([index, buffer, offset](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindVertexBuffer(index, buffer, offset);
-        });
+        scheduler.RecordReplayable(
+            [index, buffer, offset](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffer(index, buffer, offset);
+            },
+            ReplayClass::VertexBuffers);
     }
 }
 
@@ -780,12 +790,48 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
             compact.sizes[i] = bindings.sizes[i];
             compact.strides[i] = bindings.strides[i];
         }
-        scheduler.Record([compact](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindVertexBuffers2EXT(compact.first, compact.count, compact.buffers.data(),
-                                         compact.offsets.data(), compact.sizes.data(),
-                                         compact.strides.data());
-        });
+        scheduler.RecordReplayable(
+            [compact](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(compact.first, compact.count, compact.buffers.data(),
+                                             compact.offsets.data(), compact.sizes.data(),
+                                             compact.strides.data());
+            },
+            ReplayClass::VertexBuffers);
         return;
+    }
+    if (scheduler.ReplayCapturing()) [[unlikely]] {
+        // EDEN_NX2_MT_REPLAY: {u32 first, u32 count, u32 eds, u32 pad, buffers[count],
+        // offsets[count], sizes[count], strides[count]} as one POD record (only `count` entries
+        // instead of the ~1.3 KiB closure with all 32).
+        static_assert(sizeof(VkBuffer) == sizeof(u64) && sizeof(VkDeviceSize) == sizeof(u64));
+        std::array<u64, 2 + 4 * VideoCommon::NUM_VERTEX_BUFFERS> payload;
+        const bool eds = device.IsExtExtendedDynamicStateSupported();
+        const std::array<u32, 4> header{bindings.min_index, binding_count, eds ? 1U : 0U, 0U};
+        std::memcpy(payload.data(), header.data(), sizeof(header));
+        u64* const arrays = payload.data() + 2;
+        std::memcpy(arrays, buffer_handles.data(), binding_count * sizeof(u64));
+        std::memcpy(arrays + binding_count, bindings.offsets.data(), binding_count * sizeof(u64));
+        std::memcpy(arrays + 2 * binding_count, bindings.sizes.data(), binding_count * sizeof(u64));
+        std::memcpy(arrays + 3 * binding_count, bindings.strides.data(),
+                    binding_count * sizeof(u64));
+        static constexpr DrawReplay::Thunk thunk = [](const u64* data, vk::CommandBuffer cmdbuf) {
+            std::array<u32, 4> head;
+            std::memcpy(head.data(), data, sizeof(head));
+            const u32 count = head[1];
+            const u64* const lists = data + 2;
+            const auto* const handles = reinterpret_cast<const VkBuffer*>(lists);
+            const VkDeviceSize* const offsets = lists + count;
+            if (head[2] != 0) {
+                cmdbuf.BindVertexBuffers2EXT(head[0], count, handles, offsets, lists + 2 * count,
+                                             lists + 3 * count);
+            } else {
+                cmdbuf.BindVertexBuffers(head[0], count, handles, offsets);
+            }
+        };
+        if (scheduler.RecordReplayRaw(ReplayClass::VertexBuffers, thunk, payload.data(),
+                                      (2 + 4 * size_t{binding_count}) * sizeof(u64))) {
+            return;
+        }
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
         scheduler.Record([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {

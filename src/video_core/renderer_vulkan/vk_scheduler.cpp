@@ -4,8 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -20,6 +22,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/mt/mt_switches.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_gpu_timestamps.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -50,7 +53,8 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
 Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
-      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
+      replay{VideoCommon::MT::Replay() <= 2 ? VideoCommon::MT::Replay() : 0U} {
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
@@ -154,6 +158,9 @@ void Scheduler::DispatchWork() {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
+    if (replay.IsOpen()) [[unlikely]] {
+        EndReplaySegment(ReplayCloseReason::Dispatch);
+    }
     if (chunk && !chunk->Empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
@@ -168,6 +175,37 @@ void Scheduler::DispatchWork() {
         }
         AcquireNewChunk();
     }
+}
+
+void Scheduler::EndReplaySegment(ReplayCloseReason reason) {
+    DrawReplay::Block* const block = replay.Close(reason);
+    if (block == nullptr) {
+        return;
+    }
+    // Closed before recording: a full chunk dispatched here does not come back to this block.
+    auto command = [block, encoder = &replay](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+        DrawReplay::Run(*block, cmdbuf);
+        encoder->Release(block);
+    };
+    RecordToChunk(command);
+}
+
+bool Scheduler::RecordReplayRaw(ReplayClass cls, DrawReplay::Thunk thunk, const void* data,
+                                size_t bytes) {
+    if (!ReplayCapturing() || bytes > DrawReplay::MAX_PAYLOAD_BYTES) {
+        return false;
+    }
+    if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+        VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordReplayRaw");
+    }
+    if (!replay.Fits(bytes, cls == ReplayClass::Draw)) {
+        EndReplaySegment(ReplayCloseReason::Full);
+    }
+    if (replay.Elide(cls, reinterpret_cast<const void*>(thunk), data, bytes)) {
+        return true;
+    }
+    std::memcpy(replay.Append(thunk, bytes, cls), data, bytes);
+    return true;
 }
 
 void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
@@ -490,6 +528,7 @@ void Scheduler::AllocateNewContext() {
 
 void Scheduler::InvalidateState() {
     ++recording_epoch;
+    replay.ResetMirror();
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;

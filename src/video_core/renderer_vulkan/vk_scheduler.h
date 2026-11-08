@@ -20,6 +20,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/renderer_vulkan/vk_draw_replay.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -138,11 +139,12 @@ public:
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
-        if (chunk->Record(command)) {
-            return;
+        // EDEN_NX2_MT_REPLAY: anything recorded outside the replay sites ends the open replay
+        // segment first, so it lands after the segment's records, as it was recorded.
+        if (replay.IsOpen()) [[unlikely]] {
+            EndReplaySegment(ReplayCloseReason::Record);
         }
-        DispatchWork();
-        (void)chunk->Record(command);
+        RecordToChunk(command);
     }
 
     template <typename T>
@@ -153,6 +155,64 @@ public:
                 command(cmdbuf);
             });
     }
+
+    /// Whether the per-draw recording sites encode into the replay segment (EDEN_NX2_MT_REPLAY
+    /// set, committer thread; level 2 also checks on the worker that segments run in order).
+    [[nodiscard]] bool ReplayCapturing() const noexcept {
+        return replay.Level() != 0 && VideoCommon::GpuSplit::OnCommitterThread();
+    }
+
+    /// Per-draw recording site (EDEN_NX2_MT_REPLAY, phase 5b): on the committer with replay on,
+    /// a trivially copyable command becomes a POD record of the open replay segment, dropped
+    /// when `cls` is elidable and it repeats the last record of its class in the segment.
+    /// Otherwise (and with replay off) exactly Record(command).
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordReplayable(T&& command, ReplayClass cls = ReplayClass::None) {
+        using U = std::remove_cvref_t<T>;
+        if constexpr (DrawReplay::Replayable<U>) {
+            if (ReplayCapturing()) [[unlikely]] {
+                if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+                    VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordReplayable");
+                }
+                const DrawReplay::Thunk thunk = &DrawReplay::Invoke<U>;
+                if (!replay.Fits(sizeof(U), cls == ReplayClass::Draw)) {
+                    EndReplaySegment(ReplayCloseReason::Full);
+                }
+                if (replay.Elide(cls, reinterpret_cast<const void*>(thunk), &command,
+                                 sizeof(U))) {
+                    return;
+                }
+                void* const storage = replay.Append(thunk, sizeof(U), cls);
+                ::new (storage) U(std::forward<T>(command));
+                return;
+            }
+        }
+        Record(std::forward<T>(command));
+    }
+
+    /// Variable-size POD record (vertex binds, vertex input): `bytes` of `data` replayed by
+    /// `thunk`. False when not capturing: the caller records the old way.
+    bool RecordReplayRaw(ReplayClass cls, DrawReplay::Thunk thunk, const void* data,
+                         size_t bytes);
+
+    /// A graphics pipeline bind is being recorded (replay elision mirror reset).
+    void ReplayPipelineBound() noexcept {
+        replay.ResetMirror();
+    }
+
+    /// Byte-mirror elision for state decided inside a replayed closure (push constants,
+    /// descriptor offsets): true when `bytes` repeat the class's last value in the open
+    /// segment. Only valid while ReplayCapturing().
+    bool ReplayElideBytes(ReplayClass cls, const void* bytes, size_t size) {
+        return replay.Elide(cls, nullptr, bytes, size);
+    }
+    void ReplayInvalidate(ReplayClass cls) noexcept {
+        replay.Invalidate(cls);
+    }
+
+    /// Ends the open replay segment (records its closure into the chunk). No-op when none.
+    void EndReplaySegment(ReplayCloseReason reason = ReplayCloseReason::Idle);
 
     /// Whether the recording thread submitted `tick` within 20 ms.
     [[nodiscard]] bool WaitForSubmission(u64 tick) const {
@@ -228,6 +288,17 @@ public:
     std::mutex submit_mutex;
 
 private:
+    /// Records into the current chunk without ending the replay segment (dispatching a full
+    /// chunk ends it).
+    template <typename T>
+    void RecordToChunk(T& command) {
+        if (chunk->Record(command)) {
+            return;
+        }
+        DispatchWork();
+        (void)chunk->Record(command);
+    }
+
     u64 last_flush_ns{}; ///< Common::g_wall_clock (the host counter: steady_clock cost ~2% of the back)
     bool flush_pending{};
 
@@ -361,6 +432,9 @@ private:
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
+    /// EDEN_NX2_MT_REPLAY encoder (recording thread; blocks released by the worker). Declared
+    /// before worker_thread so it outlives the worker.
+    DrawReplay replay;
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 

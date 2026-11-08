@@ -71,6 +71,8 @@ int main(int argc, char** argv) {
         {"p5_t6_variant_array", VariantArrayStressTest},
         {"p5_t7_barrier", BarrierStressTest},
         {"t8_uniform_ring", UniformRingStressTest},
+        {"t9_packet_replica", PacketReplicaStressTest},
+        {"t10_replay_arena", ReplayArenaStressTest},
     };
     const char* filter = argc > 1 && argv[1][0] != '\0' ? argv[1] : nullptr;
     int failed = 0;

@@ -1084,11 +1084,39 @@ bool GraphicsPipeline::ConfigureDrawCommon(
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
     }
-    scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
+    // EDEN_NX2_MT_REPLAY: pushes and descriptor-buffer offsets that repeat the last ones of
+    // the open replay segment, with no pipeline bind in between, are skipped (the segment runs
+    // back to back on one command buffer, so they are still set).
+    enum : u8 { SKIP_RESCALING = 1, SKIP_RENDER_AREA = 2, SKIP_DESCRIPTOR_OFFSETS = 4 };
+    u8 skip = 0;
+    if (scheduler.ReplayCapturing()) [[unlikely]] {
+        if (bind_pipeline) {
+            scheduler.ReplayPipelineBound();
+        }
+        if (bind_descriptor_buffer) {
+            scheduler.ReplayInvalidate(ReplayClass::DescriptorBufferOffset);
+        }
+        if (scheduler.ReplayElideBytes(ReplayClass::PushRescaling, rescaling_words.data(),
+                                       sizeof(rescaling_words))) {
+            skip |= SKIP_RESCALING;
+        }
+        if (render_area.uses_render_area &&
+            scheduler.ReplayElideBytes(ReplayClass::PushRenderArea, render_area.words.data(),
+                                       sizeof(render_area.words))) {
+            skip |= SKIP_RENDER_AREA;
+        }
+        if (descriptor_set_layout && uses_descriptor_buffer &&
+            scheduler.ReplayElideBytes(ReplayClass::DescriptorBufferOffset,
+                                       &descriptor_buffer_offset,
+                                       sizeof(descriptor_buffer_offset))) {
+            skip |= SKIP_DESCRIPTOR_OFFSETS;
+        }
+    }
+    auto command = [this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling_words, is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                      render_area_data = render_area.words, skip](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
             const VkDescriptorBufferBindingInfoEXT binding_info{
                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
@@ -1101,9 +1129,11 @@ bool GraphicsPipeline::ConfigureDrawCommon(
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
         }
-        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
-                             RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
-                             rescaling_data.data());
+        if ((skip & SKIP_RESCALING) == 0) {
+            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                                 RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
+                                 rescaling_data.data());
+        }
         if (update_rescaling) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
@@ -1111,7 +1141,7 @@ bool GraphicsPipeline::ConfigureDrawCommon(
                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
                                  &scale_down_factor);
         }
-        if (uses_render_area) {
+        if (uses_render_area && (skip & SKIP_RENDER_AREA) == 0) {
             cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
                                  &render_area_data);
@@ -1120,9 +1150,12 @@ bool GraphicsPipeline::ConfigureDrawCommon(
             return;
         }
         if (uses_descriptor_buffer) {
-            const u32 buffer_index{};
-            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
-                                                 0, buffer_index, descriptor_buffer_offset);
+            if ((skip & SKIP_DESCRIPTOR_OFFSETS) == 0) {
+                const u32 buffer_index{};
+                cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                     *pipeline_layout, 0, buffer_index,
+                                                     descriptor_buffer_offset);
+            }
         } else if (uses_push_descriptor) {
             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
                                                     0, descriptor_data);
@@ -1133,7 +1166,10 @@ bool GraphicsPipeline::ConfigureDrawCommon(
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
                                       descriptor_set, nullptr);
         }
-    });
+    };
+    static_assert(DrawReplay::Replayable<decltype(command)>,
+                  "the ConfigureDraw closure must stay a POD replay record");
+    scheduler.RecordReplayable(std::move(command), ReplayClass::Configure);
     return true;
 }
 

@@ -1219,6 +1219,8 @@ inline void Nx2DrawPipeline::CommitterLoop(std::stop_token stop) {
             rasterizer.scheduler.FlushDeferred();
         }
     }
+    // EDEN_NX2_MT_REPLAY: the open segment belongs to this thread.
+    rasterizer.scheduler.EndReplaySegment(ReplayCloseReason::Idle);
     rasterizer.scheduler.FlushDeferred();
     // Back to the real engines for whoever records next.
     for (const auto& pair : mirrors) {
@@ -1263,6 +1265,9 @@ inline void Nx2DrawPipeline::Idle(std::stop_token& stop) {
         }
         MTDetail::Pause();
     }
+    // EDEN_NX2_MT_REPLAY: going to sleep, end the open segment (it is recorded in the chunk
+    // like the closures it replaces would be; FlushDeferred/DispatchWork hand it over).
+    rasterizer.scheduler.EndReplaySegment(ReplayCloseReason::Idle);
     if (!committer_quiet.load(std::memory_order_relaxed) ||
         hook_requested.load(std::memory_order_relaxed)) {
         hook_requested.store(false, std::memory_order_seq_cst);
