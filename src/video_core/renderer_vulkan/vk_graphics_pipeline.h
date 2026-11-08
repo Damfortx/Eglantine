@@ -139,11 +139,11 @@ public:
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
     void MarkUsed(u64 frame) noexcept {
-        last_use_frame = frame;
+        last_use_frame.store(frame, std::memory_order_relaxed);
     }
 
     [[nodiscard]] u64 LastUse() const noexcept {
-        return last_use_frame;
+        return last_use_frame.load(std::memory_order_relaxed);
     }
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
@@ -195,7 +195,7 @@ private:
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
-    u64 last_use_frame{};
+    std::atomic<u64> last_use_frame{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 

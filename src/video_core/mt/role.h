@@ -27,6 +27,9 @@ inline thread_local Role g_role = Role::None;
 [[nodiscard]] inline bool OnCommitter() noexcept {
     return g_role == Role::Committer;
 }
+[[nodiscard]] inline bool OnResolver() noexcept {
+    return g_role == Role::Resolver;
+}
 
 /// Set while the committer runs (the sequencer then routes its rasterizer work to it).
 inline std::atomic<bool> g_active{};

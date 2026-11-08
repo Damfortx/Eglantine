@@ -59,4 +59,59 @@ namespace VideoCommon::MT {
     return on;
 }
 
+/// EDEN_NX2_MT_SHADOW=1|2: resolvers run, but the committer records the phase-4 result and
+/// compares it with theirs (2 also logs every validation failure with the ids involved).
+[[nodiscard]] inline u32 Shadow() {
+    static const u32 level = EnvNumber("EDEN_NX2_MT_SHADOW", 0);
+    return level;
+}
+
+/// EDEN_NX2_MT_PIPE=resolver: FixedPipelineState::Refresh and the key lookup on the resolvers
+/// (default seq: the packet carries the pipeline the sequencer looked up).
+[[nodiscard]] inline bool PipeOnResolver() {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_NX2_MT_PIPE");
+        return value != nullptr && value[0] == 'r';
+    }();
+    return on;
+}
+
+/// EDEN_NX2_MT_RDESC: resolvers write descriptor-buffer bytes into their own blocks (off: the
+/// committer writes them from the resolver's payload).
+[[nodiscard]] inline bool ResolverDescriptors() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_RDESC");
+    static const bool on = Tegra::Nx2Switch(mode, true);
+    return on;
+}
+
+/// EDEN_NX2_MT_RUBO: resolvers stream small uniform buffers into their own ring (off: the
+/// committer streams them from the packet).
+[[nodiscard]] inline bool ResolverUniforms() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_RUBO");
+    static const bool on = Tegra::Nx2Switch(mode, true);
+    return on;
+}
+
+/// EDEN_NX2_MT_RCOMMIT: record validated resolver results (default on with resolvers; off keeps
+/// the resolvers running and every draw on the phase-4 path, without the shadow compare).
+[[nodiscard]] inline bool ResolvedCommit() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_RCOMMIT");
+    static const bool on = Tegra::Nx2Switch(mode, true);
+    return on;
+}
+
+/// EDEN_NX2_MT_REPLAY=1: per-render-pass POD replay closures (phase 5b); 2 also records the old
+/// closures and checks the op stream against them.
+[[nodiscard]] inline u32 Replay() {
+    static const u32 level = EnvNumber("EDEN_NX2_MT_REPLAY", 0);
+    return level;
+}
+
+/// EDEN_NX2_MT_RCHECK=1: resolver-side asserts (role, guard held, ring overrun, consistency of
+/// the committer's geometry flags); 2 also fails 1 % of resolves on purpose.
+[[nodiscard]] inline u32 ResolverChecks() {
+    static const u32 level = EnvNumber("EDEN_NX2_MT_RCHECK", 0);
+    return level;
+}
+
 } // namespace VideoCommon::MT
