@@ -44,6 +44,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/mt/capture.h"
+#include "video_core/mt/role.h"
 #include "video_core/mt/stable_slot_vector.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"

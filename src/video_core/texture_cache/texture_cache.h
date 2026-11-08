@@ -30,6 +30,7 @@
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/mt/role.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -3582,6 +3583,7 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    MT::CheckNotSequencer("TextureCache::DeleteImage");
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while

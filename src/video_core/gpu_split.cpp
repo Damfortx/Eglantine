@@ -250,8 +250,19 @@ void GpuSplit::CheckOwner(const char* where) {
     }
     std::fflush(stderr);
 #else
-    (void)where;
+    // EDEN_NX2_MT_CHECK: under the multithreaded back only the committer records and submits.
+    if (Get().MtActive() && !on_committer_thread) {
+        MT::ReportRoleViolation(where);
+    }
 #endif
+}
+
+void MT::ReportRoleViolation(const char* where) {
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_ERROR(HW_GPU, "MT check: {} on the wrong thread (role {})", where,
+                  static_cast<u32>(MT::g_role));
+    }
 }
 
 GpuSplit GpuSplit::instance;

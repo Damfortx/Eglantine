@@ -77,6 +77,16 @@ inline std::atomic<bool> g_active{};
     return Tegra::Nx2Switch(mode, false);
 }
 
+/// EDEN_NX2_MT_CHECK, set while the committer runs.
+inline std::atomic<bool> g_check{};
+void ReportRoleViolation(const char* where);
+/// Committer-owned structure touched from the sequencer (it must route instead).
+inline void CheckNotSequencer(const char* where) {
+    if (g_check.load(std::memory_order_relaxed) && OnSequencer()) [[unlikely]] {
+        ReportRoleViolation(where);
+    }
+}
+
 /// Installed by the committer pipeline while it runs.
 struct Hooks {
     void* context = nullptr;

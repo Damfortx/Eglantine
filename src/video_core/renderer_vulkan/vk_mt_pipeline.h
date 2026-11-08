@@ -460,6 +460,10 @@ inline void Nx2DrawPipeline::Start() {
     running = true;
     VideoCommon::MT::g_write_hook_on.store(true, std::memory_order_seq_cst);
     VideoCommon::MT::g_active.store(true, std::memory_order_seq_cst);
+    if (VideoCommon::MT::Check()) {
+        VideoCommon::MT::g_check.store(true, std::memory_order_seq_cst);
+        VideoCommon::GpuSplit::check_owner = true;
+    }
     LOG_INFO(Render_Vulkan, "MT: committer started (lockstep {}, verify {}, compute {})",
              lockstep, verify, VideoCommon::MT::ComputePackets() ? "packet" : "serial");
 }
@@ -472,6 +476,7 @@ inline void Nx2DrawPipeline::Stop() {
     stream.WakeAll();
     committer.join();
     VideoCommon::MT::g_active.store(false, std::memory_order_seq_cst);
+    VideoCommon::MT::g_check.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_write_hook_on.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_hooks = {};
     stream.RemoveConsumer(consumer);

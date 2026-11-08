@@ -24,6 +24,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/mt/role.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/query_base.h"
 #include "video_core/query_cache/query_cache_base.h"
@@ -233,6 +234,7 @@ void QueryCacheBase<Traits>::BindToChannel(s32 id) {
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type,
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    MT::CheckNotSequencer("QueryCache::CounterReport");
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
     static const GPUVAddr watch = [] {
