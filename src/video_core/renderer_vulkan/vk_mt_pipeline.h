@@ -40,6 +40,7 @@
 #include "video_core/mt/reg_delta.h"
 #include "video_core/mt/role.h"
 #include "video_core/mt/spmc_stream.h"
+#include "video_core/mt/tracker_lock.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2.h"
 #include "video_core/shader_handle_program.h"
@@ -107,6 +108,7 @@ struct Counters {
     std::atomic<u64> verify_checks{};
     std::atomic<u64> verify_mismatches{};
     std::atomic<u64> verify_cpu_writes{};
+    std::atomic<u64> seq_mutex_writes{};
     std::array<std::atomic<u64>, 16> forced_serial{};
 };
 
@@ -419,6 +421,25 @@ private:
 namespace Vulkan {
 
 namespace MTDetail {
+/// The sequencer's lock for the buffer tracker: tracker_mutex with EDEN_NX2_MT_TRAPLOCK, else
+/// the buffer cache mutex (phase 4).
+class SeqTrackerLock {
+public:
+    explicit SeqTrackerLock(BufferCache& buffer_cache)
+        : mutex{VideoCommon::MT::TrapLock() ? &buffer_cache.MtTrackerMutex()
+                                            : &buffer_cache.mutex} {
+        mutex->lock();
+    }
+    ~SeqTrackerLock() {
+        mutex->unlock();
+    }
+    SeqTrackerLock(const SeqTrackerLock&) = delete;
+    SeqTrackerLock& operator=(const SeqTrackerLock&) = delete;
+
+private:
+    Common::SpinRecursiveMutex* mutex;
+};
+
 inline void Pause() {
 #if defined(__x86_64__) || defined(_M_X64)
     __builtin_ia32_pause();
@@ -1066,10 +1087,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         size_t stage;
     };
     boost::container::small_vector<SsboCapture, 32> ssbos;
-    const bool prefers_sparse = [&] {
-        std::scoped_lock lock{rasterizer.buffer_cache.mutex};
-        return rasterizer.buffer_cache.MtPrefersSparseSources();
-    }();
+    const bool prefers_sparse = rasterizer.buffer_cache.MtPrefersSparseSources();
     for (size_t stage = 0; stage < infos.size(); ++stage) {
         const Shader::Info& info = infos[stage];
         const auto& cbufs = real.state.shader_stages[stage].const_buffers;
@@ -1141,7 +1159,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
     }
 
     // Pass 2: the buffer tracker, in the order the committer synchronizes the bindings.
-    std::scoped_lock lock{rasterizer.buffer_cache.mutex};
+    MTDetail::SeqTrackerLock lock{rasterizer.buffer_cache};
     const auto& draw_state = real.draw_manager.draw_state;
     if (is_indexed && draw_state.inline_index_draw_indexes.empty()) {
         const auto& index_buffer = draw_state.index_buffer;
@@ -1409,8 +1427,18 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         .verify = verify,
     };
     {
-        std::scoped_lock lock{r.buffer_cache.mutex, r.texture_cache.mutex};
-        r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+        // EDEN_NX2_MT_LOCKSCOPE: the uploads under the buffer mutex, then ConfigureDrawPipeline
+        // takes both for the resolve only.
+        std::unique_lock buffer_lock{r.buffer_cache.mutex, std::defer_lock};
+        std::unique_lock texture_lock{r.texture_cache.mutex, std::defer_lock};
+        if (VideoCommon::MT::LockScope()) {
+            buffer_lock.lock();
+            r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+            buffer_lock.unlock();
+        } else {
+            std::lock(buffer_lock, texture_lock);
+            r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+        }
         VideoCommon::MT::t_capture = &view;
         r.mt_commit_pipeline = header.pipeline;
         SCOPE_EXIT {
@@ -1659,7 +1687,25 @@ inline void Nx2DrawPipeline::SeqInvalidateBuffers(
     // GPU data on the written pages is downloaded first, which only the scheduler's owner may
     // do: those ranges go to the committer.
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 8> owner_ranges;
-    {
+    if (VideoCommon::MT::TrapLock()) {
+        // The tracker only; ranges with GPU-written data need the buffer cache mutex.
+        using Result = BufferCache::MtTrapResult;
+        boost::container::small_vector<std::pair<DAddr, std::size_t>, 8> mutex_ranges;
+        for (const auto& [addr, size] : regions) {
+            if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
+                owner_ranges.emplace_back(addr, size);
+            } else if (r.buffer_cache.MtTrapWrite(addr, size, false) == Result::NeedsMutex) {
+                mutex_ranges.emplace_back(addr, size);
+            }
+        }
+        if (!mutex_ranges.empty()) {
+            counters.seq_mutex_writes.fetch_add(mutex_ranges.size(), std::memory_order_relaxed);
+            std::scoped_lock lock{r.buffer_cache.mutex};
+            for (const auto& [addr, size] : mutex_ranges) {
+                r.buffer_cache.WriteMemory(addr, size);
+            }
+        }
+    } else {
         std::scoped_lock lock{r.buffer_cache.mutex};
         for (const auto& [addr, size] : regions) {
             if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
@@ -1730,10 +1776,7 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
     const auto enabled = [&](u32 cbuf) { return ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0; };
     const bool native = real.IsNativeMode();
     const bool mapping_sized = real.IsDlssDispatch();
-    const bool prefers_sparse = [&] {
-        std::scoped_lock lock{rasterizer.buffer_cache.mutex};
-        return rasterizer.buffer_cache.MtPrefersSparseSources();
-    }();
+    const bool prefers_sparse = rasterizer.buffer_cache.MtPrefersSparseSources();
     struct SsboCapture {
         DAddr device_addr;
         u32 size;
@@ -1814,7 +1857,7 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
         }
     }
 
-    std::scoped_lock lock{rasterizer.buffer_cache.mutex};
+    MTDetail::SeqTrackerLock lock{rasterizer.buffer_cache};
     const u32 alignment = rasterizer.buffer_cache.MtUniformBufferAlignment();
     const u32 skip_size = rasterizer.buffer_cache.MtSkipCacheSize();
     const auto& sizes = pipeline->UniformSizes();
@@ -1979,8 +2022,17 @@ inline void Nx2DrawPipeline::CommitCompute(const u64* entry) {
         .verify = verify,
     };
     {
-        std::scoped_lock lock{r.texture_cache.mutex, r.buffer_cache.mutex};
-        r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+        // DispatchComputeBody takes both cache mutexes itself.
+        std::unique_lock buffer_lock{r.buffer_cache.mutex, std::defer_lock};
+        std::unique_lock texture_lock{r.texture_cache.mutex, std::defer_lock};
+        if (VideoCommon::MT::LockScope()) {
+            buffer_lock.lock();
+            r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+            buffer_lock.unlock();
+        } else {
+            std::lock(texture_lock, buffer_lock);
+            r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+        }
         VideoCommon::MT::t_capture = &view;
         SCOPE_EXIT {
             VideoCommon::MT::t_capture = nullptr;

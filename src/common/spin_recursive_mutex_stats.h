@@ -68,7 +68,8 @@ inline void LockStatsRegisterThread() {
     stats.names[std::this_thread::get_id()] = name;
 }
 
-inline void LockStatsRecord(std::thread::id owner, std::chrono::steady_clock::duration wait) {
+inline void LockStatsRecord(std::thread::id owner, std::chrono::steady_clock::duration wait,
+                            const char* lock_name) {
     using namespace LockStatsDetail;
     const std::string& waiter = CurrentThreadName();
     LockStats& stats = Stats();
@@ -79,6 +80,11 @@ inline void LockStatsRecord(std::thread::id owner, std::chrono::steady_clock::du
         if (owner != std::thread::id{}) {
             const auto it = stats.names.find(owner);
             owner_name = it != stats.names.end() ? it->second : ThreadIdString(owner);
+        }
+        if (lock_name != nullptr) {
+            owner_name += " [";
+            owner_name += lock_name;
+            owner_name += "]";
         }
         WaitTotals& totals = stats.waits[{waiter, std::move(owner_name)}];
         totals.time += wait;

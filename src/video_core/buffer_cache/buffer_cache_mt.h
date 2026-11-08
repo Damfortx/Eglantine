@@ -36,6 +36,7 @@ u32 BufferCache<P>::MtSkipCacheSize() const noexcept {
 
 template <class P>
 bool BufferCache<P>::MtIsRegionGpuModified(DAddr device_addr, u64 size) {
+    MT::TrackerScope tracker_scope{tracker_mutex};
     return memory_tracker.IsRegionGpuModified(device_addr, size);
 }
 
@@ -43,6 +44,7 @@ template <class P>
 bool BufferCache<P>::MtPageHoldsGpuData(DAddr device_addr, u64 size) {
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+    MT::TrackerScope tracker_scope{tracker_mutex};
     return Tegra::g_nx2_keep_page_gpu_data.load(std::memory_order_relaxed) !=
                Tegra::Nx2KeepPageGpuData::None &&
            gpu_modified_ranges.Intersects(page_begin, page_end - page_begin);
@@ -68,6 +70,7 @@ Binding BufferCache<P>::MtStorageBinding(GPUVAddr gpu_addr, u64 next_qword, u32 
 template <class P>
 template <typename Func>
 void BufferCache<P>::MtTakeUploads(DAddr device_addr, u32 size, Func&& emit) {
+    MT::TrackerScope tracker_scope{tracker_mutex};
     if (device_addr == 0 || size == 0 || !memory_tracker.HasPendingCpuUpload(device_addr, size)) {
         return;
     }
@@ -88,6 +91,7 @@ void BufferCache<P>::MtTakeUploads(DAddr device_addr, u32 size, Func&& emit) {
 
 template <class P>
 void BufferCache<P>::MtCaptureWrittenRange(DAddr device_addr, u32 size) {
+    MT::TrackerScope tracker_scope{tracker_mutex};
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
@@ -144,6 +148,70 @@ void BufferCache<P>::MtApplyUploads(std::span<const MT::UploadEntry> uploads, co
             first = last;
         }
     }
+}
+
+template <class P>
+bool BufferCache<P>::MtIsRegionRegistered(DAddr device_addr, u64 size) {
+    const DAddr end_addr = device_addr + size;
+    const u64 page_end = Common::DivCeil(end_addr, CACHING_PAGESIZE);
+    for (u64 page = device_addr >> CACHING_PAGEBITS; page < page_end && page < page_table.size();
+         ++page) {
+        const BufferId buffer_id =
+            std::atomic_ref<BufferId>{page_table[page]}.load(std::memory_order_acquire);
+        if (!buffer_id) {
+            continue;
+        }
+        const Buffer& buffer = slot_buffers[buffer_id];
+        const DAddr buf_start_addr = buffer.CpuAddr();
+        const DAddr buf_end_addr = buf_start_addr + buffer.SizeBytes();
+        if (buf_start_addr < end_addr && device_addr < buf_end_addr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
+typename BufferCache<P>::MtTrapResult BufferCache<P>::MtTrapWrite(DAddr device_addr, u64 size,
+                                                                  bool trap) {
+    {
+        MT::TrackerScope tracker_scope{tracker_mutex};
+        // Registration is checked under the tracker lock: a buffer the committer creates
+        // concurrently is in page_table before its first upload clears (and protects) its pages.
+        if (trap && !MtIsRegionRegistered(device_addr, size)) {
+            return MtTrapResult::Done;
+        }
+        if (trap && memory_tracker.IsRegionGpuModified(device_addr, size)) {
+            return MtTrapResult::GpuModified;
+        }
+        // WriteMemory's GPU-data cases (ClearDownload, keeping the page's GPU bytes) need the
+        // structure under `mutex`.
+        const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+        if (IsRegionGpuModified(page_begin, page_end - page_begin)) {
+            return MtTrapResult::NeedsMutex;
+        }
+        memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+        if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
+            mt_stale_ranges.emplace_back(device_addr, size);
+            mt_stale_pending.store(true, std::memory_order_release);
+        }
+    }
+    Nx2NoteListHostWrite(device_addr, size);
+    return MtTrapResult::Done;
+}
+
+template <class P>
+void BufferCache<P>::MtApplyStaleRanges() {
+    if (!mt_stale_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    MT::TrackerScope tracker_scope{tracker_mutex};
+    mt_stale_pending.store(false, std::memory_order_relaxed);
+    for (const auto& [addr, size] : mt_stale_ranges) {
+        MarkVertexBuffersStale(addr, size);
+    }
+    mt_stale_ranges.clear();
 }
 
 } // namespace VideoCommon

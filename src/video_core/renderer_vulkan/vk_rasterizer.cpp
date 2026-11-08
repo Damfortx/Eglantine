@@ -522,7 +522,9 @@ bool RasterizerVulkan::MeshDrawAllowed(GraphicsPipeline* pipeline) {
 
 bool RasterizerVulkan::ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is_indexed) {
     namespace Profile = VideoCommon::Nx2Profile;
-    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    std::unique_lock buffer_lock{buffer_cache.mutex, std::defer_lock};
+    std::unique_lock texture_lock{texture_cache.mutex, std::defer_lock};
+    std::lock(buffer_lock, texture_lock);
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
@@ -540,6 +542,12 @@ bool RasterizerVulkan::ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         ReportDrawFailure("configure failed");
         return false;
+    }
+    // EDEN_NX2_MT_LOCKSCOPE: what follows is committer-owned state (dynamic state, rescaling
+    // flag, query cache, recording).
+    if (VideoCommon::MT::OnCommitter() && VideoCommon::MT::LockScope()) {
+        texture_lock.unlock();
+        buffer_lock.unlock();
     }
 
     {
@@ -1431,7 +1439,11 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
     // for their reads: each took the buffer cache lock the back holds through every draw. Pages
     // the GPU never wrote need no lock.
     if ((True(which & VideoCommon::CacheType::BufferCache)) && MayHoldGpuBufferData(addr, size)) {
-        std::scoped_lock lock{buffer_cache.mutex};
+        // EDEN_NX2_MT_TRAPLOCK: GPU-modified ranges are guarded by the tracker lock.
+        std::unique_lock lock{buffer_cache.mutex, std::defer_lock};
+        if (!VideoCommon::MT::TrapLock()) {
+            lock.lock();
+        }
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
         }
@@ -1537,6 +1549,25 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    // EDEN_NX2_MT_TRAPLOCK: the buffer side with the tracker lock only, unless the range holds
+    // GPU-written data; the committer keeps the buffer cache mutex for whole draws.
+    if (VideoCommon::MT::TrapLock()) {
+        using Result = BufferCache::MtTrapResult;
+        Result result = buffer_cache.MtTrapWrite(addr, size, true);
+        if (result == Result::NeedsMutex) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            result = buffer_cache.OnCPUWrite(addr, size) ? Result::GpuModified : Result::Done;
+        }
+        if (result == Result::GpuModified) {
+            return true;
+        }
+        if (MayHoldTexture(addr, size)) {
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_cache.WriteMemory(addr, size);
+        }
+        pipeline_cache.InvalidateRegion(addr, size);
+        return false;
+    }
     // EDEN_NX2_CPUWRITE_FAST: guest CPU threads (~800 contended traps a second each in title 1)
     // held the cache locks the back needs for every draw through the work below, mprotect
     // included. Off by default ('1' on, 'a' alternates; the tracked-page bitmap is kept for both).

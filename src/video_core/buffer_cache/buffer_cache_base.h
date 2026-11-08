@@ -46,6 +46,7 @@
 #include "video_core/mt/capture.h"
 #include "video_core/mt/role.h"
 #include "video_core/mt/stable_slot_vector.h"
+#include "video_core/mt/tracker_lock.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -269,6 +270,24 @@ public:
     /// Committer: copies captured bytes into the buffers that hold their ranges.
     void MtApplyUploads(std::span<const MT::UploadEntry> uploads, const u8* blob);
 
+    /// What MtTrapWrite did.
+    enum class MtTrapResult : u8 {
+        Done,        ///< as WriteMemory/OnCPUWrite returning false
+        GpuModified, ///< OnCPUWrite would return true: nothing changed
+        NeedsMutex,  ///< GPU-written data in the range: run the full path under `mutex`
+    };
+    /// EDEN_NX2_MT_TRAPLOCK: a guest write's buffer cache side with only tracker_mutex (callers
+    /// hold neither cache mutex). `trap`: OnCPUWrite's semantics (unregistered ranges and
+    /// tracker GPU-modified ranges are left alone), else WriteMemory's.
+    MtTrapResult MtTrapWrite(DAddr device_addr, u64 size, bool trap);
+    /// Lock-free IsRegionRegistered (page_table loads; buffers never relocate).
+    [[nodiscard]] bool MtIsRegionRegistered(DAddr device_addr, u64 size);
+    /// The stale marks MtTrapWrite queued (committer, `mutex` held).
+    void MtApplyStaleRanges();
+    [[nodiscard]] Common::SpinRecursiveMutex& MtTrackerMutex() noexcept {
+        return tracker_mutex;
+    }
+
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);
@@ -406,7 +425,7 @@ public:
         } while (channel_state->has_deleted_buffers);
     }
 
-    Common::SpinRecursiveMutex mutex;
+    Common::SpinRecursiveMutex mutex{"buffer"};
     Runtime& runtime;
     bool any_buffer_uploaded = false;
 
@@ -638,9 +657,14 @@ private:
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 
     MemoryTracker memory_tracker;
-    /// Guards memory_tracker once the sequencer, CPU write traps and the committer share it
-    /// (multithreaded back; unused on the single-threaded path).
-    std::mutex tracker_mutex;
+    /// Guards memory_tracker and gpu_modified_ranges once the sequencer, CPU write traps and the
+    /// committer share them (EDEN_NX2_MT_TRAPLOCK, mt/tracker_lock.h; unused otherwise). Taken
+    /// after `mutex`, never before it.
+    Common::SpinRecursiveMutex tracker_mutex{"tracker"};
+    /// Vertex buffer stale marks of writes that only took tracker_mutex (MtTrapWrite), applied
+    /// by the next RefreshRepackedVertexBuffers. Guarded by tracker_mutex.
+    std::vector<std::pair<DAddr, u64>> mt_stale_ranges;
+    std::atomic<bool> mt_stale_pending{};
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
     /// Set (by the GPU thread) whenever downloads are queued for the next fence; cleared once a
     /// commit leaves none. Fences check it before taking the contended cache lock.
@@ -668,6 +692,7 @@ private:
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
     /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
     bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
+        MT::TrackerScope tracker_scope{tracker_mutex};
         return AsyncBufferDownloads() ||
                (Tegra::g_nx2_preflush_downloads.load(std::memory_order_relaxed) &&
                 memory_tracker.IsRegionPreflushable(device_addr, size));
@@ -679,6 +704,7 @@ private:
     /// and the GPU thread drew a third as many draws. Only the Preflushable pages are downloaded;
     /// the rest of the write keeps its read traps.
     void QueueFenceDownload(DAddr device_addr, u64 size) {
+        MT::TrackerScope tracker_scope{tracker_mutex};
         if (AsyncBufferDownloads()) {
             nx2_flush_hint.store(true, std::memory_order_relaxed);
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
