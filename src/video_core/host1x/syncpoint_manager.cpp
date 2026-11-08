@@ -77,16 +77,40 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
                                  std::list<RegisteredAction>& action_storage) {
     auto new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
 
-    std::scoped_lock lk(guard);
-    auto it = action_storage.begin();
-    while (it != action_storage.end()) {
-        if (it->expected_value > new_value) {
-            break;
+    {
+        std::scoped_lock lk(guard);
+        // guard is not recursive: an action can't Increment on this thread, so no nesting here.
+        in_increment = true;
+        auto it = action_storage.begin();
+        while (it != action_storage.end()) {
+            if (it->expected_value > new_value) {
+                break;
+            }
+            it->action();
+            it = action_storage.erase(it);
         }
-        it->action();
-        it = action_storage.erase(it);
+        in_increment = false;
+        wait_cv.notify_all();
     }
-    wait_cv.notify_all();
+    if (after_actions.empty()) [[likely]] {
+        return;
+    }
+    // Unlocked, on this thread and before returning to the caller: the work keeps its place
+    // relative to what the caller (the fence manager on the split's back) does next. Taken out
+    // first, as it may increment (and put off work) itself.
+    auto work = std::move(after_actions);
+    after_actions.clear();
+    for (auto& func : work) {
+        func();
+    }
+}
+
+void SyncpointManager::RunAfterActions(std::function<void()>&& func) {
+    if (!in_increment) {
+        func();
+        return;
+    }
+    after_actions.push_back(std::move(func));
 }
 
 void SyncpointManager::Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,

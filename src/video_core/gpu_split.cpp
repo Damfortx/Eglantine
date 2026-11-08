@@ -688,6 +688,7 @@ size_t GpuSplit::Execute(const u64* entry) {
 
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadName("GPUBack");
+    Tegra::Nx2ApplyTimerSlack();
     on_back_thread = true;
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
@@ -703,7 +704,19 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
+            // EDEN_NX2_BACK_SPIN=<count> sets the number of pauses (default 8192; 'a'
+            // alternates 8192/32768) to trade idle CPU for fewer futex sleep/wake trips.
+            static const char spin_mode = Tegra::Nx2EnvMode("EDEN_NX2_BACK_SPIN");
+            static const u32 spin_count = [] {
+                const char* text = std::getenv("EDEN_NX2_BACK_SPIN");
+                if (text == nullptr || text[0] == 'a') {
+                    return 8192U;
+                }
+                return static_cast<u32>(std::clamp(std::atoll(text), 0LL, 1LL << 30));
+            }();
+            const u32 max_spins =
+                spin_mode == 'a' ? (Tegra::Nx2AltOn() ? 32768U : 8192U) : spin_count;
+            for (u32 spins = 0; spins < max_spins && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
                 Pause();

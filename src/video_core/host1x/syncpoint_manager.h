@@ -9,6 +9,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -50,6 +51,12 @@ public:
 
     void DeregisterGuestAction(u32 syncpoint_id, const ActionHandle& handle);
 
+    /// From inside an action: runs `func` on the same thread once the increment running the
+    /// action has released `guard` and run every other action due at the new value (and woken
+    /// the waiters). Outside an increment (e.g. an action run at registration) it runs at once.
+    /// For slow actions (the composite) that must not hold up the others or block registrars.
+    static void RunAfterActions(std::function<void()>&& func);
+
     void DeregisterHostAction(u32 syncpoint_id, const ActionHandle& handle);
 
     void IncrementGuest(u32 syncpoint_id);
@@ -87,6 +94,9 @@ private:
     std::array<std::list<RegisteredAction>, NUM_MAX_SYNCPOINTS> host_action_storage;
 
     std::mutex guard;
+    /// Per thread: whether it is running Increment's actions, and the work they put off.
+    static inline thread_local bool in_increment{};
+    static inline thread_local std::vector<std::function<void()>> after_actions;
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
 };

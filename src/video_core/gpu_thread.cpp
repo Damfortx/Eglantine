@@ -38,6 +38,20 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
     }
 }
 
+/// EDEN_NX2_QUEUE_SPIN: the GPU thread spins briefly for commands before sleeping, and the queue
+/// skips mutex/notify round trips when the other side isn't blocked. Fast and plain queue calls
+/// can be mixed safely, so mode 'a' may flip this between a push and a pop.
+bool QueueSpinOn() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_QUEUE_SPIN");
+    return Tegra::Nx2Switch(mode, true);
+}
+
+/// EDEN_NX2_PENDING_WAKE: while channels are suspended, the front's sleep ends on a new push.
+bool PendingWakeOn() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_PENDING_WAKE");
+    return Tegra::Nx2Switch(mode, false);
+}
+
 } // Anonymous namespace
 
 ThreadManager::ThreadManager(Core::System& system_)
@@ -50,6 +64,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     rasterizer = renderer.ReadRasterizer();
     thread = std::jthread([&](std::stop_token stop_token) {
         Common::SetCurrentThreadName("GPU");
+        Tegra::Nx2ApplyTimerSlack();
         VideoCommon::GpuSplit::MarkGpuThread();
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
@@ -70,7 +85,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     scheduler.ResumePending(system.GPU());
                 }
-                if (!state.queue.TryPop(next)) {
+                const bool fast_queue = QueueSpinOn();
+                if (!(fast_queue ? state.queue.TryPopFast(next) : state.queue.TryPop(next))) {
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
@@ -88,6 +104,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     if (std::chrono::steady_clock::now() - last_progress <
                         std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (PendingWakeOn()) {
+                        // Same maximum sleep, but a command pushed meanwhile ends it at once
+                        // instead of waiting out the rest of the sleep.
+                        state.queue.WaitNonEmptyFor(std::chrono::microseconds{this_sleep},
+                                                    stop_token);
                     } else {
                         std::this_thread::sleep_for(std::chrono::microseconds{this_sleep});
                     }
@@ -95,7 +116,16 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
-                state.queue.PopWait(next, stop_token);
+                if (QueueSpinOn()) {
+                    // The game usually pushes again within microseconds: spinning ~30 us
+                    // avoids a futex sleep + wake (and the producer's notify) per command.
+                    if (!state.queue.PopSpinWait(next, stop_token,
+                                                 std::chrono::microseconds{30})) {
+                        continue; // Stop requested.
+                    }
+                } else {
+                    state.queue.PopWait(next, stop_token);
+                }
             }
             if (stop_token.stop_requested()) {
                 break;
@@ -202,7 +232,12 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
-    state.queue.EmplaceWait(std::move(command_data), fence, block);
+    if (QueueSpinOn()) {
+        // Notifies the GPU thread only when it is actually asleep (see EmplaceWaitFast).
+        state.queue.EmplaceWaitFast(std::move(command_data), fence, block);
+    } else {
+        state.queue.EmplaceWait(std::move(command_data), fence, block);
+    }
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {

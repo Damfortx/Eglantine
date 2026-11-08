@@ -15,6 +15,10 @@
 
 #include "common/common_types.h"
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
 namespace Tegra {
 
 /// EDEN_NX2_ACQUIRE_STATS: addresses QMD releases wrote, by kind (lossy hash table).
@@ -52,6 +56,18 @@ inline std::atomic<u64> g_nx2_presents{};
     default:
         return default_on;
     }
+}
+
+/// EDEN_NX2_TIMERSLACK: 1 ns timer slack for the calling thread (Linux; default 50 us), so the
+/// GPU threads' short timed waits/sleeps (50 us pending sleeps, futex timeouts) aren't
+/// stretched by the kernel's timer coalescing. Call from the thread itself.
+inline void Nx2ApplyTimerSlack() {
+#ifdef __linux__
+    static const char mode = Nx2EnvMode("EDEN_NX2_TIMERSLACK");
+    if (Nx2Switch(mode, false)) {
+        prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+    }
+#endif
 }
 
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use

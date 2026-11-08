@@ -409,9 +409,27 @@ struct GPU::Impl {
                     }
                     renderer->Composite(composite_layers);
                 };
+                // The composite runs as an action of the frame's fence, inside its Increment on
+                // the thread signaling it (the split's back) with the syncpoint guard held. With
+                // async presentation off it waits for the Vulkan worker, acquires an image (FIFO:
+                // up to a refresh) and presents, while the other actions at that value (the
+                // game's slot events, WaitForFrame's wake) wait behind it and game threads
+                // registering actions block on the guard. Deferred, it runs on the same thread
+                // right after the increment, once the guard is free and the game was woken: the
+                // caller only goes on to later GPU work after it, as before.
+                // EDEN_NX2_COMPOSITE_DEFER=0 runs it in the action (=a alternates).
+                static const char defer_mode = Tegra::Nx2EnvMode("EDEN_NX2_COMPOSITE_DEFER");
+                const bool defer = Tegra::Nx2Switch(defer_mode, false);
                 for (size_t i = 0; i < num_fences; i++) {
-                    syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
-                                                          composite_fences[i].value, executer);
+                    if (defer) {
+                        syncpoint_manager.RegisterGuestAction(
+                            composite_fences[i].id, composite_fences[i].value, [executer] {
+                                Tegra::Host1x::SyncpointManager::RunAfterActions(executer);
+                            });
+                    } else {
+                        syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
+                                                              composite_fences[i].value, executer);
+                    }
                 }
             });
         gpu_thread.TickGPU(is_async);
