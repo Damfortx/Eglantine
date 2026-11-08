@@ -145,12 +145,13 @@ public:
     /// consecutive runs the back runs as one multi-method (one write, not one a word).
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
                     bool mergeable = false) {
-        // Off by default: the back ran 0.25-1 us less a draw with it but the attract demo showed
-        // 0.4-1.6 fewer frames a second in four A/B runs (latency not found yet).
-        // EDEN_NX2_MACRO_LIST=1 turns it on (=a alternates).
+        // With the back idle half the time (title 1's presents waiting 3 ms for their own frame)
+        // the lists showed no gain; with that gone the back is the limit again and they gave
+        // 0.8-3.2 more frames a second, 0.64 us less back time a draw (medians, two A/B runs).
+        // EDEN_NX2_MACRO_LIST=0 sends each write as an entry (=a alternates).
         static const char list_mode = Tegra::Nx2EnvMode("EDEN_NX2_MACRO_LIST");
-        if (!Tegra::Nx2Switch(list_mode, false)) {
-            if (mergeable && list_mode == 'd') {
+        if (!Tegra::Nx2Switch(list_mode, true)) {
+            if (mergeable && list_mode != '0') {
                 // Without lists, the constant buffer / upload words still go as runs.
                 if (list_count != 0 && list_engine != engine) {
                     FlushState();
