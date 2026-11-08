@@ -47,6 +47,59 @@ inline void Nx2DrawPipeline::ApplyHeapUploads(HeapUploads* heap_uploads) {
     delete heap_uploads;
 }
 
+// ---- Uniform buffer write generations (EDEN_NX2_MT_UBO_GEN) ----
+
+inline void Nx2DrawPipeline::SeqStageUniform(VideoCommon::MT::UboEntry& entry) {
+    using View = VideoCommon::MT::CaptureView;
+    const DAddr device_addr = entry.device_addr;
+    const u32 size = entry.size;
+    if (VideoCommon::MT::UboGen() && size != 0 && size <= View::UboMemoBytes &&
+        entry.stage < View::UboMemoStages && entry.index < View::UboMemoSlots) {
+        UniformMemo& memo = seq_ubo_memo[entry.stage][entry.index];
+        // Guest CPU writes reach the generations only through write traps: the pages must be
+        // protected (not CPU-modified in the buffer tracker) now and when the memo was taken
+        // (dropping the protection bumps them). Query reports write guest memory directly.
+        const bool protected_pages =
+            !rasterizer.buffer_cache.IsRegionCpuModified(device_addr, size) &&
+            !Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, device_addr, size);
+        // Read before the bytes: a write in between only makes the next capture miss.
+        const u64 generation =
+            protected_pages ? VideoCommon::MT::UboWriteGenerations().Read(device_addr, size) : 0;
+        if (generation != 0 && memo.generation == generation && memo.device_addr == device_addr &&
+            memo.size == size) {
+            entry.staged = 2;
+            counters.ubo_gen_hits.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        memo = UniformMemo{device_addr, size, generation};
+        if (generation != 0) {
+            entry.memo = 1;
+            counters.ubo_gen_misses.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            counters.ubo_gen_unprotected.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    entry.offset = static_cast<u32>(blob.size());
+    blob.resize(blob.size() + ((size + 7) & ~7U));
+    rasterizer.device_memory.ReadBlockUnsafe(device_addr, blob.data() + entry.offset, size);
+}
+
+inline void Nx2DrawPipeline::KeepUniformMemos(std::span<const VideoCommon::MT::UboEntry> entries,
+                                              const u8* blob_data) {
+    using View = VideoCommon::MT::CaptureView;
+    if (!ubo_memo_bytes) {
+        return;
+    }
+    for (const VideoCommon::MT::UboEntry& entry : entries) {
+        if (entry.staged == 1 && entry.memo != 0) {
+            std::memcpy(ubo_memo_bytes.get() +
+                            (size_t{entry.stage} * View::UboMemoSlots + entry.index) *
+                                View::UboMemoBytes,
+                        blob_data + entry.offset, entry.size);
+        }
+    }
+}
+
 // ---- Conditional rendering ----
 
 inline bool Nx2DrawPipeline::SeqConditionalRendering() {

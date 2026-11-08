@@ -92,6 +92,7 @@ void BufferCache<P>::MtTakeUploads(DAddr device_addr, u32 size, Func&& emit) {
 template <class P>
 void BufferCache<P>::MtCaptureWrittenRange(DAddr device_addr, u32 size) {
     MT::TrackerScope tracker_scope{tracker_mutex};
+    MT::BumpWriteGeneration(device_addr, size);
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
@@ -174,6 +175,7 @@ bool BufferCache<P>::MtIsRegionRegistered(DAddr device_addr, u64 size) {
 template <class P>
 typename BufferCache<P>::MtTrapResult BufferCache<P>::MtTrapWrite(DAddr device_addr, u64 size,
                                                                   bool trap) {
+    MT::BumpWriteGeneration(device_addr, size);
     {
         MT::TrackerScope tracker_scope{tracker_mutex};
         // Registration is checked under the tracker lock: a buffer the committer creates

@@ -24,12 +24,13 @@ struct OverlayEntry {
 static_assert(sizeof(OverlayEntry) == 16);
 
 /// A uniform buffer bind: streamed from these bytes (staged) or bound from the cache (cached;
-/// its CPU-modified bytes travel as uploads).
+/// its CPU-modified bytes travel as uploads). EDEN_NX2_MT_UBO_GEN: staged == 2 streams the bytes
+/// the committer kept for the slot; `memo` != 0 on a staged == 1 entry makes it keep these.
 struct UboEntry {
     u8 stage;
     u8 index;
     u8 staged;
-    u8 pad;
+    u8 memo;
     u32 size;
     u64 device_addr;
     u32 offset; ///< into the blob, staged only
@@ -55,6 +56,8 @@ struct CaptureView {
     std::span<const UboEntry> ubos;
     const u8* blob = nullptr;
     bool verify = false;
+    /// EDEN_NX2_MT_UBO_GEN: the committer's per-slot copies (UboMemoBytes each).
+    const u8* ubo_memo = nullptr;
     mutable u64 overlay_misses = 0;
     mutable u64 ubo_misses = 0;
     mutable u64 decision_mismatches = 0;
@@ -77,6 +80,18 @@ struct CaptureView {
         std::memcpy(out, blob + entry.offset + (gpu_addr - entry.gpu_addr), size);
         return true;
     }
+
+    /// A staged uniform buffer's bytes.
+    [[nodiscard]] const u8* UboBytes(const UboEntry& entry) const noexcept {
+        if (entry.staged == 2) {
+            return ubo_memo + (size_t{entry.stage} * UboMemoSlots + entry.index) * UboMemoBytes;
+        }
+        return blob + entry.offset;
+    }
+
+    static constexpr size_t UboMemoStages = 6; ///< 5 graphics stages and compute
+    static constexpr size_t UboMemoSlots = 18;
+    static constexpr size_t UboMemoBytes = 4096;
 
     [[nodiscard]] const UboEntry* FindUbo(u32 stage, u32 index) const noexcept {
         for (const UboEntry& entry : ubos) {

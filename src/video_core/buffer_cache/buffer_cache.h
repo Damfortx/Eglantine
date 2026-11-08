@@ -206,6 +206,7 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
     MT::TrackerScope tracker_scope{tracker_mutex};
+    MT::BumpWriteGeneration(device_addr, size);
     Nx2NoteListHostWrite(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
@@ -242,6 +243,7 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
 
 template <class P>
 void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+    MT::BumpWriteGeneration(device_addr, size);
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return;
@@ -263,6 +265,7 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
     MT::TrackerScope tracker_scope{tracker_mutex};
+    MT::BumpWriteGeneration(device_addr, size);
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return false;
@@ -897,6 +900,7 @@ void BufferCache<P>::PopAsyncBuffers() {
         // Only what no write replaced since the copy was taken: the rest is older than guest
         // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
         ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+            MT::BumpWriteGeneration(start, end - start);
             device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
                                            end - start);
             gpu_modified_ranges.Subtract(start, end - start);
@@ -1271,7 +1275,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             // EDEN_NX2_UBOREUSE=0 turns it off.
             if (VideoCommon::UniformStreamReuseEnabled()) {
                 if (captured != nullptr) [[unlikely]] {
-                    MT::CapturedBytes bytes{MT::t_capture->blob + captured->offset, device_addr};
+                    MT::CapturedBytes bytes{MT::t_capture->UboBytes(*captured), device_addr};
                     streamed = VideoCommon::BindSmallUniformReusing(
                         runtime, bytes, stage, index, binding_index, device_addr, size);
                 } else {
@@ -1283,7 +1287,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         if (!streamed) {
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
             if (captured != nullptr) [[unlikely]] {
-                std::memcpy(span.data(), MT::t_capture->blob + captured->offset, size);
+                std::memcpy(span.data(), MT::t_capture->UboBytes(*captured), size);
             } else {
                 device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
             }
@@ -1538,7 +1542,7 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                 const std::span<u8> span =
                     runtime.BindMappedUniformBuffer(0, binding_index, size);
                 if (captured != nullptr) [[unlikely]] {
-                    std::memcpy(span.data(), MT::t_capture->blob + captured->offset, size);
+                    std::memcpy(span.data(), MT::t_capture->UboBytes(*captured), size);
                 } else {
                     device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
                 }
@@ -1974,6 +1978,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
         ranges.Subtract(device_addr, size);
     }
     MT::TrackerScope tracker_scope{tracker_mutex};
+    MT::BumpWriteGeneration(device_addr, size);
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
@@ -2558,6 +2563,7 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
     ClearDownload(dest_address, copy_size);
     {
         MT::TrackerScope tracker_scope{tracker_mutex};
+        MT::BumpWriteGeneration(dest_address, copy_size);
         gpu_modified_ranges.Subtract(dest_address, copy_size);
     }
     MarkVertexBuffersStale(dest_address, copy_size);
@@ -2628,6 +2634,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     const u8* const mapped_memory = download_staging.mapped_span.data();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+        MT::BumpWriteGeneration(device_addr, download.copy.size);
         device_memory.WriteBlockUnsafe(
             device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
             download.copy.size);
@@ -2684,6 +2691,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             // Undo the modified offset
             const u64 dst_offset = copy.dst_offset - download_staging.offset;
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
+            MT::BumpWriteGeneration(copy_device_addr, copy.size);
             device_memory.WriteBlockUnsafe(copy_device_addr, copy_mapped_memory, copy.size);
         }
     } else {
@@ -2691,6 +2699,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         for (const BufferCopy& copy : copies) {
             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
+            MT::BumpWriteGeneration(copy_device_addr, copy.size);
             device_memory.WriteBlockUnsafe(copy_device_addr, immediate_buffer.data(), copy.size);
         }
     }
@@ -2739,6 +2748,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     if (!do_not_mark) {
         Buffer& buffer = slot_buffers[buffer_id];
         MT::TrackerScope tracker_scope{tracker_mutex};
+        MT::BumpWriteGeneration(buffer.CpuAddr(), buffer.SizeBytes());
         memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
     }
 

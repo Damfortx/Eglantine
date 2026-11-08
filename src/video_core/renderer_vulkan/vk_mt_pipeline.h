@@ -110,6 +110,9 @@ struct Counters {
     std::atomic<u64> verify_cpu_writes{};
     std::atomic<u64> seq_mutex_writes{};
     std::atomic<u64> dma_serial{};
+    std::atomic<u64> ubo_gen_hits{};
+    std::atomic<u64> ubo_gen_misses{};
+    std::atomic<u64> ubo_gen_unprotected{};
     std::array<std::atomic<u64>, 16> forced_serial{};
 };
 
@@ -322,6 +325,11 @@ private:
         }
     };
     void SeqReadDescriptor(u64 gpu_addr);
+    /// A streamed uniform buffer's bytes into the blob, or (EDEN_NX2_MT_UBO_GEN) a reference to
+    /// the committer's copy while its pages are unchanged (vk_mt_seq.h). Tracker lock held.
+    void SeqStageUniform(VideoCommon::MT::UboEntry& entry);
+    /// Committer: keeps the bytes of memo entries before anything else reads the packet.
+    void KeepUniformMemos(std::span<const VideoCommon::MT::UboEntry> ubos, const u8* blob);
     /// Copies the CPU-modified parts of a range the draw binds into the packet.
     void SeqTakeUploads(DAddr device_addr, u32 size);
     /// -1, or why this draw goes as a Serial (MT::ForcedSerialNames).
@@ -413,6 +421,14 @@ private:
     std::vector<u8> blob;
     std::vector<std::pair<DAddr, u32>> taken_ranges;
     std::vector<u8> dma_scratch;
+    struct UniformMemo {
+        DAddr device_addr;
+        u32 size;
+        u64 generation; ///< 0: none
+    };
+    std::array<std::array<UniformMemo, VideoCommon::MT::CaptureView::UboMemoSlots>,
+               VideoCommon::MT::CaptureView::UboMemoStages>
+        seq_ubo_memo{};
     u64 last_query_position = 0;
 
 public:
@@ -425,6 +441,7 @@ private:
     std::chrono::steady_clock::time_point last_stats{std::chrono::steady_clock::now()};
 
     // Committer-owned.
+    std::unique_ptr<u8[]> ubo_memo_bytes;
     std::vector<std::unique_ptr<ChannelMirrors>> mirrors;
     ChannelMirrors* current{};
     u64 last_mark{};
@@ -498,6 +515,13 @@ inline void Nx2DrawPipeline::Start() {
     hooks.before_write = [](void* context, u64 device_addr, u64 size) {
         static_cast<Nx2DrawPipeline*>(context)->BeforeWrite(device_addr, size);
     };
+    if (VideoCommon::MT::UboGen()) {
+        using View = VideoCommon::MT::CaptureView;
+        seq_ubo_memo = {};
+        ubo_memo_bytes = std::make_unique<u8[]>(View::UboMemoStages * View::UboMemoSlots *
+                                                View::UboMemoBytes);
+        VideoCommon::MT::g_ubo_gen_on.store(true, std::memory_order_seq_cst);
+    }
     start_ready.store(false, std::memory_order_relaxed);
     committer = std::jthread([this](std::stop_token stop) { CommitterLoop(stop); });
     while (!start_ready.load(std::memory_order_acquire)) {
@@ -524,6 +548,7 @@ inline void Nx2DrawPipeline::Stop() {
     VideoCommon::MT::g_active.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_check.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_write_hook_on.store(false, std::memory_order_seq_cst);
+    VideoCommon::MT::g_ubo_gen_on.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_hooks = {};
     stream.RemoveConsumer(consumer);
     running = false;
@@ -1260,16 +1285,14 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
                 .stage = static_cast<u8>(stage),
                 .index = static_cast<u8>(index),
                 .staged = static_cast<u8>(fast ? 1 : 0),
-                .pad = 0,
+                .memo = 0,
                 .size = size,
                 .device_addr = device_addr,
                 .offset = 0,
                 .pad2 = 0,
             };
             if (fast) {
-                entry.offset = static_cast<u32>(blob.size());
-                blob.resize(blob.size() + ((size + 7) & ~7U));
-                rasterizer.device_memory.ReadBlockUnsafe(device_addr, blob.data() + entry.offset, size);
+                SeqStageUniform(entry);
             } else {
                 SeqTakeUploads(device_addr, size);
             }
@@ -1438,6 +1461,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         reinterpret_cast<const VideoCommon::MT::UploadEntry*>(cursor), header.num_upload};
     cursor += header.num_upload * sizeof(VideoCommon::MT::UploadEntry) / 8;
     const u8* const blob_data = reinterpret_cast<const u8*>(cursor);
+    KeepUniformMemos(ubo_span, blob_data);
     if (current == nullptr) {
         return;
     }
@@ -1472,6 +1496,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         .ubos = ubo_span,
         .blob = blob_data,
         .verify = verify,
+        .ubo_memo = ubo_memo_bytes.get(),
     };
     {
         // EDEN_NX2_MT_LOCKSCOPE: the uploads under the buffer mutex, then ConfigureDrawPipeline
@@ -1621,7 +1646,10 @@ inline void Nx2DrawPipeline::VerifyCaptures(
         }
         bytes.resize(entry.size);
         rasterizer.device_memory.ReadBlockUnsafe(entry.device_addr, bytes.data(), entry.size);
-        if (std::memcmp(bytes.data(), blob_data + entry.offset, entry.size) != 0) {
+        const VideoCommon::MT::CaptureView memo_view{
+            .overlay = {}, .ubos = {}, .blob = blob_data, .verify = false,
+            .ubo_memo = ubo_memo_bytes.get()};
+        if (std::memcmp(bytes.data(), memo_view.UboBytes(entry), entry.size) != 0) {
             if (written_by_cpu(entry.device_addr, entry.size)) {
                 counters.verify_cpu_writes.fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -1942,16 +1970,14 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
             .stage = 5,
             .index = static_cast<u8>(index),
             .staged = static_cast<u8>(fast ? 1 : 0),
-            .pad = 0,
+            .memo = 0,
             .size = size,
             .device_addr = device_addr,
             .offset = 0,
             .pad2 = 0,
         };
         if (fast) {
-            entry.offset = static_cast<u32>(blob.size());
-            blob.resize(blob.size() + ((size + 7) & ~7U));
-            rasterizer.device_memory.ReadBlockUnsafe(device_addr, blob.data() + entry.offset, size);
+            SeqStageUniform(entry);
         } else {
             SeqTakeUploads(device_addr, size);
         }
@@ -2048,6 +2074,7 @@ inline void Nx2DrawPipeline::CommitCompute(const u64* entry) {
         reinterpret_cast<const VideoCommon::MT::UploadEntry*>(cursor), header.num_upload};
     cursor += header.num_upload * sizeof(VideoCommon::MT::UploadEntry) / 8;
     const u8* const blob_data = reinterpret_cast<const u8*>(cursor);
+    KeepUniformMemos(ubo_span, blob_data);
     if (current == nullptr || !current->mirror_compute) {
         return;
     }
@@ -2079,6 +2106,7 @@ inline void Nx2DrawPipeline::CommitCompute(const u64* entry) {
         .ubos = ubo_span,
         .blob = blob_data,
         .verify = verify,
+        .ubo_memo = ubo_memo_bytes.get(),
     };
     {
         // DispatchComputeBody takes both cache mutexes itself.
