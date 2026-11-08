@@ -217,7 +217,12 @@ public:
     void Command(MT::Kind kind, const Func& func) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr u32 functor_words = static_cast<u32>((sizeof(Func) + 7) / 8);
-        CloseBatch();
+        // A uniform bind only records the binding in the committer's channel state (no cache
+        // structure, no wait on the GPU or the front): it may sit inside a batch. Closing on it
+        // too made batches 1.1 draws long in MKW (a bind before nearly every draw).
+        if (kind != MT::Kind::Uniform) {
+            CloseBatch();
+        }
         EmitDeltas();
         u64* const out = stream.Reserve(functor_words + 3);
         out[0] = SpmcStream::MakeHeader(static_cast<u8>(MT::StreamEntry::Command), functor_words + 3,
