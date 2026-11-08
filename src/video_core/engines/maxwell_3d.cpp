@@ -1050,7 +1050,16 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
     }
     if (from_macro) {
-        split.MacroWrite(this, method, argument);
+        // EDEN_NX2_CB_BATCH=0 sends each word on its own (=a alternates). Not with the shadow
+        // RAM replaying: the back takes the word from it then.
+        static const char cb_batch = Tegra::Nx2EnvMode("EDEN_NX2_CB_BATCH");
+        constexpr u32 cb_first = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        if (method >= cb_first && method < cb_first + 16 &&
+            fs.control != Regs::ShadowRamControl::Replay && Tegra::Nx2Switch(cb_batch, true)) {
+            split.ConstBufferWord(this, method, argument);
+        } else {
+            split.MacroWrite(this, method, argument);
+        }
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }

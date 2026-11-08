@@ -183,10 +183,32 @@ public:
     }
     /// Sends the gathered state writes (before any other entry, publish or wait).
     void FlushState() {
+        if (cb_run_count != 0) [[unlikely]] {
+            FlushConstBufferRun();
+        }
         if (state_count != 0) {
             FlushStateSlow();
         }
     }
+
+    /// A word a macro writes to one of the 3D engine's const_buffer.buffer registers (`method`):
+    /// consecutive ones go to the back as one multi-method entry (one buffer write, not one entry
+    /// and one write a word). The 16 registers all write at const_buffer.offset and advance it.
+    /// Title 1's macros write ~1.3 million such words a second.
+    void ConstBufferWord(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        if (cb_run_count != 0 && (cb_run_engine != engine || cb_run_count == cb_run.size())) {
+            FlushConstBufferRun();
+        }
+        if (state_count != 0) {
+            FlushStateSlow();
+        }
+        if (cb_run_count == 0) {
+            cb_run_engine = engine;
+            cb_run_method = method;
+        }
+        cb_run[cb_run_count++] = argument;
+    }
+    void FlushConstBufferRun();
 
     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
     /// using back-owned state (the Vulkan scheduler) while the back runs entries.
@@ -392,6 +414,10 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    std::array<u32, 1024> cb_run{};
+    size_t cb_run_count{};
+    Tegra::Engines::EngineInterface* cb_run_engine{};
+    u32 cb_run_method{};
     std::array<std::pair<GPUVAddr, GPUVAddr>, 256> pending_writes{};
     size_t pending_write_count{};
     bool pending_write_overflow{};

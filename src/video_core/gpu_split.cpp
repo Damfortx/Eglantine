@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <vector>
+#include <unordered_map>
 #include <sched.h>
 #include <pthread.h>
 
@@ -524,6 +526,12 @@ void GpuSplit::FlushStateSlow() {
     Commit(1 + count);
 }
 
+void GpuSplit::FlushConstBufferRun() {
+    const u32 count = static_cast<u32>(cb_run_count);
+    cb_run_count = 0; // First: MultiMethod flushes the state, which comes here again.
+    MultiMethod(cb_run_engine, cb_run_method, cb_run.data(), count, count, nullptr);
+}
+
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                            u32 amount, u32 methods_pending, const GPUVAddr* segment) {
     FlushState();
@@ -570,6 +578,28 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        // EDEN_NX2_METHOD_STATS: which methods the back runs one by one (top 16 every 10 s).
+        static const bool method_stats = std::getenv("EDEN_NX2_METHOD_STATS") != nullptr;
+        if (method_stats) [[unlikely]] {
+            static std::unordered_map<u64, u64> counts;
+            static auto window = std::chrono::steady_clock::now();
+            const bool executed = (head & Direct) != 0 || engine->execution_mask[method];
+            ++counts[(reinterpret_cast<u64>(engine) << 20) ^ (u64{method} << 1) ^ (executed ? 1 : 0)];
+            if (std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
+                std::vector<std::pair<u64, u64>> top(counts.begin(), counts.end());
+                std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
+                std::string line;
+                u64 total = 0;
+                for (auto& [k, c] : top) total += c;
+                for (size_t i = 0; i < std::min<size_t>(16, top.size()); ++i) {
+                    line += fmt::format(" | {:#x}{} {}", (top[i].first >> 1) & 0x7ffff,
+                                        (top[i].first & 1) ? "x" : "", top[i].second / 10);
+                }
+                LOG_INFO(HW_GPU, "Back methods per second: {} total{}", total / 10, line);
+                counts.clear();
+                window = std::chrono::steady_clock::now();
+            }
+        }
         if ((head & Direct) != 0) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
