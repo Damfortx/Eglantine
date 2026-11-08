@@ -1615,10 +1615,12 @@ void BufferCache<P>::UpdateIndexBuffer() {
     // address of the start) and the buffer set (no deletion anywhere) hold, the buffer FindBuffer
     // returned for (start, memo.size) is the page_table entry at start and covers any smaller
     // size from the same start, so FindBuffer would return it again. Accurate GPU fences make
-    // FindBuffer synchronize writes, so the memo stays off there.
+    // FindBuffer synchronize writes, so the memo stays off there. On by default since title 1
+    // at 2x gained +6.4 and +4.0 fps (in-run A/B means; neutral before frames ahead).
+    // EDEN_NX2_INDEX_MEMO=0 turns it off (=a alternates).
     static const char index_memo_mode = Tegra::Nx2EnvMode("EDEN_NX2_INDEX_MEMO");
     const bool use_memo =
-        Tegra::Nx2Switch(index_memo_mode, false) && !Settings::IsGPUFenceBehaviorAccurate();
+        Tegra::Nx2Switch(index_memo_mode, true) && !Settings::IsGPUFenceBehaviorAccurate();
     const u64 generation = use_memo ? gpu_memory->LayoutGeneration() : 0;
     IndexBufferMemo& memo = index_buffer_memo;
     if (use_memo && size != 0 && memo.buffer_id && memo.generation == generation &&
