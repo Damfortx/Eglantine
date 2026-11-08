@@ -129,6 +129,9 @@ private:
     Mirrors* current{};
     u32 channel_gen = 0;
     u64 inject_counter = 0;
+    /// EDEN_NX2_MT_COMPACT: this resolver's TIC/TSC replica (every draw packet updates it, the
+    /// ones of other batches too) and the decoded overlay of the packet it resolves.
+    VideoCommon::MT::PacketDecoder decoder;
     std::vector<const ImageView*> view_objects;
     std::vector<u8> view_rescaled;
     std::vector<Sampler*> sampler_objects;
@@ -189,6 +192,10 @@ inline void Resolver::CreateRing() {
 
 inline void Resolver::Start() {
     CreateRing();
+    if (ring && (VideoCommon::MT::Compact() || VideoCommon::MT::UboGen())) {
+        // Streamed uniforms may come as the committer's kept bytes (staged 2/3): keep a replica.
+        decoder.EnableUniforms();
+    }
     ready.store(false, std::memory_order_relaxed);
     thread = std::jthread([this](std::stop_token stop) { Loop(stop); });
     while (!ready.load(std::memory_order_acquire)) {
@@ -332,12 +339,11 @@ inline void Resolver::OnEntry(const u64* entry, std::stop_token& stop) {
         }
         break;
     case StreamEntry::DrawPacket: {
-        u64 batch;
-        std::memcpy(&batch, reinterpret_cast<const u8*>(entry + 1) +
-                                offsetof(Nx2DrawPipeline::DrawHeader, batch),
-                    sizeof(batch));
+        const u64 batch = Nx2DrawPipeline::PacketBatch(entry);
         if (batch % count == index) {
             ResolveDraw(entry);
+        } else {
+            Nx2DrawPipeline::SkipPacket(entry, decoder);
         }
         break;
     }
@@ -390,7 +396,9 @@ inline void Resolver::ResolveDraw(const u64* entry) {
     const bool timed = VideoCommon::MT::Stats();
     const auto begin =
         timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const Nx2DrawPipeline::PacketView packet = Nx2DrawPipeline::ParsePacket(entry);
+    const Nx2DrawPipeline::PacketView packet = Nx2DrawPipeline::ParsePacket(entry, decoder);
+    // Before anything reads the packet's streamed uniforms (staged 2/3 read the kept bytes).
+    decoder.ApplyUniforms(packet.ubos, packet.blob);
     EnterBatch();
     current_batch = packet.header.batch;
     ResolvedDraw& out = pipeline.resolved.Slot(packet.header.seq);
@@ -537,6 +545,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         .overlay = packet.overlay,
         .ubos = packet.ubos,
         .blob = packet.blob,
+        .overlay_blob = packet.overlay_blob,
     };
     VideoCommon::MT::t_capture = &capture;
     SCOPE_EXIT {
@@ -776,12 +785,14 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             if (buffer_fail != BufNone) {
                 continue;
             }
-            if (ubo->staged != 1) {
-                fail_buffers(BufUniformMemo); // the committer's per-slot copy (UBO_GEN)
+            u64 source = 0;
+            const u8* const bytes = decoder.UniformBytes(*ubo, packet.blob, source);
+            if (bytes == nullptr) {
+                fail_buffers(BufUniformMemo); // the committer's per-slot copy, no replica here
                 continue;
             }
-            if (!stream_uniform(sink, static_cast<u32>(stage), index, capture.UboBytes(*ubo),
-                                ubo->size, 0)) {
+            if (!stream_uniform(sink, static_cast<u32>(stage), index, bytes, ubo->size,
+                                source)) {
                 fail_buffers(BufRingFull);
             }
         }

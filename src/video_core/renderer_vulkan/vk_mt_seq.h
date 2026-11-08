@@ -61,6 +61,62 @@ inline void Nx2DrawPipeline::SeqStageUniform(VideoCommon::MT::UboEntry& entry) {
     using View = VideoCommon::MT::CaptureView;
     const DAddr device_addr = entry.device_addr;
     const u32 size = entry.size;
+    if (compact && size != 0 && size <= View::UboMemoBytes && entry.stage < View::UboMemoStages &&
+        entry.index < View::UboMemoSlots) {
+        // EDEN_NX2_MT_COMPACT: the committer keeps every slot's last streamed bytes (each
+        // staged == 1 entry here has `memo`), and seq_ubo_bytes holds the same bytes as of the
+        // end of the stream. Unchanged bytes go as staged == 2, a few changed chunks as a
+        // patch (staged == 3); both are read from the committer's copy. EDEN_NX2_MT_UBO_GEN
+        // still skips reading the bytes while the generations allow.
+        UniformMemo& memo = seq_ubo_memo[entry.stage][entry.index];
+        u64 generation = 0;
+        if (VideoCommon::MT::UboGen()) {
+            const bool protected_pages =
+                !rasterizer.buffer_cache.IsRegionCpuModified(device_addr, size) &&
+                !Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, device_addr, size);
+            generation =
+                protected_pages ? VideoCommon::MT::UboWriteGenerations().Read(device_addr, size) : 0;
+            if (generation != 0 && memo.generation == generation &&
+                memo.device_addr == device_addr && memo.size == size) {
+                entry.staged = 2;
+                counters.ubo_gen_hits.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+        u8* const kept = seq_ubo_bytes.get() +
+                         (size_t{entry.stage} * View::UboMemoSlots + entry.index) *
+                             View::UboMemoBytes;
+        u8* const now = ubo_scratch.data();
+        rasterizer.device_memory.ReadBlockUnsafe(device_addr, now, size);
+        // The kept bytes are now this range's at `generation` (read before the bytes).
+        memo = UniformMemo{device_addr, size, generation};
+        u32 changed_bytes = 0;
+        const u64 mask = VideoCommon::MT::UniformPatchMask(now, kept, size, changed_bytes);
+        if (mask == 0) {
+            entry.staged = 2;
+            counters.ubo_same.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const u32 patch_size = static_cast<u32>(sizeof(u64)) + changed_bytes;
+        entry.offset = static_cast<u32>(blob.size());
+        if (patch_size < size) {
+            entry.staged = 3;
+            const u32 padded = (patch_size + 7) & ~7U;
+            blob.resize(blob.size() + padded);
+            VideoCommon::MT::WriteUniformPatch(blob.data() + entry.offset, now, size, mask);
+            blob_ubo_bytes += padded;
+            counters.ubo_patched.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            entry.memo = 1;
+            const u32 padded = (size + 7) & ~7U;
+            blob.resize(blob.size() + padded);
+            std::memcpy(blob.data() + entry.offset, now, size);
+            blob_ubo_bytes += padded;
+            counters.ubo_full.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::memcpy(kept, now, size);
+        return;
+    }
     if (VideoCommon::MT::UboGen() && size != 0 && size <= View::UboMemoBytes &&
         entry.stage < View::UboMemoStages && entry.index < View::UboMemoSlots) {
         UniformMemo& memo = seq_ubo_memo[entry.stage][entry.index];
@@ -90,6 +146,7 @@ inline void Nx2DrawPipeline::SeqStageUniform(VideoCommon::MT::UboEntry& entry) {
     entry.offset = static_cast<u32>(blob.size());
     blob.resize(blob.size() + ((size + 7) & ~7U));
     rasterizer.device_memory.ReadBlockUnsafe(device_addr, blob.data() + entry.offset, size);
+    blob_ubo_bytes += (size + 7) & ~7U;
 }
 
 inline void Nx2DrawPipeline::KeepUniformMemos(std::span<const VideoCommon::MT::UboEntry> entries,
@@ -98,12 +155,17 @@ inline void Nx2DrawPipeline::KeepUniformMemos(std::span<const VideoCommon::MT::U
     if (!ubo_memo_bytes) {
         return;
     }
+    const auto kept_bytes = [&](const VideoCommon::MT::UboEntry& entry) {
+        return ubo_memo_bytes.get() +
+               (size_t{entry.stage} * View::UboMemoSlots + entry.index) * View::UboMemoBytes;
+    };
     for (const VideoCommon::MT::UboEntry& entry : entries) {
         if (entry.staged == 1 && entry.memo != 0) {
-            std::memcpy(ubo_memo_bytes.get() +
-                            (size_t{entry.stage} * View::UboMemoSlots + entry.index) *
-                                View::UboMemoBytes,
-                        blob_data + entry.offset, entry.size);
+            std::memcpy(kept_bytes(entry), blob_data + entry.offset, entry.size);
+        } else if (entry.staged == 3) {
+            // EDEN_NX2_MT_COMPACT: the changed chunks (UboBytes then reads the kept bytes).
+            VideoCommon::MT::ApplyUniformPatch(kept_bytes(entry), blob_data + entry.offset,
+                                               entry.size);
         }
     }
 }

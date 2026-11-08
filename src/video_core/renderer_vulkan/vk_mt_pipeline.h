@@ -39,6 +39,8 @@
 #include "video_core/mt/engine_ptr.h"
 #include "video_core/mt/epoch.h"
 #include "video_core/mt/maxwell3d_reg_names.h"
+#include "video_core/mt/mt_switches.h"
+#include "video_core/mt/packet_compact.h"
 #include "video_core/mt/reg_delta.h"
 #include "video_core/mt/resolve_packet.h"
 #include "video_core/mt/resolve_sync.h"
@@ -121,6 +123,19 @@ struct Counters {
     std::atomic<u64> ubo_gen_hits{};
     std::atomic<u64> ubo_gen_misses{};
     std::atomic<u64> ubo_gen_unprotected{};
+    // Draw packet bytes by part (EDEN_NX2_MT_STATS), and the EDEN_NX2_MT_COMPACT decisions.
+    std::atomic<u64> pkt_header_bytes{};
+    std::atomic<u64> pkt_overlay_bytes{}; ///< entries, bytes, slot references and inserts
+    std::atomic<u64> pkt_ubo_entry_bytes{};
+    std::atomic<u64> pkt_ubo_data_bytes{};
+    std::atomic<u64> pkt_upload_bytes{}; ///< entries and blob bytes (not heap ones)
+    std::atomic<u64> pkt_other_bytes{};  ///< ssbo/geometry/tic-valid arrays, inline indices, padding
+    std::atomic<u64> compact_packets{};
+    std::atomic<u64> ubo_same{};
+    std::atomic<u64> ubo_patched{};
+    std::atomic<u64> ubo_full{};
+    std::atomic<u64> desc_hits{};
+    std::atomic<u64> desc_misses{};
     // Stage times (EDEN_NX2_MT_STATS), ns.
     std::atomic<u64> seq_capture_ns{};
     std::atomic<u64> wait_committed_ns{};
@@ -346,6 +361,61 @@ private:
         u32 pad2;
     };
     static constexpr u32 DrawHeaderWords = static_cast<u32>((sizeof(DrawHeader) + 7) / 8);
+    /// EDEN_NX2_MT_COMPACT draw packets (stream header aux 1): this header, the indirect
+    /// parameters only for indirect draws, the arrays of the v2 layout, then the TIC/TSC slot
+    /// references (u16, padded to 8 bytes) and inserts (u64 addresses), then the blob.
+    /// ParsePacket rebuilds the DrawHeader and the overlay the old layout carried.
+    struct CompactDrawHeader {
+        u64 seq;
+        GraphicsPipeline* pipeline;
+        u64 batch;
+        u64 layout_gen;
+        u32 blob_size;
+        u32 instance_count;
+        u32 num_overlay;
+        u32 num_upload;
+        u16 num_desc_refs;
+        u16 num_desc_inserts;
+        u8 num_ubo;
+        u8 num_ssbo;
+        u8 num_geometry;
+        u8 tic_valid_words;
+        u8 flags;
+        u8 draw_mode;
+        u16 pad;
+        u32 topology;
+        u32 inline_index_offset;
+        u32 inline_index_size;
+        u32 draw_element_count;
+        u32 base_index;
+        Maxwell3D::Regs::VertexBuffer vertex_buffer;
+        Maxwell3D::Regs::IndexBuffer index_buffer;
+        u32 base_instance;
+        u32 draw_instance_count;
+        u32 drawn_instances;
+        enum Flags : u8 {
+            IsIndexed = 1 << 0,
+            NativeTuring = 1 << 1,
+            Indirect = 1 << 2,
+            DrawIndexed = 1 << 3,
+        };
+    };
+    static constexpr u32 CompactHeaderWords =
+        static_cast<u32>((sizeof(CompactDrawHeader) + 7) / 8);
+    static constexpr u32 IndirectWords = static_cast<u32>((sizeof(IndirectParams) + 7) / 8);
+    static constexpr u32 CompactAux = 1;
+    /// A draw packet's batch (resolvers pick their packets by it), either layout.
+    [[nodiscard]] static u64 PacketBatch(const u64* entry) noexcept {
+        u64 batch;
+        const size_t offset = SpmcStream::HeaderAux(entry[0]) == CompactAux
+                                  ? offsetof(CompactDrawHeader, batch)
+                                  : offsetof(DrawHeader, batch);
+        std::memcpy(&batch, reinterpret_cast<const u8*>(entry + 1) + offset, sizeof(batch));
+        return batch;
+    }
+    /// A reader that does not parse a draw packet (a resolver, other batches) must still apply
+    /// its TIC/TSC inserts to its replica.
+    static void SkipPacket(const u64* entry, VideoCommon::MT::PacketDecoder& decoder);
     /// Resolved draw slots (by seq), see vk_mt_resolve.h.
     static constexpr u32 ResolvedSlots = 4096;
 
@@ -359,14 +429,19 @@ private:
         std::span<const VideoCommon::MT::GeometryEntry> geometry;
         std::span<const u64> tic_valid;
         const u8* blob;
+        /// The overlay's bytes: `blob` (old layout), or the decoder's (compact).
+        const u8* overlay_blob;
     };
-    static PacketView ParsePacket(const u64* entry);
+    /// Both layouts. `decoder`: the calling reader's own (compact packets update its replica,
+    /// and the overlay spans point into it until its next call).
+    static PacketView ParsePacket(const u64* entry, VideoCommon::MT::PacketDecoder& decoder);
 
     /// A guest read the committer will repeat (its bytes go into the overlay).
     struct RawRead {
         u64 gpu_addr;
         u32 size;
         u32 offset;
+        bool descriptor; ///< a TIC/TSC entry (SeqReadDescriptor)
     };
 
     /// Reads guest memory for the capture and records it.
@@ -392,6 +467,9 @@ private:
     int CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed, const IndirectParams* indirect);
     /// The captured reads, sorted and merged, into the overlay (bytes in the blob).
     void FinishOverlay();
+    /// EDEN_NX2_MT_COMPACT: FinishOverlay, but TIC/TSC entries the replicas hold unchanged
+    /// become slot references (desc_refs), and the others replace their slot (desc_inserts).
+    void FinishOverlayCompact();
     void ClearCapture();
     struct ComputeHeader {
         u64 seq;
@@ -408,9 +486,11 @@ private:
     int CaptureCompute(ComputePipeline* pipeline);
     void EmitCompute(ComputePipeline* pipeline, u64 native_key);
     void CommitCompute(const u64* entry);
+    /// `overlay_blob`: the overlay's bytes (null: `blob`).
     void VerifyCaptures(u64 seq, std::span<const VideoCommon::MT::OverlayEntry> overlay,
                         std::span<const VideoCommon::MT::UboEntry> ubos,
-                        std::span<const VideoCommon::MT::UploadEntry> uploads, const u8* blob);
+                        std::span<const VideoCommon::MT::UploadEntry> uploads, const u8* blob,
+                        const u8* overlay_blob = nullptr);
     void ReportView(u64 seq, const VideoCommon::MT::CaptureView& view);
     void EmitDraw(GraphicsPipeline* pipeline, bool is_indexed, u32 instance_count,
                   const IndirectParams* indirect);
@@ -424,7 +504,8 @@ private:
     void CommitDraw(const u64* entry);
     void VerifyDraw(const DrawHeader& header, std::span<const VideoCommon::MT::OverlayEntry> overlay,
                     std::span<const VideoCommon::MT::UboEntry> ubos,
-                    std::span<const VideoCommon::MT::UploadEntry> uploads, const u8* blob);
+                    std::span<const VideoCommon::MT::UploadEntry> uploads, const u8* blob,
+                    const u8* overlay_blob);
     void VerifyReport(u64 key, const std::string& message);
 
     template <typename Func>
@@ -529,6 +610,21 @@ private:
     std::array<std::array<UniformMemo, VideoCommon::MT::CaptureView::UboMemoSlots>,
                VideoCommon::MT::CaptureView::UboMemoStages>
         seq_ubo_memo{};
+    // EDEN_NX2_MT_COMPACT (sequencer).
+    const bool compact = VideoCommon::MT::Compact();
+    /// This capture goes out in the compact layout (its counts fit; set by CaptureDraw).
+    bool compact_packet = false;
+    /// The bytes the committer keeps per uniform slot (ubo_memo_bytes), as of the stream's end.
+    std::unique_ptr<u8[]> seq_ubo_bytes;
+    std::array<u8, VideoCommon::MT::CaptureView::UboMemoBytes> ubo_scratch{};
+    /// The TIC/TSC table the readers replicate.
+    VideoCommon::MT::DescriptorReplica seq_desc;
+    std::vector<u16> desc_refs;
+    std::vector<u64> desc_inserts;
+    std::vector<u8> desc_eligible;
+    /// Blob bytes of the capture by part (EDEN_NX2_MT_STATS).
+    u32 blob_ubo_bytes = 0;
+    u32 blob_upload_bytes = 0;
     u64 last_query_position = 0;
 
 public:
@@ -556,6 +652,8 @@ private:
 
     // Committer-owned.
     std::unique_ptr<u8[]> ubo_memo_bytes;
+    /// EDEN_NX2_MT_COMPACT: the committer's TIC/TSC replica and decoded overlay.
+    VideoCommon::MT::PacketDecoder commit_decoder;
     std::vector<std::unique_ptr<ChannelMirrors>> mirrors;
     ChannelMirrors* current{};
     u64 last_mark{};
@@ -670,13 +768,24 @@ inline void Nx2DrawPipeline::Start() {
     if (verify) {
         VideoCommon::MT::g_cpu_write_log_on.store(true, std::memory_order_seq_cst);
     }
-    if (VideoCommon::MT::UboGen()) {
+    if (VideoCommon::MT::UboGen() || compact) {
         using View = VideoCommon::MT::CaptureView;
         seq_ubo_memo = {};
+        // Value-initialized (zero) on both sides: the committer's kept bytes and the
+        // sequencer's copy of them start equal.
         ubo_memo_bytes = std::make_unique<u8[]>(View::UboMemoStages * View::UboMemoSlots *
                                                 View::UboMemoBytes);
+        if (compact) {
+            seq_ubo_bytes = std::make_unique<u8[]>(View::UboMemoStages * View::UboMemoSlots *
+                                                   View::UboMemoBytes);
+        }
+    }
+    if (VideoCommon::MT::UboGen()) {
         VideoCommon::MT::g_ubo_gen_on.store(true, std::memory_order_seq_cst);
     }
+    // The TIC/TSC table and the committer's replica (resolvers make theirs at StartResolvers).
+    seq_desc.Reset();
+    commit_decoder.table.Reset();
     start_ready.store(false, std::memory_order_relaxed);
     committer = std::jthread([this](std::stop_token stop) { CommitterLoop(stop); });
     while (!start_ready.load(std::memory_order_acquire)) {
@@ -1314,6 +1423,26 @@ inline void Nx2DrawPipeline::LogStats() {
              static_cast<double>(take(counters.ubo_gen_hits)) / seconds,
              static_cast<double>(take(counters.ubo_gen_misses)) / seconds,
              static_cast<double>(take(counters.ubo_gen_unprotected)) / seconds);
+    {
+        // Average draw packet bytes by part (EDEN_NX2_MT_COMPACT decisions per second).
+        const double draws = packets != 0 ? static_cast<double>(packets) : 1.0;
+        const auto per_draw = [&](std::atomic<u64>& value) {
+            return static_cast<double>(take(value)) / draws;
+        };
+        const auto rate = [&](std::atomic<u64>& value) {
+            return static_cast<double>(take(value)) / seconds;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "MT draw packet B: header {:.0f}, overlay {:.0f}, ubo entries {:.0f}, ubo bytes "
+                 "{:.0f}, uploads {:.0f}, other {:.0f} | compact {:.0f}/s: ubo same {:.0f}/s, "
+                 "patched {:.0f}/s, full {:.0f}/s, descriptors referenced {:.0f}/s, sent {:.0f}/s",
+                 per_draw(counters.pkt_header_bytes), per_draw(counters.pkt_overlay_bytes),
+                 per_draw(counters.pkt_ubo_entry_bytes), per_draw(counters.pkt_ubo_data_bytes),
+                 per_draw(counters.pkt_upload_bytes), per_draw(counters.pkt_other_bytes),
+                 rate(counters.compact_packets), rate(counters.ubo_same),
+                 rate(counters.ubo_patched), rate(counters.ubo_full), rate(counters.desc_hits),
+                 rate(counters.desc_misses));
+    }
 }
 
 } // namespace Vulkan
@@ -1328,7 +1457,7 @@ T Nx2DrawPipeline::SeqRead(u64 gpu_addr) {
     const u32 offset = static_cast<u32>(raw_bytes.size());
     raw_bytes.resize(raw_bytes.size() + sizeof(T));
     std::memcpy(raw_bytes.data() + offset, &value, sizeof(T));
-    raw_reads.push_back({gpu_addr, static_cast<u32>(sizeof(T)), offset});
+    raw_reads.push_back({gpu_addr, static_cast<u32>(sizeof(T)), offset, false});
     return value;
 }
 
@@ -1345,7 +1474,7 @@ inline void Nx2DrawPipeline::SeqReadDescriptor(u64 gpu_addr) {
     } else {
         rasterizer.gpu_memory->ReadBlockUnsafe(gpu_addr, out, Size);
     }
-    raw_reads.push_back({gpu_addr, Size, offset});
+    raw_reads.push_back({gpu_addr, Size, offset, true});
 }
 
 inline void Nx2DrawPipeline::SeqTakeUploads(DAddr device_addr, u32 size) {
@@ -1378,6 +1507,7 @@ inline void Nx2DrawPipeline::SeqTakeUploads(DAddr device_addr, u32 size) {
             blob.resize(offset + length);
             rasterizer.device_memory.ReadBlockUnsafe(start, blob.data() + offset, length);
             entry.data = offset;
+            blob_upload_bytes += static_cast<u32>(length);
         }
         uploads.push_back(entry);
     });
@@ -1652,7 +1782,16 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         }
     }
 
-    FinishOverlay();
+    // EDEN_NX2_MT_COMPACT: the compact header's narrow counts must hold this draw's (else the
+    // old layout, which every reader still parses; it touches no replica).
+    compact_packet = compact && ubos.size() <= 0xff && ssbo_entries.size() <= 0xff &&
+                     geometry_entries.size() <= 0xff && tic_valid.size() <= 0xff &&
+                     raw_reads.size() <= 0xffff;
+    if (compact_packet) {
+        FinishOverlayCompact();
+    } else {
+        FinishOverlay();
+    }
     return -1;
 }
 
@@ -1683,10 +1822,99 @@ inline void Nx2DrawPipeline::FinishOverlay() {
     }
 }
 
+inline void Nx2DrawPipeline::FinishOverlayCompact() {
+    using Replica = VideoCommon::MT::DescriptorReplica;
+    // Same order as FinishOverlay (address), ties broken so duplicates are adjacent.
+    std::sort(raw_reads.begin(), raw_reads.end(), [](const RawRead& a, const RawRead& b) {
+        return a.gpu_addr != b.gpu_addr ? a.gpu_addr < b.gpu_addr : a.size < b.size;
+    });
+    // A TIC/TSC read may travel as a slot reference only when it stands alone in the overlay:
+    // no other read overlaps it, and no other kind of read touches it (FinishOverlay merges
+    // touching reads, and a reader could read across them). Descriptor reads are exactly the
+    // 32-byte entries the readers ask for, so touching ones may stay separate entries.
+    const size_t count = raw_reads.size();
+    std::vector<u8>& eligible = desc_eligible;
+    eligible.assign(count, 0);
+    u64 max_end_plain = 0; // end of the reads before, by kind
+    u64 max_end_desc = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const RawRead& read = raw_reads[i];
+        const u64 end = read.gpu_addr + read.size;
+        if (read.descriptor && read.size == Replica::EntryBytes) {
+            const bool duplicate = i > 0 && raw_reads[i - 1].descriptor &&
+                                   raw_reads[i - 1].gpu_addr == read.gpu_addr &&
+                                   raw_reads[i - 1].size == read.size;
+            bool alone = duplicate ? eligible[i - 1] != 0
+                                   : max_end_plain < read.gpu_addr && max_end_desc <= read.gpu_addr;
+            if (alone && !duplicate) {
+                for (size_t j = i + 1; j < count && raw_reads[j].gpu_addr <= end; ++j) {
+                    const RawRead& next = raw_reads[j];
+                    const bool same = next.descriptor && next.gpu_addr == read.gpu_addr &&
+                                      next.size == read.size;
+                    if (same) {
+                        continue;
+                    }
+                    if (next.descriptor ? next.gpu_addr < end : next.gpu_addr <= end) {
+                        alone = false;
+                        break;
+                    }
+                }
+            }
+            eligible[i] = alone ? 1 : 0;
+            max_end_desc = (std::max)(max_end_desc, end);
+        } else {
+            max_end_plain = (std::max)(max_end_plain, end);
+        }
+    }
+    // Pass 1, against the table as the readers have it before this packet: references.
+    // Pass 2: the misses replace their slots (in this order on every reader).
+    desc_refs.clear();
+    desc_inserts.clear();
+    size_t kept = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const RawRead read = raw_reads[i];
+        if (eligible[i] != 0) {
+            if (i > 0 && eligible[i - 1] != 0 && raw_reads[i - 1].gpu_addr == read.gpu_addr) {
+                continue; // a duplicate of the entry just handled
+            }
+            const u32 slot = Replica::SlotOf(read.gpu_addr);
+            const Replica::Slot& entry = seq_desc.slots[slot];
+            if (entry.gpu_addr == read.gpu_addr &&
+                std::memcmp(entry.bytes.data(), raw_bytes.data() + read.offset,
+                            Replica::EntryBytes) == 0) {
+                desc_refs.push_back(static_cast<u16>(slot));
+                continue;
+            }
+            desc_inserts.push_back(read.gpu_addr);
+        }
+        raw_reads[kept++] = read;
+    }
+    raw_reads.resize(kept);
+    for (const u64 gpu_addr : desc_inserts) {
+        Replica::Slot& entry = seq_desc.slots[Replica::SlotOf(gpu_addr)];
+        // The bytes this packet carries for it (its read is among the kept ones).
+        for (const RawRead& read : raw_reads) {
+            if (read.descriptor && read.gpu_addr == gpu_addr) {
+                entry.gpu_addr = gpu_addr;
+                std::memcpy(entry.bytes.data(), raw_bytes.data() + read.offset,
+                            Replica::EntryBytes);
+                break;
+            }
+        }
+    }
+    if (VideoCommon::MT::Stats()) {
+        counters.desc_hits.fetch_add(desc_refs.size(), std::memory_order_relaxed);
+        counters.desc_misses.fetch_add(desc_inserts.size(), std::memory_order_relaxed);
+    }
+    // The rest as FinishOverlay does (raw_reads stay sorted).
+    FinishOverlay();
+}
+
 inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexed,
                                       u32 instance_count, const IndirectParams* indirect) {
     Maxwell3D& real = *rasterizer.maxwell3d.Real();
     const auto& state = real.draw_manager.draw_state;
+    const size_t captured_blob = blob.size();
     const u32 inline_offset = static_cast<u32>((blob.size() + 7) & ~size_t{7});
     const u32 inline_size = static_cast<u32>(state.inline_index_draw_indexes.size());
     if (inline_size != 0) {
@@ -1704,8 +1932,13 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     const u32 geometry_words =
         static_cast<u32>(geometry_entries.size() * sizeof(geometry_entries[0]) / 8);
     const u32 tic_words = static_cast<u32>(tic_valid.size());
-    const u32 words = 1 + DrawHeaderWords + overlay_words + ubo_words + upload_words + ssbo_words +
-                      geometry_words + tic_words + blob_words;
+    const bool packed = compact_packet;
+    const u32 header_words =
+        packed ? CompactHeaderWords + (indirect != nullptr ? IndirectWords : 0) : DrawHeaderWords;
+    const u32 ref_words = packed ? static_cast<u32>((desc_refs.size() * 2 + 7) / 8) : 0;
+    const u32 insert_words = packed ? static_cast<u32>(desc_inserts.size()) : 0;
+    const u32 words = 1 + header_words + overlay_words + ubo_words + upload_words + ssbo_words +
+                      geometry_words + tic_words + ref_words + insert_words + blob_words;
     const u64 seq = next_seq;
     if (Batching()) {
         // Back-pressure: the resolved slot of `seq` must have been committed. One wait for
@@ -1723,44 +1956,85 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
         batch_open = true;
     }
     u64* const out = stream.Reserve(words);
-    out[0] = SpmcStream::MakeHeader(static_cast<u8>(MT::StreamEntry::DrawPacket), words, 0);
-    DrawHeader header{};
-    header.seq = next_seq++;
-    emitted_seq.store(header.seq, std::memory_order_relaxed);
-    header.pipeline = pipeline;
-    header.draw_state = DrawStateCopy{
-        .topology = state.topology,
-        .draw_mode = state.draw_mode,
-        .draw_indexed = state.draw_indexed,
-        .draw_element_count = state.draw_element_count,
-        .base_index = state.base_index,
-        .vertex_buffer = state.vertex_buffer,
-        .index_buffer = state.index_buffer,
-        .base_instance = state.base_instance,
-        .instance_count = state.instance_count,
-        .drawn_instances = state.drawn_instances,
-    };
-    header.instance_count = instance_count;
-    header.is_indexed = is_indexed ? 1 : 0;
-    if (indirect != nullptr) {
-        header.indirect = 1;
-        header.indirect_params = *indirect;
+    out[0] = SpmcStream::MakeHeader(static_cast<u8>(MT::StreamEntry::DrawPacket), words,
+                                    packed ? CompactAux : 0);
+    u64* cursor = out + 1 + header_words;
+    if (packed) {
+        CompactDrawHeader header{};
+        header.seq = next_seq++;
+        emitted_seq.store(header.seq, std::memory_order_relaxed);
+        header.pipeline = pipeline;
+        header.batch = Batching() ? batch_id : 0;
+        header.layout_gen = rasterizer.gpu_memory->LayoutGeneration();
+        header.blob_size = static_cast<u32>(blob.size());
+        header.instance_count = instance_count;
+        header.num_overlay = static_cast<u32>(overlay.size());
+        header.num_upload = static_cast<u32>(uploads.size());
+        header.num_desc_refs = static_cast<u16>(desc_refs.size());
+        header.num_desc_inserts = static_cast<u16>(desc_inserts.size());
+        header.num_ubo = static_cast<u8>(ubos.size());
+        header.num_ssbo = static_cast<u8>(ssbo_entries.size());
+        header.num_geometry = static_cast<u8>(geometry_entries.size());
+        header.tic_valid_words = static_cast<u8>(tic_words);
+        header.flags = static_cast<u8>(
+            (is_indexed ? CompactDrawHeader::IsIndexed : 0) |
+            (real.GetNativeMacroEngine().native_turing ? CompactDrawHeader::NativeTuring : 0) |
+            (indirect != nullptr ? CompactDrawHeader::Indirect : 0) |
+            (state.draw_indexed ? CompactDrawHeader::DrawIndexed : 0));
+        header.draw_mode = static_cast<u8>(state.draw_mode);
+        header.topology = static_cast<u32>(state.topology);
+        header.inline_index_offset = inline_offset;
+        header.inline_index_size = inline_size;
+        header.draw_element_count = state.draw_element_count;
+        header.base_index = state.base_index;
+        header.vertex_buffer = state.vertex_buffer;
+        header.index_buffer = state.index_buffer;
+        header.base_instance = state.base_instance;
+        header.draw_instance_count = state.instance_count;
+        header.drawn_instances = state.drawn_instances;
+        std::memset(out + 1, 0, header_words * 8);
+        std::memcpy(out + 1, &header, sizeof(header));
+        if (indirect != nullptr) {
+            std::memcpy(out + 1 + CompactHeaderWords, indirect, sizeof(*indirect));
+        }
+    } else {
+        DrawHeader header{};
+        header.seq = next_seq++;
+        emitted_seq.store(header.seq, std::memory_order_relaxed);
+        header.pipeline = pipeline;
+        header.draw_state = DrawStateCopy{
+            .topology = state.topology,
+            .draw_mode = state.draw_mode,
+            .draw_indexed = state.draw_indexed,
+            .draw_element_count = state.draw_element_count,
+            .base_index = state.base_index,
+            .vertex_buffer = state.vertex_buffer,
+            .index_buffer = state.index_buffer,
+            .base_instance = state.base_instance,
+            .instance_count = state.instance_count,
+            .drawn_instances = state.drawn_instances,
+        };
+        header.instance_count = instance_count;
+        header.is_indexed = is_indexed ? 1 : 0;
+        if (indirect != nullptr) {
+            header.indirect = 1;
+            header.indirect_params = *indirect;
+        }
+        header.native_turing = real.GetNativeMacroEngine().native_turing ? 1 : 0;
+        header.inline_index_offset = inline_offset;
+        header.inline_index_size = inline_size;
+        header.num_overlay = static_cast<u32>(overlay.size());
+        header.num_ubo = static_cast<u32>(ubos.size());
+        header.num_upload = static_cast<u32>(uploads.size());
+        header.blob_size = static_cast<u32>(blob.size());
+        header.batch = Batching() ? batch_id : 0;
+        header.layout_gen = rasterizer.gpu_memory->LayoutGeneration();
+        header.num_ssbo = static_cast<u32>(ssbo_entries.size());
+        header.num_geometry = static_cast<u32>(geometry_entries.size());
+        header.tic_valid_words = tic_words;
+        std::memset(out + 1, 0, DrawHeaderWords * 8);
+        std::memcpy(out + 1, &header, sizeof(header));
     }
-    header.native_turing = real.GetNativeMacroEngine().native_turing ? 1 : 0;
-    header.inline_index_offset = inline_offset;
-    header.inline_index_size = inline_size;
-    header.num_overlay = static_cast<u32>(overlay.size());
-    header.num_ubo = static_cast<u32>(ubos.size());
-    header.num_upload = static_cast<u32>(uploads.size());
-    header.blob_size = static_cast<u32>(blob.size());
-    header.batch = Batching() ? batch_id : 0;
-    header.layout_gen = rasterizer.gpu_memory->LayoutGeneration();
-    header.num_ssbo = static_cast<u32>(ssbo_entries.size());
-    header.num_geometry = static_cast<u32>(geometry_entries.size());
-    header.tic_valid_words = tic_words;
-    std::memset(out + 1, 0, DrawHeaderWords * 8);
-    std::memcpy(out + 1, &header, sizeof(header));
-    u64* cursor = out + 1 + DrawHeaderWords;
     std::memcpy(cursor, overlay.data(), overlay_words * 8);
     cursor += overlay_words;
     std::memcpy(cursor, ubos.data(), ubo_words * 8);
@@ -1773,10 +2047,40 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     cursor += geometry_words;
     std::memcpy(cursor, tic_valid.data(), tic_words * 8);
     cursor += tic_words;
+    if (packed) {
+        if (ref_words != 0) {
+            cursor[ref_words - 1] = 0;
+            std::memcpy(cursor, desc_refs.data(), desc_refs.size() * sizeof(u16));
+        }
+        cursor += ref_words;
+        std::memcpy(cursor, desc_inserts.data(), insert_words * 8);
+        cursor += insert_words;
+    }
     std::memcpy(cursor, blob.data(), blob.size());
     stream.Commit();
     counters.packets.fetch_add(1, std::memory_order_relaxed);
     counters.packet_words.fetch_add(words, std::memory_order_relaxed);
+    if (VideoCommon::MT::Stats()) {
+        // Where the bytes go (blob: uploads and uniform bytes during pass 2, then the overlay's
+        // bytes with their alignment, then inline indices).
+        const u64 overlay_blob_bytes = captured_blob - blob_ubo_bytes - blob_upload_bytes;
+        const u64 header_bytes = 8 + u64{header_words} * 8;
+        const u64 overlay_bytes = u64{overlay_words + ref_words + insert_words} * 8 +
+                                  overlay_blob_bytes;
+        const u64 ubo_entry_bytes = u64{ubo_words} * 8;
+        const u64 upload_bytes = u64{upload_words} * 8 + blob_upload_bytes;
+        counters.pkt_header_bytes.fetch_add(header_bytes, std::memory_order_relaxed);
+        counters.pkt_overlay_bytes.fetch_add(overlay_bytes, std::memory_order_relaxed);
+        counters.pkt_ubo_entry_bytes.fetch_add(ubo_entry_bytes, std::memory_order_relaxed);
+        counters.pkt_ubo_data_bytes.fetch_add(blob_ubo_bytes, std::memory_order_relaxed);
+        counters.pkt_upload_bytes.fetch_add(upload_bytes, std::memory_order_relaxed);
+        counters.pkt_other_bytes.fetch_add(u64{words} * 8 - header_bytes - overlay_bytes -
+                                               ubo_entry_bytes - blob_ubo_bytes - upload_bytes,
+                                           std::memory_order_relaxed);
+        if (packed) {
+            counters.compact_packets.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (Batching() && (++batch_draws >= VideoCommon::MT::BatchSize() ||
                        (adaptive_batches &&
                         wanted_batch.load(std::memory_order_relaxed) == batch_id + 1))) {
@@ -1841,27 +2145,140 @@ inline void Nx2DrawPipeline::SeqDraw(bool is_indexed, u32 instance_count,
     EmitDraw(pipeline, is_indexed, instance_count, indirect);
 }
 
-inline Nx2DrawPipeline::PacketView Nx2DrawPipeline::ParsePacket(const u64* entry) {
+inline Nx2DrawPipeline::PacketView Nx2DrawPipeline::ParsePacket(
+    const u64* entry, VideoCommon::MT::PacketDecoder& decoder) {
     PacketView view{};
-    std::memcpy(&view.header, entry + 1, sizeof(view.header));
-    const DrawHeader& header = view.header;
-    const u64* cursor = entry + 1 + DrawHeaderWords;
-    const auto take = [&]<typename T>(std::span<const T>& out, u32 count) {
+    const auto take = [](const u64*& cursor, auto& out, u32 count) {
+        using T = typename std::remove_reference_t<decltype(out)>::value_type;
         out = std::span<const T>{reinterpret_cast<const T*>(cursor), count};
         cursor += count * sizeof(T) / 8;
     };
-    take(view.overlay, header.num_overlay);
-    take(view.ubos, header.num_ubo);
-    take(view.uploads, header.num_upload);
-    take(view.ssbos, header.num_ssbo);
-    take(view.geometry, header.num_geometry);
-    take(view.tic_valid, header.tic_valid_words);
+    if (SpmcStream::HeaderAux(entry[0]) != CompactAux) {
+        std::memcpy(&view.header, entry + 1, sizeof(view.header));
+        const DrawHeader& header = view.header;
+        const u64* cursor = entry + 1 + DrawHeaderWords;
+        take(cursor, view.overlay, header.num_overlay);
+        take(cursor, view.ubos, header.num_ubo);
+        take(cursor, view.uploads, header.num_upload);
+        take(cursor, view.ssbos, header.num_ssbo);
+        take(cursor, view.geometry, header.num_geometry);
+        take(cursor, view.tic_valid, header.tic_valid_words);
+        view.blob = reinterpret_cast<const u8*>(cursor);
+        view.overlay_blob = view.blob;
+        return view;
+    }
+    // EDEN_NX2_MT_COMPACT: rebuild the header the old layout carried, and the overlay.
+    CompactDrawHeader packed;
+    std::memcpy(&packed, entry + 1, sizeof(packed));
+    const bool indirect = (packed.flags & CompactDrawHeader::Indirect) != 0;
+    DrawHeader& header = view.header;
+    header.seq = packed.seq;
+    header.pipeline = packed.pipeline;
+    header.draw_state = DrawStateCopy{
+        .topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(packed.topology),
+        .draw_mode = static_cast<Maxwell3D::DrawManager::DrawMode>(packed.draw_mode),
+        .draw_indexed = (packed.flags & CompactDrawHeader::DrawIndexed) != 0,
+        .draw_element_count = packed.draw_element_count,
+        .base_index = packed.base_index,
+        .vertex_buffer = packed.vertex_buffer,
+        .index_buffer = packed.index_buffer,
+        .base_instance = packed.base_instance,
+        .instance_count = packed.draw_instance_count,
+        .drawn_instances = packed.drawn_instances,
+    };
+    if (indirect) {
+        std::memcpy(&header.indirect_params, entry + 1 + CompactHeaderWords,
+                    sizeof(header.indirect_params));
+    }
+    header.instance_count = packed.instance_count;
+    header.is_indexed = (packed.flags & CompactDrawHeader::IsIndexed) != 0 ? 1 : 0;
+    header.native_turing = (packed.flags & CompactDrawHeader::NativeTuring) != 0 ? 1 : 0;
+    header.indirect = indirect ? 1 : 0;
+    header.inline_index_offset = packed.inline_index_offset;
+    header.inline_index_size = packed.inline_index_size;
+    header.num_ubo = packed.num_ubo;
+    header.num_upload = packed.num_upload;
+    header.blob_size = packed.blob_size;
+    header.batch = packed.batch;
+    header.layout_gen = packed.layout_gen;
+    header.num_ssbo = packed.num_ssbo;
+    header.num_geometry = packed.num_geometry;
+    header.tic_valid_words = packed.tic_valid_words;
+    const u64* cursor = entry + 1 + CompactHeaderWords + (indirect ? IndirectWords : 0);
+    std::span<const VideoCommon::MT::OverlayEntry> wire;
+    take(cursor, wire, packed.num_overlay);
+    take(cursor, view.ubos, packed.num_ubo);
+    take(cursor, view.uploads, packed.num_upload);
+    take(cursor, view.ssbos, packed.num_ssbo);
+    take(cursor, view.geometry, packed.num_geometry);
+    take(cursor, view.tic_valid, packed.tic_valid_words);
+    const std::span<const u16> refs{reinterpret_cast<const u16*>(cursor), packed.num_desc_refs};
+    cursor += (size_t{packed.num_desc_refs} * 2 + 7) / 8;
+    std::span<const u64> inserts;
+    take(cursor, inserts, packed.num_desc_inserts);
     view.blob = reinterpret_cast<const u8*>(cursor);
+    // References first (the replica as it was before this packet), then this packet's inserts.
+    decoder.Decode(wire, view.blob, refs);
+    decoder.ApplyInserts(wire, view.blob, inserts);
+    view.overlay = decoder.overlay;
+    view.overlay_blob = decoder.bytes.data();
+    header.num_overlay = static_cast<u32>(view.overlay.size());
     return view;
 }
 
+inline void Nx2DrawPipeline::SkipPacket(const u64* entry,
+                                        VideoCommon::MT::PacketDecoder& decoder) {
+    using VideoCommon::MT::GeometryEntry;
+    using VideoCommon::MT::OverlayEntry;
+    using VideoCommon::MT::SsboEntry;
+    using VideoCommon::MT::UboEntry;
+    using VideoCommon::MT::UploadEntry;
+    if (SpmcStream::HeaderAux(entry[0]) != CompactAux) {
+        // The old layout touches no descriptor replica; its uniform memos still count.
+        if (!decoder.uniform_kept) {
+            return;
+        }
+        DrawHeader header;
+        std::memcpy(&header, entry + 1, sizeof(header));
+        const u64* cursor = entry + 1 + DrawHeaderWords + header.num_overlay * sizeof(OverlayEntry) / 8;
+        const std::span<const UboEntry> ubos{reinterpret_cast<const UboEntry*>(cursor),
+                                             header.num_ubo};
+        cursor += (size_t{header.num_ubo} * sizeof(UboEntry) +
+                   size_t{header.num_upload} * sizeof(UploadEntry) +
+                   size_t{header.num_ssbo} * sizeof(SsboEntry) +
+                   size_t{header.num_geometry} * sizeof(GeometryEntry)) /
+                      8 +
+                  header.tic_valid_words;
+        decoder.ApplyUniforms(ubos, reinterpret_cast<const u8*>(cursor));
+        return;
+    }
+    CompactDrawHeader packed;
+    std::memcpy(&packed, entry + 1, sizeof(packed));
+    if (packed.num_desc_inserts == 0 && !decoder.uniform_kept) {
+        return;
+    }
+    const bool indirect = (packed.flags & CompactDrawHeader::Indirect) != 0;
+    const u64* cursor = entry + 1 + CompactHeaderWords + (indirect ? IndirectWords : 0);
+    const std::span<const OverlayEntry> wire{reinterpret_cast<const OverlayEntry*>(cursor),
+                                             packed.num_overlay};
+    cursor += size_t{packed.num_overlay} * sizeof(OverlayEntry) / 8;
+    const std::span<const UboEntry> ubos{reinterpret_cast<const UboEntry*>(cursor),
+                                         packed.num_ubo};
+    cursor += (size_t{packed.num_ubo} * sizeof(UboEntry) +
+               size_t{packed.num_upload} * sizeof(UploadEntry) +
+               size_t{packed.num_ssbo} * sizeof(SsboEntry) +
+               size_t{packed.num_geometry} * sizeof(GeometryEntry)) /
+                  8 +
+              packed.tic_valid_words + (size_t{packed.num_desc_refs} * 2 + 7) / 8;
+    const std::span<const u64> inserts{cursor, packed.num_desc_inserts};
+    cursor += packed.num_desc_inserts;
+    const u8* const blob_data = reinterpret_cast<const u8*>(cursor);
+    decoder.ApplyInserts(wire, blob_data, inserts);
+    decoder.ApplyUniforms(ubos, blob_data);
+}
+
 inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
-    const PacketView packet = ParsePacket(entry);
+    const PacketView packet = ParsePacket(entry, commit_decoder);
     const DrawHeader& header = packet.header;
     MT::ResolvedDraw* const res = WaitResolved(header);
     SCOPE_EXIT {
@@ -1902,7 +2319,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         mirror.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     }
     if (verify) {
-        VerifyDraw(header, overlay_span, ubo_span, upload_span, blob_data);
+        VerifyDraw(header, overlay_span, ubo_span, upload_span, blob_data, packet.overlay_blob);
     }
     r.FlushWork();
     VideoCommon::MT::CaptureView view{
@@ -1912,6 +2329,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         .verify = verify,
         .ubo_memo = ubo_memo_bytes.get(),
         .cpu_write_since = verify_cpu_writes_since.load(std::memory_order_acquire),
+        .overlay_blob = packet.overlay_blob,
     };
     {
         // EDEN_NX2_MT_LOCKSCOPE: the uploads under the buffer mutex, then ConfigureDrawPipeline
@@ -2059,7 +2477,7 @@ inline void Nx2DrawPipeline::VerifyDraw(const DrawHeader& header,
                                         std::span<const VideoCommon::MT::OverlayEntry> overlay_span,
                                         std::span<const VideoCommon::MT::UboEntry> ubo_span,
                                         std::span<const VideoCommon::MT::UploadEntry> upload_span,
-                                        const u8* blob_data) {
+                                        const u8* blob_data, const u8* overlay_blob) {
     // The sequencer waits for this packet (lockstep): its state equals the capture's.
     counters.verify_checks.fetch_add(1, std::memory_order_relaxed);
     VerifyMirror("draw");
@@ -2091,17 +2509,19 @@ inline void Nx2DrawPipeline::VerifyDraw(const DrawHeader& header,
         state.inline_index_draw_indexes.size() != header.inline_index_size) {
         VerifyReport(0x2001, fmt::format("draw {}: draw state differs", header.seq));
     }
-    VerifyCaptures(header.seq, overlay_span, ubo_span, upload_span, blob_data);
+    VerifyCaptures(header.seq, overlay_span, ubo_span, upload_span, blob_data, overlay_blob);
 }
 
 inline void Nx2DrawPipeline::VerifyCaptures(
     u64 seq, std::span<const VideoCommon::MT::OverlayEntry> overlay_span,
     std::span<const VideoCommon::MT::UboEntry> ubo_span,
-    std::span<const VideoCommon::MT::UploadEntry> upload_span, const u8* blob_data) {
+    std::span<const VideoCommon::MT::UploadEntry> upload_span, const u8* blob_data,
+    const u8* overlay_blob) {
     struct {
         u64 seq;
     } header{seq};
     std::vector<u8> bytes;
+    const u8* const overlay_bytes = overlay_blob != nullptr ? overlay_blob : blob_data;
     // Bytes that differ from the capture are a capture bug unless a guest CPU thread wrote them
     // since (the sequencer waits for this packet; the game's threads don't): its write trap
     // marked them CPU-modified in the buffer tracker.
@@ -2116,7 +2536,7 @@ inline void Nx2DrawPipeline::VerifyCaptures(
     for (const auto& entry : overlay_span) {
         bytes.resize(entry.size);
         rasterizer.gpu_memory->ReadBlockUnsafe(entry.gpu_addr, bytes.data(), entry.size);
-        if (std::memcmp(bytes.data(), blob_data + entry.offset, entry.size) != 0) {
+        if (std::memcmp(bytes.data(), overlay_bytes + entry.offset, entry.size) != 0) {
             const auto device_addr = rasterizer.gpu_memory->GpuToCpuAddress(entry.gpu_addr);
             if (device_addr && written_by_cpu(*device_addr, entry.size)) {
                 counters.verify_cpu_writes.fetch_add(1, std::memory_order_relaxed);
@@ -2340,6 +2760,11 @@ inline void Nx2DrawPipeline::SeqCacheInvalidations(
 namespace Vulkan {
 
 inline void Nx2DrawPipeline::ClearCapture() {
+    compact_packet = false;
+    desc_refs.clear();
+    desc_inserts.clear();
+    blob_ubo_bytes = 0;
+    blob_upload_bytes = 0;
     raw_reads.clear();
     raw_bytes.clear();
     overlay.clear();

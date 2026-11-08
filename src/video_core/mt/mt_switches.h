@@ -127,23 +127,6 @@ namespace VideoCommon::MT {
     return on;
 }
 
-/// EDEN_NX2_MT_COMPACT (on): compact draw packets (variable-length header, uniform bytes in a
-/// side arena with sequencer-side dedupe, packed entries).
-[[nodiscard]] inline bool CompactPackets() {
-    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_COMPACT");
-    static const bool on = Tegra::Nx2Switch(mode, true);
-    return on;
-}
-
-/// EDEN_NX2_MT_FLUSHCMD (on): flush/invalidate requests on the sequencer skip the committer
-/// when a sequencer-side check finds nothing to do, and invalidations run there or as ordered
-/// Commands; Serial only when GPU data must reach guest memory first.
-[[nodiscard]] inline bool FlushCommands() {
-    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_FLUSHCMD");
-    static const bool on = Tegra::Nx2Switch(mode, true);
-    return on;
-}
-
 /// EDEN_NX2_MT_REPLAY (on): the committer's scheduler records go into per-render-pass POD op
 /// lists (one scheduler record per list), with bind elision; =2 also checks the order the
 /// worker runs the ops in. =0 off.
@@ -156,6 +139,16 @@ namespace VideoCommon::MT {
         return Tegra::Nx2Switch(mode, true) ? 1u : 0u;
     }();
     return level;
+}
+
+/// EDEN_NX2_MT_COMPACT (on under EDEN_NX2_MT): smaller draw packets (packet_compact.h): a
+/// compact header, TIC/TSC entries referenced from stream-ordered replicas instead of re-sent,
+/// and streamed uniform buffers sent as "same as the slot's last bytes" or as changed 64-byte
+/// chunks. =0: today's layout.
+[[nodiscard]] inline bool Compact() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_COMPACT");
+    static const bool on = Enabled() && Tegra::Nx2Switch(mode, true);
+    return on;
 }
 
 /// EDEN_NX2_MT_RCHECK=1: resolver-side asserts (role, guard held, ring overrun, consistency of

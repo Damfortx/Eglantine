@@ -26,6 +26,9 @@ static_assert(sizeof(OverlayEntry) == 16);
 /// A uniform buffer bind: streamed from these bytes (staged) or bound from the cache (cached;
 /// its CPU-modified bytes travel as uploads). EDEN_NX2_MT_UBO_GEN: staged == 2 streams the bytes
 /// the committer kept for the slot; `memo` != 0 on a staged == 1 entry makes it keep these.
+/// EDEN_NX2_MT_COMPACT: staged == 3 is a patch of the kept bytes (a u64 mask of changed
+/// UboPatchChunk-byte chunks, then those chunks, at `offset`); the committer applies it before
+/// anything reads the packet, so it streams the kept bytes like staged == 2.
 struct UboEntry {
     u8 stage;
     u8 index;
@@ -68,6 +71,8 @@ struct CaptureView {
     /// capture misses), and the syncs it explained.
     u64 cpu_write_since = 0;
     mutable u64 concurrent_cpu_syncs = 0;
+    /// EDEN_NX2_MT_COMPACT: the overlay's bytes when they are not in `blob` (a decoded packet).
+    const u8* overlay_blob = nullptr;
 
     /// Copies [gpu_addr, +size) when one entry holds all of it.
     [[nodiscard]] bool Read(u64 gpu_addr, void* out, size_t size) const noexcept {
@@ -81,13 +86,14 @@ struct CaptureView {
         if (gpu_addr + size > entry.gpu_addr + entry.size) {
             return false;
         }
-        std::memcpy(out, blob + entry.offset + (gpu_addr - entry.gpu_addr), size);
+        const u8* const base = overlay_blob != nullptr ? overlay_blob : blob;
+        std::memcpy(out, base + entry.offset + (gpu_addr - entry.gpu_addr), size);
         return true;
     }
 
     /// A staged uniform buffer's bytes.
     [[nodiscard]] const u8* UboBytes(const UboEntry& entry) const noexcept {
-        if (entry.staged == 2) {
+        if (entry.staged >= 2) {
             return ubo_memo + (size_t{entry.stage} * UboMemoSlots + entry.index) * UboMemoBytes;
         }
         return blob + entry.offset;
@@ -96,6 +102,9 @@ struct CaptureView {
     static constexpr size_t UboMemoStages = 6; ///< 5 graphics stages and compute
     static constexpr size_t UboMemoSlots = 18;
     static constexpr size_t UboMemoBytes = 4096;
+    /// EDEN_NX2_MT_COMPACT patches: 64 chunks (one u64 mask) cover UboMemoBytes.
+    static constexpr size_t UboPatchChunk = 64;
+    static_assert(UboMemoBytes / UboPatchChunk <= 64);
 
     [[nodiscard]] const UboEntry* FindUbo(u32 stage, u32 index) const noexcept {
         for (const UboEntry& entry : ubos) {
