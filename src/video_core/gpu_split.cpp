@@ -670,7 +670,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
         g_back_busy.store(true, std::memory_order_relaxed);
-        const auto busy_begin = std::chrono::steady_clock::now();
+        // The A/B windows' busy time (Tegra::Nx2AltOn): only timed while they are logged.
+        static const bool time_busy = std::getenv("EDEN_NX2_ALT_SECONDS") != nullptr;
+        const auto busy_begin = time_busy ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size = Execute(&ring[index]);
@@ -690,7 +693,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         g_back_busy.store(false, std::memory_order_release);
-        Tegra::g_nx2_back_busy_ns.fetch_add(
+        if (time_busy) Tegra::g_nx2_back_busy_ns.fetch_add(
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - busy_begin)
                                  .count()),

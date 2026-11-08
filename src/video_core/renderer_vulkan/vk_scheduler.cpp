@@ -15,6 +15,7 @@
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
+#include "common/cpu_features.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -64,7 +65,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
     AllocateNewContext();
-    last_flush = std::chrono::steady_clock::now();
+    last_flush_ns = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
     flush_pending = false;
     return signal_value;
 }
@@ -80,7 +81,8 @@ bool Scheduler::DeferFlush() {
         return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
     }();
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
-        std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
+        static_cast<u64>(Common::g_wall_clock.GetTimeNS().count()) - last_flush_ns >=
+            static_cast<u64>(interval_us) * 1000) {
         return false;
     }
     flush_pending = true;

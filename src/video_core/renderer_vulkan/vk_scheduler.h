@@ -214,7 +214,7 @@ public:
     std::mutex submit_mutex;
 
 private:
-    std::chrono::steady_clock::time_point last_flush{};
+    u64 last_flush_ns{}; ///< Common::g_wall_clock (the host counter: steady_clock cost ~2% of the back)
     bool flush_pending{};
 
     class Command {
