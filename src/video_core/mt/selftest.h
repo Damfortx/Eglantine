@@ -18,6 +18,7 @@
 #include "video_core/mt/engine_ptr.h"
 #include "video_core/mt/epoch.h"
 #include "video_core/mt/reg_delta.h"
+#include "video_core/mt/selftest_phase5.h"
 #include "video_core/mt/spmc_stream.h"
 #include "video_core/mt/stable_slot_vector.h"
 
@@ -347,6 +348,13 @@ inline void Run() {
         Test{"stable_slot_vector+epoch", SlotVectorTest}, Test{"atomic_flags", FlagsTest},
         Test{"ring_arena", ArenaTest}, Test{"engine_ptr", EnginePtrTest},
         Test{"reg_write_set", RegSetTest},
+        Test{"p5_t1_slot_ebr", SlotEbrStressTest},
+        Test{"p5_t2_multi_writer_map", MultiWriterMapStressTest},
+        Test{"p5_t3_buffer_model", BufferModelStressTest},
+        Test{"p5_t4_arena_worker", ArenaWorkerStressTest},
+        Test{"p5_t5_batch_publish", BatchPublishStressTest},
+        Test{"p5_t6_variant_array", VariantArrayStressTest},
+        Test{"p5_t7_barrier", BarrierStressTest},
     };
     bool all = true;
     for (const Test& test : tests) {
