@@ -1736,10 +1736,15 @@ private:
         // previous frame's fence instead and let the game prepare frame N+1 meanwhile (waiting
         // for this frame there cost 8-56 ms of every 34-105 ms frame, or never finished).
         // EDEN_NX2_FRAMES_AHEAD=1 always waits for the previous frame, =0 always for this one.
-        static const int frames_ahead_setting = [] {
+        static const char frames_ahead_mode = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
-            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+            return value == nullptr ? 'd' : value[0];
         }();
+        // =a alternates between 1 and the default (A/B windows, Tegra::Nx2AltOn).
+        const int frames_ahead_setting = frames_ahead_mode == 'd'   ? -1
+                                         : frames_ahead_mode == 'a' ? (Tegra::Nx2AltOn() ? 1 : -1)
+                                         : frames_ahead_mode == '1' ? 1
+                                                                    : 0;
         // Donkey Kong Bananza's channels wait on each other every frame, so it always ran a frame
         // ahead, where it rewrote memory the GPU thread hadn't read yet (misread commands, then
         // a freeze or crash; rubberbanding while moving). Title 1 runs ahead without either.
@@ -1748,6 +1753,14 @@ private:
         if (frames_ahead == -1 &&
             system.GetApplicationProcessProgramID() == DonkeyKongBananzaProgramId) {
             frames_ahead = 0;
+        }
+        // Title 1 (Mario Kart World) waits for the previous frame: by default each present first
+        // waited for its own frame until a channel had been suspended for 3 ms, which in title 1
+        // is every frame (the ~3.2 ms "blocked on the GPU fence" floor). Over 35 adjacent 5 s
+        // windows of its attract demo: 9.4 more frames a second (+19%), no fence timeouts.
+        if (frames_ahead_mode == 'd' &&
+            system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
+            frames_ahead = 1;
         }
         const auto entered = std::chrono::steady_clock::now();
         if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
