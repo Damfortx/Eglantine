@@ -380,9 +380,14 @@ public:
     }
 
     /// Whether a release the front sent may still be on its way to `address`.
-    [[nodiscard]] bool HasPendingRelease(GPUVAddr address) {
+    /// `writes_only`: only releases that write their payload count (max releases, which can only
+    /// raise the word, are left out: for an acquire memory already meets, they change nothing).
+    [[nodiscard]] bool HasPendingRelease(GPUVAddr address, bool writes_only = false) {
         const auto it = pending_releases.find(address);
         if (it == pending_releases.end()) {
+            return false;
+        }
+        if (writes_only && it->second.at_least) {
             return false;
         }
         if (write_position - it->second.position > RingWords) {

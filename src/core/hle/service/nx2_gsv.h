@@ -1778,7 +1778,14 @@ private:
                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
                                         m_previous_fence_id, m_previous_fence_value);
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
-            if (gpu_behind) {
+            // With the GPU behind this second wait turns frames-ahead off exactly when the back is
+            // the limit. Not for title 1, whose command lists are copied at submit (no rewrite
+            // race): 2.7 more frames a second without it (median, 36 A/B windows).
+            // EDEN_NX2_AHEAD_STRICT=0/1 forces it (=a alternates).
+            static const char strict_mode = Tegra::Nx2EnvMode("EDEN_NX2_AHEAD_STRICT");
+            const bool strict_default =
+                system.GetApplicationProcessProgramID() != Settings::MarioKartWorldProgramId;
+            if (gpu_behind && Tegra::Nx2Switch(strict_mode, strict_default)) {
                 WaitForFrame(~w[22], w[24]);
             }
         } else if (frames_ahead == 0) {

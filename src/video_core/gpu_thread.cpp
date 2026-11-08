@@ -17,6 +17,7 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
+#include "video_core/nx2.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
@@ -74,11 +75,21 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    // The sleep held new command lists too (nothing is popped meanwhile).
+                    // 50 us instead of 1 ms: 2 more frames a second in title 1 (median, 35 A/B
+                    // windows). EDEN_NX2_PENDING_SLEEP_US sets it (=a alternates 1000/50).
+                    static const char sleep_mode = Tegra::Nx2EnvMode("EDEN_NX2_PENDING_SLEEP_US");
+                    static const long long sleep_us = [] {
+                        const char* text = std::getenv("EDEN_NX2_PENDING_SLEEP_US");
+                        return text != nullptr && text[0] != 'a' ? std::atoll(text) : 50LL;
+                    }();
+                    const long long this_sleep =
+                        sleep_mode == 'a' ? (Tegra::Nx2AltOn() ? 50LL : 1000LL) : sleep_us;
                     if (std::chrono::steady_clock::now() - last_progress <
                         std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        std::this_thread::sleep_for(std::chrono::microseconds{this_sleep});
                     }
                     continue;
                 }

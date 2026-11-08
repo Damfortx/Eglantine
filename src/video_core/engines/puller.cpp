@@ -90,7 +90,13 @@ std::optional<VideoCommon::GpuSplit::Prediction> PredictedRelease(DmaPusher& dma
 // for ~9,000 acquires a second, most of them already met (the front waited half its time).
 bool MetInMemory(DmaPusher& dma_pusher, GPUVAddr address, u32 value, bool wrapping) {
     auto& split = VideoCommon::GpuSplit::Get();
-    if (!split.Active() || !split.PredictAcquires() || split.HasPendingRelease(address)) {
+    // Max releases still queued can only raise the word: title 1 drained ~970 times a second for
+    // GEQ acquires memory already met, behind a queued QMD max release (EDEN_NX2_ACQUIRE_STATS).
+    // Off by default: no gain measured (-0.4 fps, +0.7 us a draw, medians of 36 A/B windows).
+    // EDEN_NX2_MAX_RELEASE_MET=1 leaves them out (=a alternates).
+    static const char max_mode = Tegra::Nx2EnvMode("EDEN_NX2_MAX_RELEASE_MET");
+    if (!split.Active() || !split.PredictAcquires() ||
+        split.HasPendingRelease(address, Tegra::Nx2Switch(max_mode, false))) {
         return false;
     }
     const u32 current = dma_pusher.memory_manager.Read<u32>(address);
