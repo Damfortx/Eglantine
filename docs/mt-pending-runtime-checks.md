@@ -70,3 +70,56 @@ reports any MT wait > 2 s and stalled cursors, then kicks waiters: 0 reports in 
 | RCHECK=2 SHADOW=1 | 39.9 | 183 injected/s handled |
 | RCOMMIT=1 / +RCHECK=2 | 42.8 / 41.2 | committed == ok; screenshots not taken (window covered) |
 All runs: 120 s, clean "committer stopped", no exit hang.
+
+## Steps 3-6 (commits a71c376..a37157d on mkw-mt): one test round
+Commits: a71c376 RBUF (+ epoch guard for the trap-path slot reads), 0a7f905 COMPACT, d9cec9a
+FLUSHCMD, 10a4d2d REPLAY (+ t9/t10 selftests), a37157d RREFRESH. Nothing below was run in the
+emulator yet (compile + standalone TSan/ASan only).
+BIN=/home/appo/src/Eglantine-mt/build/pgo/bin/eden-cli, from /home/appo/src/eglantine-buildenv/tools
+(`./demo.sh $BIN 120 <tag>`, results in runs/cli-<tag>.out and runs/log-<tag>.txt). Every switch
+below is inert with EDEN_NX2_MT unset and ON by default under EDEN_NX2_MT=1:
+| switch | step | what =0 restores |
+|---|---|---|
+| EDEN_NX2_MT_RBUF | 3 | the committer runs ConfigureImpl's buffer half (texture half still resolved) |
+| EDEN_NX2_MT_COMPACT | 4 | the v2 packet layout (full TIC/TSC entries and uniform bytes, fixed header) |
+| EDEN_NX2_MT_FLUSHCMD | 5 | every FlushRegion/InvalidateRegion on the sequencer is a Serial |
+| EDEN_NX2_MT_REPLAY | 6 | one scheduler closure per record (=2: replay plus the worker-side segment order check) |
+| EDEN_NX2_MT_RREFRESH | extra | CPU-modified images make the resolve slow (view-not-clean) |
+Older ones still worth flipping when bisecting: EDEN_NX2_MT_RCOMMIT, EDEN_NX2_MT_COMPUTE=serial,
+EDEN_NX2_MT_ADAPTIVE, EDEN_NX2_MT_RESOLVERS=0.
+
+0. Standalone (any time, already PASS at commit time): `docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v /home/appo/src:/home/appo/src -w /home/appo/src/Eglantine-mt eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all`
+   -> RESULT: ALL PASS, sanitizer_reports=0 for tsan and asan; new: t8_uniform_ring (resolver ring
+   lifetime vs a simulated GPU), t9_packet_replica (compact TIC/TSC + uniform replicas, skipping
+   reader), t10_replay_arena (replay blocks, elision, worker order).
+1. Baseline, MT unset: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 ./demo.sh $BIN 120 s6-off` (expect ~47.9 fps; nothing new runs).
+2. VERIFY, everything on: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_VERIFY=1 EDEN_NX2_MT_STATS=1 ./demo.sh $BIN 120 s6-verify`;
+   `grep "MT verify\|MT stats\|MT draw packet\|MT resolved buffers\|MT replay\|MT stages" runs/cli-s6-verify.out`.
+   Expect 0 mismatches (compact packets: the decoded overlay and the kept uniform bytes are what
+   VERIFY compares with guest memory), "MT draw packet B" total ~1 KB (header/overlay/ubo bytes
+   split), "order errors 0" is only checked with REPLAY=2 (item 6).
+3. Shadow (resolver payload incl. the buffer half vs the old path): `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_SHADOW=1 EDEN_NX2_MT_STATS=1 ./demo.sh $BIN 120 s6-shadow`;
+   `grep "MT shadow\|MT resolvers\|MT resolved buffers" runs/cli-s6-shadow.out`: 0 "MT shadow:" lines
+   (new fields: 12 payload entry/count, 13 streamed uniform size).
+4. Free run, defaults, with stats: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_STATS=1 ./demo.sh $BIN 120 s6-free` + portal screenshot.
+   Look at: "MT resolved buffers/s" (committed ~= resolver ok; reasons left to the committer;
+   ring MB/s and reuse), "MT resolvers/s" (view-not-clean should drop with RREFRESH; commit wait
+   ms), "MT stages ... flush: skipped/commands/serial" and the serial list in "MT stats" (flush and
+   invalidate Serials should mostly go), "MT replay /s" (draws/segment, elided records),
+   "MT draw packet B" and "B avg".
+5. The fps number: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 ./demo.sh $BIN 120 s6-fps` vs step 1 and the earlier 42.8 (RESOLVERS=2 + RCOMMIT).
+6. Replay order check: 4 with `EDEN_NX2_MT_REPLAY=2` (tag s6-replay2): "order errors 0" in "MT replay /s".
+7. Bisect (only if 2-6 show a problem or a loss): 4 with one switch at 0 per run, tags
+   s6-rbuf0 (EDEN_NX2_MT_RBUF=0), s6-compact0, s6-flushcmd0, s6-replay0, s6-rrefresh0; picture
+   problems first with REPLAY=0 and RBUF=0 (they change what is recorded), hangs with FLUSHCMD=0
+   (it changes what the sequencer waits for).
+8. Fault injection, everything on: 4 with `EDEN_NX2_MT_RCHECK=2` (tag s6-rcheck2): picture identical,
+   no "resolved slot" lines; RCHECK=1 also reports "uniform binding(s) held another buffer" (should be 0).
+Known risks to watch in this round: RBUF replaces ConfigureImpl's buffer half on the fast path
+(a missed side effect shows as wrong geometry/uniforms: compare with s6-rbuf0); COMPACT relies on
+every reader applying every draw packet's inserts/uniform patches in stream order (a divergence
+shows as VERIFY "overlay misses"/"uniform buffer changed" or SHADOW mismatches: compare with
+s6-compact0); FLUSHCMD's texture skip relies on texture page bits plus "no draw/compute in flight"
+(stale CPU reads of render targets would show as wrong pictures in readbacks: s6-flushcmd0);
+REPLAY elides repeated state inside a segment (state bugs: s6-replay0); RREFRESH uploads CPU-
+modified images at commit (stale textures: s6-rrefresh0).
