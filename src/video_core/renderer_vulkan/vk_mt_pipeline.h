@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "common/logging.h"
@@ -113,6 +114,10 @@ struct Counters {
     std::atomic<u64> ubo_gen_hits{};
     std::atomic<u64> ubo_gen_misses{};
     std::atomic<u64> ubo_gen_unprotected{};
+    // Stage times (EDEN_NX2_MT_STATS), ns.
+    std::atomic<u64> seq_capture_ns{};
+    std::atomic<u64> wait_committed_ns{};
+    std::atomic<u64> committer_idle_ns{};
     std::array<std::atomic<u64>, 16> forced_serial{};
 };
 
@@ -660,6 +665,17 @@ inline void Nx2DrawPipeline::WaitCommitted() {
         return;
     }
     counters.wait_committed.fetch_add(1, std::memory_order_relaxed);
+    const bool timed = VideoCommon::MT::Stats();
+    const auto begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    SCOPE_EXIT {
+        if (timed) {
+            counters.wait_committed_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - begin)
+                                     .count()),
+                std::memory_order_relaxed);
+        }
+    };
     for (u32 spins = 0; spins < 4096; ++spins) {
         if (stream.ConsumerPosition(consumer) >= target) {
             return;
@@ -857,6 +873,17 @@ inline void Nx2DrawPipeline::CommitterLoop(std::stop_token stop) {
 }
 
 inline void Nx2DrawPipeline::Idle(std::stop_token& stop) {
+    const bool timed = VideoCommon::MT::Stats();
+    const auto begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    SCOPE_EXIT {
+        if (timed) {
+            counters.committer_idle_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - begin)
+                                     .count()),
+                std::memory_order_relaxed);
+        }
+    };
     for (u32 spins = 0; spins < 4096; ++spins) {
         if (stream.Peek(consumer) != nullptr || stop.stop_requested()) {
             return;
@@ -1023,6 +1050,22 @@ inline void Nx2DrawPipeline::LogStats() {
              static_cast<double>(take(counters.verify_checks)) / seconds,
              counters.verify_mismatches.load(std::memory_order_relaxed),
              counters.verify_cpu_writes.load(std::memory_order_relaxed));
+    // Per-stage time (ms per second of wall time) and the phase 6/7 paths.
+    const auto ms = [&](std::atomic<u64>& value) {
+        return static_cast<double>(take(value)) / 1e6 / seconds;
+    };
+    const double stream_ms = static_cast<double>(std::exchange(stream.space_wait_ns, 0)) / 1e6 / seconds;
+    LOG_INFO(Render_Vulkan,
+             "MT stages ms/s: sequencer draws {:.1f} (waits: wait-committed {:.1f}, stream full "
+             "{:.1f}) | committer idle {:.1f} | buffer-mutex invalidations {:.0f}/s, dma serial "
+             "{:.0f}/s | ubo gen: hits {:.0f}/s, misses {:.0f}/s, unprotected {:.0f}/s",
+             ms(counters.seq_capture_ns), ms(counters.wait_committed_ns), stream_ms,
+             ms(counters.committer_idle_ns),
+             static_cast<double>(take(counters.seq_mutex_writes)) / seconds,
+             static_cast<double>(take(counters.dma_serial)) / seconds,
+             static_cast<double>(take(counters.ubo_gen_hits)) / seconds,
+             static_cast<double>(take(counters.ubo_gen_misses)) / seconds,
+             static_cast<double>(take(counters.ubo_gen_unprotected)) / seconds);
 }
 
 } // namespace Vulkan
@@ -1411,6 +1454,18 @@ inline void Nx2DrawPipeline::SeqDraw(bool is_indexed, u32 instance_count,
     // The draw's sync requests (CPU reads, composites) run on the committer after it.
     SCOPE_EXIT {
         r.gpu.TickWork();
+    };
+    const bool timed = VideoCommon::MT::Stats();
+    const auto begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    SCOPE_EXIT {
+        if (timed) {
+            // Capture and emit (Serial waits included; they are also counted on their own).
+            counters.seq_capture_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - begin)
+                                     .count()),
+                std::memory_order_relaxed);
+        }
     };
     const auto serial_draw = [&] {
         if (indirect != nullptr) {

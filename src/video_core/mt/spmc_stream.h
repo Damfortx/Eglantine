@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <bit>
 #include <memory>
 #include <thread>
@@ -183,10 +184,20 @@ private:
         if (write_pos + total_words - reclaimed <= capacity) {
             return;
         }
+        std::chrono::steady_clock::time_point begin{};
         for (u32 spins = 0;; ++spins) {
             reclaimed = SlowestCursor();
             if (write_pos + total_words - reclaimed <= capacity) {
+                if (spins != 0) {
+                    space_wait_ns += static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count());
+                }
                 return;
+            }
+            if (spins == 0) {
+                begin = std::chrono::steady_clock::now();
             }
             if (spins > 64) {
                 std::this_thread::yield();
@@ -203,6 +214,11 @@ private:
     const size_t mask;
     std::unique_ptr<u64[]> words;
 
+public:
+    /// Producer-owned: time the producer waited for ring space (MT_STATS).
+    u64 space_wait_ns = 0;
+
+private:
     // Producer-owned.
     u64 write_pos = 0;
     u64 reclaimed = 0;

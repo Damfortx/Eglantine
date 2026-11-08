@@ -62,6 +62,7 @@
 #include "video_core/mt/mirror_3d.h"
 #include "video_core/renderer_vulkan/vk_mt_pipeline.h"
 #include "video_core/renderer_vulkan/vk_mt_seq.h"
+#include "video_core/renderer_vulkan/vk_gpu_timestamps.h"
 
 // The multithreaded back's routing (vk_mt_pipeline.h): on the sequencer, run the call on the
 // committer and wait (Serial) or queue it there (Command). Elsewhere these do nothing.
@@ -1847,6 +1848,9 @@ void RasterizerVulkan::FlushCommands() {
 }
 
 void RasterizerVulkan::TickFrame() {
+    if (Nx2GpuTimestamps::Enabled()) {
+        Nx2GpuTimestamps::Get().NoteFrame();
+    }
     draw_counter = 0;
     pipeline_cache.TickFrame();
     guest_descriptor_queue.TickFrame();
