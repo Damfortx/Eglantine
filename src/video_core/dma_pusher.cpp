@@ -818,7 +818,7 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
                                      VideoCommon::CacheType::BufferCache)) {
         // The download records into the Vulkan scheduler, which the split's back owns: a drained
         // back still submits from its idle hook, so the front must not flush these pages itself.
-        VideoCommon::GpuSplit::Get().Run(
+        VideoCommon::GpuSplit::Get().RunFlush(
             [memory = &memory_manager, first_page, size = end_page - first_page] {
                 memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
             },

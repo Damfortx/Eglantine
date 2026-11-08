@@ -92,7 +92,7 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
                                                           VideoCommon::CacheType::BufferCache)) {
         NotePullerSite(PullerSite::ReadFlush, true);
         // The flush downloads through the Vulkan scheduler, which the split's back owns.
-        VideoCommon::GpuSplit::Get().Run([rasterizer = dma_pusher.rasterizer, device = *device] {
+        VideoCommon::GpuSplit::Get().RunFlush([rasterizer = dma_pusher.rasterizer, device = *device] {
             rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
         }, VideoCommon::GpuSplit::DrainReason::Puller);
     }

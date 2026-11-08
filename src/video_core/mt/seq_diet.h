@@ -45,6 +45,35 @@ namespace SeqDietDetail {
     }();
     return on;
 }
+/// EDEN_NX2_MT_FLUSHCMD (on): cache flushes and invalidations on the sequencer skip the Serial
+/// when nothing can need them, run as ordered Commands where the sequencer reads no result, and
+/// stay Serial otherwise (vk_mt_seq.h, SeqFlushRegion / SeqInvalidateRegion).
+[[nodiscard]] inline bool FlushCommands() {
+    static const bool on = SeqDietDetail::Switch("EDEN_NX2_MT_FLUSHCMD", true);
+    return on;
+}
+
+/// Sequencer: set while a function the split's front deferred and then drains for runs
+/// (GpuSplit::RunFlush). The front reads the flushed memory only once the committer passed the
+/// drain's mark, and the sequencer gets nothing else to run before that: a flush may be queued
+/// as a Command instead of waited for.
+inline thread_local bool t_flush_async = false;
+
+class AsyncFlushScope {
+public:
+    AsyncFlushScope() noexcept : saved{t_flush_async} {
+        t_flush_async = true;
+    }
+    ~AsyncFlushScope() {
+        t_flush_async = saved;
+    }
+    AsyncFlushScope(const AsyncFlushScope&) = delete;
+    AsyncFlushScope& operator=(const AsyncFlushScope&) = delete;
+
+private:
+    bool saved;
+};
+
 /// EDEN_NX2_MT_UBO_GEN (off): reuse a uniform buffer's last staging while its pages are unchanged.
 [[nodiscard]] inline bool UboGen() {
     static const bool on = SeqDietDetail::Switch("EDEN_NX2_MT_UBO_GEN", false);

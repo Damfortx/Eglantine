@@ -18,6 +18,7 @@
 
 #include "common/common_types.h"
 #include "video_core/nx2.h"
+#include "video_core/mt/seq_diet.h"
 
 namespace Core {
 class System;
@@ -331,6 +332,22 @@ public:
             return;
         }
         Defer(func);
+        Drain(reason);
+    }
+    /// As Run, for a `func` that ends with a cache flush whose memory the caller reads after
+    /// this returns. Deferred, the drain waits for the committer to pass its mark (MtActive), so
+    /// the multithreaded back may queue the flush instead of waiting (EDEN_NX2_MT_FLUSHCMD).
+    /// Inline (on the back or without the split), the flush stays synchronous.
+    template <typename Func>
+    void RunFlush(const Func& func, DrainReason reason = DrainReason::Other) {
+        if (on_back_thread || !active) {
+            func();
+            return;
+        }
+        Defer([func] {
+            const MT::AsyncFlushScope scope;
+            func();
+        });
         Drain(reason);
     }
 

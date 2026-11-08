@@ -48,6 +48,7 @@
 #include "video_core/mt/spmc_stream.h"
 #include "video_core/mt/tracker_lock.h"
 #include "video_core/mt/wait_watch.h"
+#include "video_core/cache_types.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2.h"
 #include "video_core/shader_handle_program.h"
@@ -123,6 +124,13 @@ struct Counters {
     std::atomic<u64> ubo_gen_hits{};
     std::atomic<u64> ubo_gen_misses{};
     std::atomic<u64> ubo_gen_unprotected{};
+    // EDEN_NX2_MT_FLUSHCMD (vk_mt_seq.h).
+    std::atomic<u64> flush_skipped{};      ///< FlushRegion on the sequencer: nothing to flush
+    std::atomic<u64> flush_commands{};     ///< ... queued (the front drains for it)
+    std::atomic<u64> flush_serials{};      ///< ... waited for (Serial)
+    std::atomic<u64> inval_sequencer{};    ///< InvalidateRegion handled on the sequencer
+    std::atomic<u64> inval_tex_commands{}; ///< ... with a texture cache Command
+    std::atomic<u64> inval_owner_serials{}; ///< SeqInvalidateBuffers' Serial (GPU data pages)
     // Draw packet bytes by part (EDEN_NX2_MT_STATS), and the EDEN_NX2_MT_COMPACT decisions.
     std::atomic<u64> pkt_header_bytes{};
     std::atomic<u64> pkt_overlay_bytes{}; ///< entries, bytes, slot references and inserts
@@ -250,6 +258,7 @@ public:
         std::memcpy(out + 3, &func, sizeof(Func));
         stream.Commit();
         Count(counters.commands, kind);
+        NoteAsyncWork(kind);
         if (lockstep) {
             WaitCommitted();
         }
@@ -282,6 +291,14 @@ public:
     /// RasterizerVulkan::DispatchCompute on the sequencer: Serial, or a ComputePacket with
     /// EDEN_NX2_MT_COMPUTE=packet.
     void SeqDispatch();
+    /// RasterizerVulkan::FlushRegion on the sequencer (EDEN_NX2_MT_FLUSHCMD): nothing when no
+    /// cache can hold GPU data to download there, a Command when `may_queue` and the front
+    /// drains for it (t_flush_async), else a Serial.
+    void SeqFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which, bool may_queue);
+    /// RasterizerVulkan::InvalidateRegion on the sequencer (EDEN_NX2_MT_FLUSHCMD): the buffer
+    /// tracker and shader cache here, the texture and query caches as ordered Commands, a Serial
+    /// only for pages holding GPU-written buffer data (SeqInvalidateBuffers).
+    void SeqInvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which);
     /// RasterizerVulkan::InnerInvalidation on the sequencer (FlushCaching).
     void SeqInnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences);
 
@@ -626,6 +643,30 @@ private:
     u32 blob_ubo_bytes = 0;
     u32 blob_upload_bytes = 0;
     u64 last_query_position = 0;
+    /// EDEN_NX2_MT_FLUSHCMD: stream end after the last entry the committer runs later that may
+    /// add GPU-written data the sequencer can't see yet. Buffers: Commands other than the
+    /// kinds below (draw and compute packets mark their written ranges at capture). Images:
+    /// those and every draw/compute packet (render targets and storage images are registered
+    /// and marked GPU-modified at commit). Serial items are done when they return.
+    u64 seq_async_buffer_position = 0;
+    u64 seq_async_image_position = 0;
+    void NoteAsyncWork(MT::Kind kind) {
+        switch (kind) {
+        case MT::Kind::Uniform:          // records a binding
+        case MT::Kind::Query:            // query cache (guarded by last_query_position)
+        case MT::Kind::Barrier:          // barriers, flushes of the scheduler
+        case MT::Kind::FlushRegion:      // downloads (only clear GPU-modified state)
+        case MT::Kind::InvalidateRegion: // marks images CPU-modified
+            return;
+        default:
+            seq_async_buffer_position = stream.WritePosition();
+            seq_async_image_position = seq_async_buffer_position;
+            return;
+        }
+    }
+    void NoteAsyncImageWork() {
+        seq_async_image_position = stream.WritePosition();
+    }
 
 public:
     /// Sequencer: a query report was just emitted.
@@ -1415,14 +1456,22 @@ inline void Nx2DrawPipeline::LogStats() {
     LOG_INFO(Render_Vulkan,
              "MT stages ms/s: sequencer draws {:.1f} (waits: wait-committed {:.1f}, stream full "
              "{:.1f}) | committer idle {:.1f} | buffer-mutex invalidations {:.0f}/s, dma serial "
-             "{:.0f}/s | ubo gen: hits {:.0f}/s, misses {:.0f}/s, unprotected {:.0f}/s",
+             "{:.0f}/s | ubo gen: hits {:.0f}/s, misses {:.0f}/s, unprotected {:.0f}/s | flush: "
+             "skipped {:.0f}/s, commands {:.0f}/s, serial {:.0f}/s | invalidate: sequencer "
+             "{:.0f}/s, texture commands {:.0f}/s, gpu-page serial {:.0f}/s",
              ms(counters.seq_capture_ns), ms(counters.wait_committed_ns), stream_ms,
              ms(counters.committer_idle_ns),
              static_cast<double>(take(counters.seq_mutex_writes)) / seconds,
              static_cast<double>(take(counters.dma_serial)) / seconds,
              static_cast<double>(take(counters.ubo_gen_hits)) / seconds,
              static_cast<double>(take(counters.ubo_gen_misses)) / seconds,
-             static_cast<double>(take(counters.ubo_gen_unprotected)) / seconds);
+             static_cast<double>(take(counters.ubo_gen_unprotected)) / seconds,
+             static_cast<double>(take(counters.flush_skipped)) / seconds,
+             static_cast<double>(take(counters.flush_commands)) / seconds,
+             static_cast<double>(take(counters.flush_serials)) / seconds,
+             static_cast<double>(take(counters.inval_sequencer)) / seconds,
+             static_cast<double>(take(counters.inval_tex_commands)) / seconds,
+             static_cast<double>(take(counters.inval_owner_serials)) / seconds);
     {
         // Average draw packet bytes by part (EDEN_NX2_MT_COMPACT decisions per second).
         const double draws = packets != 0 ? static_cast<double>(packets) : 1.0;
@@ -2058,6 +2107,7 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     }
     std::memcpy(cursor, blob.data(), blob.size());
     stream.Commit();
+    NoteAsyncImageWork();
     counters.packets.fetch_add(1, std::memory_order_relaxed);
     counters.packet_words.fetch_add(words, std::memory_order_relaxed);
     if (VideoCommon::MT::Stats()) {
@@ -2725,6 +2775,7 @@ inline void Nx2DrawPipeline::SeqInvalidateBuffers(
         }
     }
     if (!owner_ranges.empty()) {
+        counters.inval_owner_serials.fetch_add(1, std::memory_order_relaxed);
         Serial(MT::Kind::InvalidateRegion, [&] {
             std::scoped_lock lock{r.buffer_cache.mutex};
             for (const auto& [addr, size] : owner_ranges) {
@@ -3041,6 +3092,7 @@ inline void Nx2DrawPipeline::EmitCompute(ComputePipeline* pipeline, u64 native_k
     cursor += upload_words;
     std::memcpy(cursor, blob.data(), blob.size());
     stream.Commit();
+    NoteAsyncImageWork();
     counters.compute_packets.fetch_add(1, std::memory_order_relaxed);
     counters.packet_words.fetch_add(words, std::memory_order_relaxed);
     if (lockstep) {

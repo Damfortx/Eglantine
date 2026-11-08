@@ -132,6 +132,9 @@ namespace VideoCommon::MT {
 /// worker runs the ops in. =0 off.
 [[nodiscard]] inline u32 Replay() {
     static const u32 level = [] {
+        if (!Enabled()) {
+            return 0u;
+        }
         const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_REPLAY");
         if (mode == '2') {
             return 2u;

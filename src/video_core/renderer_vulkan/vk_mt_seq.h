@@ -25,6 +25,30 @@ inline bool SeqGpuModified(BufferCache& buffer_cache, DAddr device_addr, u64 siz
     SeqTrackerLock lock{buffer_cache};
     return buffer_cache.IsRegionGpuModified(device_addr, size);
 }
+/// Whether the buffer cache may hold GPU-modified data in the range now. On Switch 2 the page
+/// bits are checked first without the lock (IsRegionGpuModified's own EDEN_NX2_GPU_MODIFIED_FAST
+/// test: GPU-modified ranges only lie on pages marked GPU-written, never cleared; the sequencer
+/// marks them itself at capture, the committer before a Serial returns or a Command the caller
+/// guards with seq_async_buffer_position).
+inline bool SeqMayHoldGpuBufferData(BufferCache& buffer_cache, DAddr device_addr, u64 size) {
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && size != 0) {
+        static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_GPU_MODIFIED_FAST");
+        if (Tegra::Nx2Switch(mode, true)) {
+            bool written = false;
+            for (DAddr page = device_addr & ~DAddr{Core::DEVICE_PAGEMASK};
+                 page < device_addr + size; page += Core::DEVICE_PAGESIZE) {
+                if (Tegra::Nx2IsGpuWritten(page)) {
+                    written = true;
+                    break;
+                }
+            }
+            if (!written) {
+                return false;
+            }
+        }
+    }
+    return SeqGpuModified(buffer_cache, device_addr, size);
+}
 } // namespace MTDetail
 
 inline Nx2DrawPipeline::HeapUploads* Nx2DrawPipeline::TakeHeapUploads(
@@ -445,6 +469,114 @@ inline bool Nx2DrawPipeline::SeqDmaClear(GPUVAddr dst_address, u64 amount, u32 v
     };
     Command(MT::Kind::Dma, DmaClearCommand{&r, dst_address, amount, value});
     return true;
+}
+
+// ---- Flushes and invalidations (EDEN_NX2_MT_FLUSHCMD) ----
+
+inline void Nx2DrawPipeline::SeqFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which,
+                                            bool may_queue) {
+    using VideoCommon::CacheType;
+    RasterizerVulkan& r = rasterizer;
+    if (!VideoCommon::MT::FlushCommands()) {
+        Serial(MT::Kind::FlushRegion, [&] { r.FlushRegion(addr, size, which); });
+        return;
+    }
+    // FlushRegion only downloads GPU-written data: the query cache's pending results, the
+    // buffer cache's GPU-modified ranges and GPU-modified images. Each part is needed when such
+    // data may lie in the range now, or may appear there from work the committer has not run
+    // yet (positions read once, first: a later read only sees more consumed).
+    const u64 consumed = stream.ConsumerPosition(consumer);
+    bool needed = false;
+    if (True(which & CacheType::QueryCache)) {
+        // As SeqInnerInvalidation: pages that ever held a query, or reports still in flight.
+        needed = consumed < last_query_position ||
+                 Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, addr, size);
+    }
+    if (!needed && True(which & CacheType::BufferCache)) {
+        needed = consumed < seq_async_buffer_position ||
+                 MTDetail::SeqMayHoldGpuBufferData(r.buffer_cache, addr, size);
+    }
+    if (!needed && True(which & CacheType::TextureCache)) {
+        if (consumed < seq_async_image_position) {
+            // A draw/compute packet or Command in flight may still register or render an image
+            // over the range (its page bits are set at registration, on the committer).
+            needed = true;
+        } else if (Tegra::Nx2MayHoldTexture(addr, size)) {
+            // Every image the range can hold is registered: ask the cache (DownloadMemory only
+            // takes GPU-modified images).
+            std::scoped_lock lock{r.texture_cache.mutex};
+            needed = r.texture_cache.IsRegionGpuModified(addr, size);
+        }
+    }
+    if (!needed) {
+        counters.flush_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (may_queue && VideoCommon::MT::t_flush_async) {
+        // GpuSplit::RunFlush: the front waits for the committer to pass the drain's mark behind
+        // this Command before it reads, and queues nothing before that.
+        struct FlushCommand {
+            RasterizerVulkan* r;
+            DAddr addr;
+            u64 size;
+            CacheType which;
+            void operator()() const {
+                r->FlushRegion(addr, size, which);
+            }
+        };
+        counters.flush_commands.fetch_add(1, std::memory_order_relaxed);
+        Command(MT::Kind::FlushRegion, FlushCommand{&r, addr, size, which});
+        return;
+    }
+    // The caller reads the memory next.
+    counters.flush_serials.fetch_add(1, std::memory_order_relaxed);
+    Serial(MT::Kind::FlushRegion, [&] { r.FlushRegion(addr, size, which); });
+}
+
+inline void Nx2DrawPipeline::SeqInvalidateRegion(DAddr addr, u64 size,
+                                                 VideoCommon::CacheType which) {
+    using VideoCommon::CacheType;
+    RasterizerVulkan& r = rasterizer;
+    if (!VideoCommon::MT::FlushCommands()) {
+        Serial(MT::Kind::InvalidateRegion, [&] { r.InvalidateRegion(addr, size, which); });
+        return;
+    }
+    counters.inval_sequencer.fetch_add(1, std::memory_order_relaxed);
+    const u64 consumed = stream.ConsumerPosition(consumer);
+    // Images belong to the committer and nothing on the sequencer reads their state: marking
+    // them CPU-modified in stream order is what the Serial did, after everything before. Skipped
+    // only when no image can lie on the range, now or from work still in flight.
+    if (True(which & CacheType::TextureCache) &&
+        (consumed < seq_async_image_position || Tegra::Nx2MayHoldTexture(addr, size))) {
+        struct TextureInvalidation {
+            RasterizerVulkan* r;
+            DAddr addr;
+            u64 size;
+            void operator()() const {
+                std::scoped_lock lock{r->texture_cache.mutex};
+                r->texture_cache.WriteMemory(addr, size);
+            }
+        };
+        counters.inval_tex_commands.fetch_add(1, std::memory_order_relaxed);
+        Command(MT::Kind::InvalidateRegion, TextureInvalidation{&r, addr, size});
+    }
+    // The buffer tracker here: the next capture must take the written bytes (phase 6). Pages
+    // holding GPU-written data still go to the committer as a Serial.
+    if (True(which & CacheType::BufferCache)) {
+        const std::pair<DAddr, std::size_t> region{addr, static_cast<std::size_t>(size)};
+        SeqInvalidateBuffers(std::span(&region, 1));
+    }
+    // Queries: as SeqInnerInvalidation.
+    if (True(which & CacheType::QueryCache) &&
+        (consumed < last_query_position ||
+         Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, addr, size))) {
+        Command(MT::Kind::Query,
+                [rp = &r, addr, size] { rp->query_cache.InvalidateRegion(addr, size); });
+    }
+    // Programs: the sequencer looks pipelines up (SeqDraw), as SeqInnerInvalidation.
+    if (True(which & CacheType::ShaderCache)) {
+        r.pipeline_cache.InvalidateRegion(addr, size);
+    }
 }
 
 } // namespace Vulkan

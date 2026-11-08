@@ -1427,7 +1427,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
     if (check) [[unlikely]] {
         if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-            split.Run([memory = &memory_manager, source, read_bytes] {
+            split.RunFlush([memory = &memory_manager, source, read_bytes] {
                 memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
             }, VideoCommon::GpuSplit::DrainReason::DmaRead);
         }
@@ -1459,7 +1459,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         // downloads it, which waits for the host GPU to finish everything (runtime.Finish), ms
         // each. EDEN_NX2_DMA_READ_WHY also logs these (count, time, why the read drained).
         const u64 begin = why ? VideoCommon::Nx2Profile::Now() : 0;
-        split.Run([memory = &memory_manager, source, read_bytes] {
+        split.RunFlush([memory = &memory_manager, source, read_bytes] {
             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
         }, VideoCommon::GpuSplit::DrainReason::DmaRead);
         if (why) [[unlikely]] {

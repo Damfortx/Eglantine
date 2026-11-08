@@ -1398,7 +1398,11 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     if (addr == 0 || size == 0) {
         return;
     }
-    MT_SERIAL(FlushRegion, FlushRegion(addr, size, which))
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        // Skipped, queued or Serial (vk_mt_seq.h; Serial with EDEN_NX2_MT_FLUSHCMD=0).
+        mt->SeqFlushRegion(addr, size, which, true);
+        return;
+    }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);
@@ -1501,7 +1505,12 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     if (addr == 0 || size == 0) {
         return;
     }
-    MT_SERIAL(InvalidateRegion, InvalidateRegion(addr, size, which))
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        // The buffer tracker and programs here, images and queries as Commands (vk_mt_seq.h;
+        // Serial with EDEN_NX2_MT_FLUSHCMD=0).
+        mt->SeqInvalidateRegion(addr, size, which);
+        return;
+    }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
@@ -1785,6 +1794,18 @@ void RasterizerVulkan::ReleaseFences(bool force) {
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
+    if (VideoCommon::MT::OnSequencer() && VideoCommon::MT::FlushCommands()) [[unlikely]] {
+        // The invalidation's buffer side runs here at once: the flush must not be queued behind
+        // it (GPU-modified ranges it drops would never be downloaded).
+        if (addr == 0 || size == 0) {
+            return;
+        }
+        if (Settings::IsGPULevelHigh()) {
+            mt->SeqFlushRegion(addr, size, which, false);
+        }
+        mt->SeqInvalidateRegion(addr, size, which);
+        return;
+    }
     MT_SERIAL(FlushRegion, FlushAndInvalidateRegion(addr, size, which))
     if (Settings::IsGPULevelHigh()) {
         FlushRegion(addr, size, which);
