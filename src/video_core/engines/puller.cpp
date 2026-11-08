@@ -308,14 +308,20 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (pending_acquire->Matches(current)) {
         return true;
     }
+    // EDEN_NX2_SUSPEND_LOG_MS: report suspensions after that many ms instead of 2 s.
+    static const auto report_after = [] {
+        const char* value = std::getenv("EDEN_NX2_SUSPEND_LOG_MS");
+        return std::chrono::milliseconds{value != nullptr ? std::atoll(value) : 2000};
+    }();
     if (!pending_acquire->reported &&
-        std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
+        std::chrono::steady_clock::now() - pending_acquire->since > report_after) {
         pending_acquire->reported = true;
         const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
-        LOG_WARNING(HW_GPU, "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s; "
+        LOG_WARNING(HW_GPU, "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for {} ms; "
                     "device {:#x}, buffer cache holds GPU data: {}, words {:08x} {:08x} {:08x} {:08x}",
                     dma_pusher.channel_state.bind_id, pending_acquire->address,
-                    pending_acquire->operation, pending_acquire->value, current, device.value_or(0),
+                    pending_acquire->operation, pending_acquire->value, current,
+                    report_after.count(), device.value_or(0),
                     device && dma_pusher.rasterizer->MustFlushRegion(*device, 16, VideoCommon::CacheType::All),
                     dma_pusher.memory_manager.Read<u32>(pending_acquire->address & ~GPUVAddr{0xf}),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 4),

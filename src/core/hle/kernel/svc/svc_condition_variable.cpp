@@ -8,6 +8,7 @@
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_wait_stats.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
@@ -41,6 +42,15 @@ Result WaitProcessWideKeyAtomic(Core::System& system, u64 address, u64 cv_key, u
     }
 
     // Wait on the condition variable.
+    if (WaitStats::Active(system.Kernel())) [[unlikely]] {
+        const auto begin = WaitStats::Clock::now();
+        const Result result = GetCurrentProcess(system.Kernel())
+            .WaitConditionVariable(address, Common::AlignDown(cv_key, sizeof(u32)), tag, timeout);
+        WaitStats::RecordAddress(system.Kernel(), WaitStats::Category::CondVar,
+                                 Common::AlignDown(cv_key, sizeof(u32)),
+                                 WaitStats::Clock::now() - begin, result == ResultTimedOut, "cv@");
+        R_RETURN(result);
+    }
     R_RETURN(
         GetCurrentProcess(system.Kernel())
             .WaitConditionVariable(address, Common::AlignDown(cv_key, sizeof(u32)), tag, timeout));

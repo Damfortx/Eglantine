@@ -8,6 +8,7 @@
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_wait_stats.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
@@ -69,6 +70,15 @@ Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_typ
         timeout = timeout_ns;
     }
 
+    if (WaitStats::Active(system.Kernel())) [[unlikely]] {
+        const auto begin = WaitStats::Clock::now();
+        const Result result =
+            GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout);
+        WaitStats::RecordAddress(system.Kernel(), WaitStats::Category::Arbiter, address,
+                                 WaitStats::Clock::now() - begin, result == ResultTimedOut,
+                                 "addr@");
+        R_RETURN(result);
+    }
     R_RETURN(
         GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout));
 }

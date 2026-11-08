@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -254,6 +256,10 @@ public:
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
                             std::span<const VideoCommon::SwizzleParameters> swizzles);
 
+    /// BC-encodes the decoded levels in `views` into one buffer and copies it into `image`.
+    void EncodeTranscoded(Image& image, const VideoCommon::ImageInfo& info, u32 width, u32 height, u32 levels,
+                          u32 layers, const std::vector<vk::ImageView>& views);
+
     /// Temporary decode images, reusable once the GPU is past `tick`.
     struct PendingTranscode {
         u64 tick;
@@ -268,6 +274,14 @@ public:
     std::deque<PendingTranscode> pending_transcodes;
     /// Decode images the GPU is done with, for the next texture of the same shape.
     std::vector<PendingTranscode> free_transcodes;
+    /// EDEN_NX2_TRANSCODE_PERSISTENT: one decode image per power-of-two size class, kept for good
+    /// and reused back to back (barriers order the uses), keyed by width << 32 | height.
+    struct PersistentDecode {
+        vk::Image image;
+        std::vector<vk::ImageView> views;
+        bool initialized{};
+    };
+    std::unordered_map<u64, PersistentDecode> persistent_decodes;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;

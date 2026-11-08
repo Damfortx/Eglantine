@@ -12,6 +12,7 @@
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
+#include "core/hle/kernel/k_wait_stats.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdata.h"
@@ -65,6 +66,7 @@ void NVDRV::Ioctl1(HLERequestContext& ctx) {
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);
+    Kernel::WaitStats::SetSubLabel(command.raw);
 
     if (!is_initialized) {
         ServiceError(ctx, NvResult::NotInitialized);
@@ -91,6 +93,7 @@ void NVDRV::Ioctl2(HLERequestContext& ctx) {
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);
+    Kernel::WaitStats::SetSubLabel(command.raw);
 
     if (!is_initialized) {
         ServiceError(ctx, NvResult::NotInitialized);
@@ -118,6 +121,7 @@ void NVDRV::Ioctl3(HLERequestContext& ctx) {
     const auto fd = rp.Pop<DeviceFD>();
     const auto command = rp.PopRaw<Ioctl>();
     LOG_DEBUG(Service_NVDRV, "called fd={}, ioctl={:#08x}", fd, command.raw);
+    Kernel::WaitStats::SetSubLabel(command.raw);
 
     if (!is_initialized) {
         ServiceError(ctx, NvResult::NotInitialized);

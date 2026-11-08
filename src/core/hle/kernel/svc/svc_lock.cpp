@@ -7,6 +7,7 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_wait_stats.h"
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel::Svc {
@@ -20,6 +21,14 @@ Result ArbitrateLock(Core::System& system, Handle thread_handle, u64 address, u3
     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
     R_UNLESS(Common::IsAligned(address, sizeof(u32)), ResultInvalidAddress);
 
+    if (WaitStats::Active(system.Kernel())) [[unlikely]] {
+        const auto begin = WaitStats::Clock::now();
+        const Result result =
+            KConditionVariable::WaitForAddress(system.Kernel(), thread_handle, address, tag);
+        WaitStats::RecordAddress(system.Kernel(), WaitStats::Category::Lock, address,
+                                 WaitStats::Clock::now() - begin, false, "mutex@");
+        R_RETURN(result);
+    }
     R_RETURN(KConditionVariable::WaitForAddress(system.Kernel(), thread_handle, address, tag));
 }
 

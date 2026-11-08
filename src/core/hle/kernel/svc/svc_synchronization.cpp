@@ -10,6 +10,7 @@
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
+#include "core/hle/kernel/k_wait_stats.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 
@@ -95,7 +96,13 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
     }
 
     // Wait on the objects.
+    const bool wait_stats = WaitStats::Active(system.Kernel());
+    const auto wait_begin = wait_stats ? WaitStats::Clock::now() : WaitStats::Clock::time_point{};
     Result res = KSynchronizationObject::Wait(system.Kernel(), out_index, objs.data(), num_handles, timeout);
+    if (wait_stats) [[unlikely]] {
+        WaitStats::RecordSync(system.Kernel(), objs.data(), num_handles,
+                              WaitStats::Clock::now() - wait_begin, res == ResultTimedOut);
+    }
 
     R_SUCCEED_IF(res == ResultSessionClosed);
     R_RETURN(res);

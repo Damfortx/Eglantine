@@ -4614,68 +4614,9 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
-void TextureCacheRuntime::TranscodeAstcToBcn(
-    Image& image, const StagingBufferRef& map,
-    std::span<const VideoCommon::SwizzleParameters> swizzles) {
-    const ImageInfo& info = image.info;
-    const u32 width = info.size.width;
-    const u32 height = info.size.height;
-    const u32 levels = static_cast<u32>(info.resources.levels);
-    const u32 layers = static_cast<u32>(info.resources.layers);
-    constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
-    // A decode image of the same shape the GPU is done with: title 1's title screen decodes
-    // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
-    // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
-    const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
-        return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
-    });
-    PendingTranscode pending;
-    if (reusable != free_transcodes.end()) {
-        pending = std::move(*reusable);
-        free_transcodes.erase(reusable);
-    } else {
-        pending = PendingTranscode{
-            .tick = 0,
-            .image = memory_allocator.CreateImage(VkImageCreateInfo{
-                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .imageType = VK_IMAGE_TYPE_2D,
-                .format = DecodeFormat,
-                .extent = {width, height, 1},
-                .mipLevels = levels,
-                .arrayLayers = layers,
-                .samples = VK_SAMPLE_COUNT_1_BIT,
-                .tiling = VK_IMAGE_TILING_OPTIMAL,
-                .usage = VK_IMAGE_USAGE_STORAGE_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .queueFamilyIndexCount = 0,
-                .pQueueFamilyIndices = nullptr,
-                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            }, true),
-            .views = {},
-            .width = width,
-            .height = height,
-            .levels = levels,
-            .layers = layers,
-            .unused_frames = 0,
-        };
-        for (u32 level = 0; level < levels; ++level) {
-            pending.views.push_back(
-                MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
-        }
-    }
-    astc_decoder_pass->AssembleInto(
-        info, 0, image.guest_size_bytes,
-        ASTCDecoderPass::Target{
-            .image = *pending.image,
-            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .initialized = false,
-            .level_view = [&pending](s32 level) { return *pending.views[level]; },
-            .wait = true,
-        },
-        map, swizzles);
-
+void TextureCacheRuntime::EncodeTranscoded(Image& image, const ImageInfo& info, u32 width,
+                                           u32 height, u32 levels, u32 layers,
+                                           const std::vector<vk::ImageView>& views) {
     // Encode every level into one buffer, then copy it into the image.
     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
@@ -4705,7 +4646,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     }
     const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
     for (u32 level = 0; level < levels; ++level) {
-        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
+        bc_encoder_pass->Encode(*views[level], copies[level].image_extent.width,
                                 copies[level].image_extent.height, layers, bc3, output.buffer,
                                 output.offset, total, copies[level].buffer_offset);
     }
@@ -4720,6 +4661,146 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                0, barrier);
     });
     image.UploadMemory(output.buffer, output.offset, copies);
+}
+
+void TextureCacheRuntime::TranscodeAstcToBcn(
+    Image& image, const StagingBufferRef& map,
+    std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    const ImageInfo& info = image.info;
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    const u32 levels = static_cast<u32>(info.resources.levels);
+    const u32 layers = static_cast<u32>(info.resources.layers);
+    constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    // A decode image of the same shape the GPU is done with: title 1's title screen decodes
+    // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
+    // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
+    // EDEN_NX2_TRANSCODE_CLASSES (=a alternates): decode into an image of the next power-of-two
+    // size class (at least 64) with its full mip chain instead of the texture's exact shape.
+    // Both passes work by extents. Title 1 streams textures of many sizes, so exact shapes kept
+    // allocating, and with VRAM nearly full each dedicated allocation took 20-200 ms on the back
+    // (the GPU stalled; the game's syncpoint waits timed out for up to seconds).
+    static const char classes_mode = Tegra::Nx2EnvMode("EDEN_NX2_TRANSCODE_CLASSES");
+    const bool use_classes = Tegra::Nx2Switch(classes_mode, false);
+    const u32 alloc_width = use_classes ? (std::max)(std::bit_ceil(width), 64U) : width;
+    const u32 alloc_height = use_classes ? (std::max)(std::bit_ceil(height), 64U) : height;
+    const u32 alloc_levels =
+        use_classes ? static_cast<u32>(std::bit_width((std::max)(alloc_width, alloc_height)))
+                    : levels;
+    // EDEN_NX2_TRANSCODE_PERSISTENT (on; =0 off, =a alternates): single-layer textures up to 4096 decode into
+    // a decode image of their size class that is never freed: no allocation after the first of
+    // each class. The decode's barrier (initialized) waits for the previous encode's reads.
+    static const char persistent_mode = Tegra::Nx2EnvMode("EDEN_NX2_TRANSCODE_PERSISTENT");
+    if (layers == 1 && Tegra::Nx2Switch(persistent_mode, true)) {
+        const u32 class_width = (std::max)(std::bit_ceil(width), 64U);
+        const u32 class_height = (std::max)(std::bit_ceil(height), 64U);
+        if (class_width <= 4096 && class_height <= 4096) {
+            const u32 class_levels =
+                static_cast<u32>(std::bit_width((std::max)(class_width, class_height)));
+            PersistentDecode& decode =
+                persistent_decodes[(u64{class_width} << 32) | class_height];
+            if (!decode.image) {
+                decode.image = memory_allocator.CreateImage(VkImageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .imageType = VK_IMAGE_TYPE_2D,
+                    .format = DecodeFormat,
+                    .extent = {class_width, class_height, 1},
+                    .mipLevels = class_levels,
+                    .arrayLayers = 1,
+                    .samples = VK_SAMPLE_COUNT_1_BIT,
+                    .tiling = VK_IMAGE_TILING_OPTIMAL,
+                    .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .queueFamilyIndexCount = 0,
+                    .pQueueFamilyIndices = nullptr,
+                    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                }, true);
+                for (u32 level = 0; level < class_levels; ++level) {
+                    decode.views.push_back(
+                        MakeStorageView(device.GetLogical(), level, *decode.image, DecodeFormat));
+                }
+            }
+            astc_decoder_pass->AssembleInto(
+                info, 0, image.guest_size_bytes,
+                ASTCDecoderPass::Target{
+                    .image = *decode.image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .initialized = decode.initialized,
+                    .level_view = [&decode](s32 level) { return *decode.views[level]; },
+                    .wait = true,
+                },
+                map, swizzles);
+            decode.initialized = true;
+            EncodeTranscoded(image, info, width, height, levels, layers, decode.views);
+            return;
+        }
+    }
+    const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
+        return t.width == alloc_width && t.height == alloc_height && t.levels == alloc_levels &&
+               t.layers == layers;
+    });
+    PendingTranscode pending;
+    if (reusable != free_transcodes.end()) {
+        pending = std::move(*reusable);
+        free_transcodes.erase(reusable);
+    } else {
+        const auto alloc_start = std::chrono::steady_clock::now();
+        const auto log_slow = [&] {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - alloc_start)
+                                .count();
+            if (ms >= 20) {
+                LOG_WARNING(Render_Vulkan, "ASTC transcode image {}x{} {} levels {} layers took {} ms "
+                            "to allocate ({} free shapes kept)",
+                            width, height, levels, layers, ms, free_transcodes.size());
+            }
+        };
+        pending = PendingTranscode{
+            .tick = 0,
+            .image = memory_allocator.CreateImage(VkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = DecodeFormat,
+                .extent = {alloc_width, alloc_height, 1},
+                .mipLevels = alloc_levels,
+                .arrayLayers = layers,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            }, true),
+            .views = {},
+            .width = alloc_width,
+            .height = alloc_height,
+            .levels = alloc_levels,
+            .layers = layers,
+            .unused_frames = 0,
+        };
+        for (u32 level = 0; level < alloc_levels; ++level) {
+            pending.views.push_back(
+                MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
+        }
+        log_slow();
+    }
+    astc_decoder_pass->AssembleInto(
+        info, 0, image.guest_size_bytes,
+        ASTCDecoderPass::Target{
+            .image = *pending.image,
+            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .initialized = false,
+            .level_view = [&pending](s32 level) { return *pending.views[level]; },
+            .wait = true,
+        },
+        map, swizzles);
+
+    EncodeTranscoded(image, info, width, height, levels, layers, pending.views);
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
 }

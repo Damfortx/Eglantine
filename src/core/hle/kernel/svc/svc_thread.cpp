@@ -14,6 +14,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/k_wait_stats.h"
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel::Svc {
@@ -155,6 +156,19 @@ void SleepThread(Core::System& system, s64 ns) {
     const auto yield_type = static_cast<Svc::YieldType>(ns);
 
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", ns);
+
+    const bool wait_stats = WaitStats::Active(kernel);
+    const auto wait_begin = wait_stats ? WaitStats::Clock::now() : WaitStats::Clock::time_point{};
+    SCOPE_EXIT {
+        if (wait_stats) [[unlikely]] {
+            // Sleeps by requested length; yields by type (0, -1, -2).
+            WaitStats::RecordAddress(kernel,
+                                     ns > 0 ? WaitStats::Category::Sleep
+                                            : WaitStats::Category::Yield,
+                                     static_cast<u64>(ns), WaitStats::Clock::now() - wait_begin,
+                                     false, ns > 0 ? "ns=" : "type=");
+        }
+    };
 
     // When the input tick is positive, sleep.
     if (ns > 0) {

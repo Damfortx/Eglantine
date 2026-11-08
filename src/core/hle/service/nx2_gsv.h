@@ -211,6 +211,9 @@ private:
     // Map nodes are stable, so a registered action can hold a reference to its request.
     struct SlotRequest {
         u32 syncpoint{};
+        u64 debug_value{}; ///< EDEN_NX2_SYNCPT_DEBUG
+        u32 debug_mode{};
+        std::chrono::steady_clock::time_point debug_since{};
         std::atomic<bool> pending{};
         Tegra::Host1x::SyncpointManager::ActionHandle handle{};
     };
@@ -242,12 +245,47 @@ private:
             return;
         }
         auto& request = m_requests[slot];
+        static const bool debug = std::getenv("EDEN_NX2_SYNCPT_DEBUG") != nullptr;
+        if (debug) {
+            // How each slot's requests end: replaced while pending, already met when made, or
+            // signalled later; and whether the event was still signalled (unconsumed) here.
+            static std::mutex stats_mutex;
+            static std::map<std::pair<u32, u32>, std::array<u64, 4>> stats;
+            static auto window = std::chrono::steady_clock::now();
+            std::scoped_lock lk{stats_mutex};
+            auto& st = stats[{slot, syncpoint}];
+            st[0]++;
+            if (request.pending.load()) {
+                st[1]++;
+            }
+            const u64 now_value = syncpoint < HostSyncpoints
+                                      ? system.Host1x().GetSyncpointManager()
+                                            .GetGuestSyncpointValue(syncpoint)
+                                      : 0;
+            if (static_cast<s32>(static_cast<u32>(now_value) - static_cast<u32>(value)) >= 0) {
+                st[2]++;
+            }
+            if (std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
+                std::string line;
+                for (const auto& [key, v] : stats) {
+                    line += fmt::format(" | slot {:#x} sp {}: {} requests, {} replaced pending, "
+                                        "{} already met",
+                                        key.first, key.second, v[0], v[1], v[2]);
+                }
+                LOG_INFO(Service, "nx2:syncpt requests in 10 s:{}", line);
+                stats.clear();
+                window = std::chrono::steady_clock::now();
+            }
+        }
         Cancel(request);
         // A new request starts unsignalled. Slots are reused by different client objects: title 1's
         // movie player got slot 0 after NVN's fence waits had left it signalled, took that as a
         // decoded frame and aborted when the decoder had none.
         event->Clear(system.Kernel());
         request.syncpoint = syncpoint;
+        request.debug_value = value;
+        request.debug_mode = mode;
+        request.debug_since = std::chrono::steady_clock::now();
         request.pending = true;
         auto& manager = system.Host1x().GetSyncpointManager();
         // The action runs on the GPU thread under the manager's lock, or inline if the value is
@@ -269,6 +307,22 @@ private:
         const u32 slot = ctx.CommandBuffer()[2];
         LOG_DEBUG(Service, "nx2:syncpt TIPC 202 slot={:#x}", slot);
         if (auto it = m_requests.find(slot); it != m_requests.end()) {
+            // EDEN_NX2_SYNCPT_DEBUG: a cancel of a still-pending request (the client's wait timed
+            // out) with the syncpoint's value against the requested one.
+            static const bool debug = std::getenv("EDEN_NX2_SYNCPT_DEBUG") != nullptr;
+            const bool was_pending = it->second.pending.load();
+            if (debug && was_pending) {
+                const u32 sp = it->second.syncpoint;
+                const u64 now = sp < HostSyncpoints ? system.Host1x().GetSyncpointManager()
+                                                          .GetGuestSyncpointValue(sp)
+                                                    : 0;
+                LOG_INFO(Service, "nx2:syncpt cancel of pending slot {:#x}: syncpoint {} wants {:#x} "
+                         "mode {}, now {:#x}, waited {} us",
+                         slot, sp, it->second.debug_value, it->second.debug_mode, now,
+                         std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - it->second.debug_since)
+                             .count());
+            }
             Cancel(it->second);
         }
         // nn::syncpt::sdk's cancel always waits on the slot's event after this reply, so a cancel

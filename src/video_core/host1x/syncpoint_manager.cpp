@@ -6,6 +6,15 @@
 
 #include "video_core/host1x/syncpoint_manager.h"
 
+#include <chrono>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <string>
+#include <pthread.h>
+#include <fmt/format.h>
+#include "common/logging.h"
+
 namespace Tegra {
 
 namespace Host1x {
@@ -57,8 +66,36 @@ void SyncpointManager::DeregisterHostAction(u32 syncpoint_id, const ActionHandle
     DeregisterAction(host_action_storage[syncpoint_id], handle);
 }
 
+// EDEN_NX2_SYNCPT_DEBUG: guest increments per syncpoint and host thread, every 10 s.
+static void NoteGuestIncrement(u32 syncpoint_id, u32 value) {
+    static const bool debug = std::getenv("EDEN_NX2_SYNCPT_DEBUG") != nullptr;
+    if (!debug) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::map<std::pair<u32, std::string>, std::pair<u64, u32>> counts;
+    static auto window = std::chrono::steady_clock::now();
+    char name[32]{};
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    std::scoped_lock lk{mutex};
+    auto& entry = counts[{syncpoint_id, name}];
+    ++entry.first;
+    entry.second = value;
+    if (std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
+        std::string line;
+        for (const auto& [key, v] : counts) {
+            line += fmt::format(" | sp {} by {}: {} (now {:#x})", key.first, key.second, v.first,
+                                v.second);
+        }
+        LOG_INFO(HW_GPU, "Syncpoint guest increments in 10 s:{}", line);
+        counts.clear();
+        window = std::chrono::steady_clock::now();
+    }
+}
+
 void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
     Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id]);
+    NoteGuestIncrement(syncpoint_id, syncpoints_guest[syncpoint_id].load());
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {

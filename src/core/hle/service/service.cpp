@@ -24,6 +24,7 @@
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/k_wait_stats.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/service.h"
@@ -264,8 +265,33 @@ void CountRequest(const std::string& service, u32 command, u32 type, u32 result)
 
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                HLERequestContext& ctx) {
+    // EDEN_NX2_WAIT_STATS: time from here (including the service lock) to the reply.
+    const bool wait_stats = Kernel::WaitStats::g_enabled;
+    const auto wait_begin =
+        wait_stats ? Kernel::WaitStats::Clock::now() : Kernel::WaitStats::Clock::time_point{};
+    if (wait_stats) [[unlikely]] {
+        Kernel::WaitStats::HleBegin();
+    }
     const auto guard = LockService();
     SCOPE_EXIT {
+        if (wait_stats) [[unlikely]] {
+            const u32 command = ctx.GetCommand();
+            const char* function = nullptr;
+            if (ctx.IsTipc()) {
+                if (const auto it = handlers_tipc.find(command); it != handlers_tipc.end()) {
+                    function = it->second.name;
+                }
+            } else if (ctx.GetCommandType() == IPC::CommandType::Request ||
+                       ctx.GetCommandType() == IPC::CommandType::RequestWithContext) {
+                if (const auto it = handlers.find(command); it != handlers.end()) {
+                    function = it->second.name;
+                }
+            } else {
+                function = "(control/close)";
+            }
+            Kernel::WaitStats::HleEnd(std::addressof(ctx.GetThread()), service_name, command,
+                                      function, Kernel::WaitStats::Clock::now() - wait_begin);
+        }
         const auto* cmd_buf = ctx.CommandBuffer();
         u32 result_word = 0;
         const u32 type = static_cast<u32>(ctx.GetCommandType());

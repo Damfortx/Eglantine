@@ -13,6 +13,7 @@
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_session.h"
+#include "core/hle/kernel/k_wait_stats.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 
@@ -30,6 +31,12 @@ Result SendSyncRequestImpl(KernelCore& kernel, uintptr_t message, size_t buffer_
     ASSERT(parent.IsNotNull());
 
     // Send the request.
+    if (WaitStats::Active(kernel)) [[unlikely]] {
+        const auto begin = WaitStats::Clock::now();
+        const Result result = session->SendSyncRequest(kernel, message, buffer_size);
+        WaitStats::RecordIpc(kernel, WaitStats::Clock::now() - begin);
+        R_RETURN(result);
+    }
     R_RETURN(session->SendSyncRequest(kernel, message, buffer_size));
 }
 
@@ -71,6 +78,16 @@ Result ReplyAndReceiveImpl(KernelCore& kernel, int32_t* out_index, uintptr_t mes
         }
 
         // Wait for a message.
+        const bool wait_stats = WaitStats::Active(kernel);
+        const auto wait_begin =
+            wait_stats ? WaitStats::Clock::now() : WaitStats::Clock::time_point{};
+        SCOPE_EXIT {
+            if (wait_stats) [[unlikely]] {
+                WaitStats::RecordAddress(kernel, WaitStats::Category::Receive,
+                                         static_cast<u64>(num_objects),
+                                         WaitStats::Clock::now() - wait_begin, false, "handles=");
+            }
+        };
         while (true) {
             // Wait for an object.
             s32 index;
