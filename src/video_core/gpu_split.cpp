@@ -489,6 +489,18 @@ void GpuSplit::Drain(DrainReason reason) {
                                            .count());
 }
 
+void GpuSplit::WaitForPosition(u64 position) {
+    FlushState();
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    if (consumed_cache >= position) {
+        return;
+    }
+    wait_target.store(position, std::memory_order_seq_cst);
+    Publish();
+    WaitConsumed(position);
+    wait_target.store(~u64{0}, std::memory_order_relaxed);
+}
+
 bool GpuSplit::WaitForWriters() {
     FlushState();
     const u64 target = std::min(last_writer_position, write_position);

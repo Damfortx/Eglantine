@@ -952,7 +952,9 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
 
 // Guest memory the back writes when it runs a method sent to it (GpuSplit::NotePendingWrite).
 void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
-                                u32 value) {
+                                u32 value, bool sent) {
+    const auto known = sent ? VideoCommon::GpuSplit::WriteKnown::Position
+                            : VideoCommon::GpuSplit::WriteKnown::Drain;
     if (method == MAXWELL3D_REG_INDEX(launch_dma)) [[unlikely]] {
         // An inline upload (I2M): its destination is written as the back runs the data words.
         const auto& upload = reinterpret_cast<const Upload::Registers&>(
@@ -961,7 +963,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
         const u64 lines = std::max<u32>(upload.line_count, 1);
         const u64 size = pitch ? u64{upload.dest.pitch} * (lines - 1) + upload.line_length_in
                                : ~u64{0} >> 1;
-        split.NotePendingWrite(pitch ? upload.dest.Address() : 0, size);
+        split.NotePendingWrite(pitch ? upload.dest.Address() : 0, size, known);
     }
     if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) [[unlikely]] {
         // Every report but an acquire writes up to 16 bytes there.
@@ -969,7 +971,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
             split.NotePendingWrite(
                 (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
                     fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)],
-                16);
+                16, known);
         }
     }
 }
@@ -1063,7 +1065,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
-    FrontNoteWrites(split, fs, method, value);
+    FrontNoteWrites(split, fs, method, value, true);
     if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) [[unlikely]] {
         // A release that writes its payload (no counter, no reduction): acquires on the front can
         // count on it before the back runs it (GpuSplit::PredictedRelease).
@@ -1151,7 +1153,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             if (!execution_mask[method]) {
                 continue;
             }
-            FrontNoteWrites(split, fs, method, value);
+            FrontNoteWrites(split, fs, method, value, false);
             switch (method) {
             case MAXWELL3D_REG_INDEX(shadow_ram_control):
                 fs.control = static_cast<Regs::ShadowRamControl>(argument);
@@ -1272,9 +1274,26 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             on_gpu_written = true;
         }
     }
-    const bool skipped =
-        !always_drain && !on_gpu_written && !split.OverlapsPendingWrite(source, read_bytes);
-    if (skipped) {
+    // A read under writes the front noted waits only until the back has run them (their
+    // positions), not for everything sent: title 1's ~235 such reads a second each waited ~1 ms
+    // for a full drain. Off by default: no stale read in ~60,000 checked (EDEN_NX2_DMA_READ_CHECK),
+    // 2,200 more draws a second, but 1.2 fewer frames (median, 36 windows).
+    // EDEN_NX2_DMA_READ_PARTIAL=1 turns it on (=a alternates).
+    static const char partial_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_PARTIAL");
+    const auto pending = split.PendingWritesFor(source, read_bytes);
+    const bool partial = !always_drain && !on_gpu_written && !pending.drain &&
+                         (pending.writers || pending.position != 0) &&
+                         Tegra::Nx2Switch(partial_mode, false);
+    const bool skipped = !always_drain && !on_gpu_written && !pending.drain &&
+                         !pending.writers && pending.position == 0;
+    if (partial) {
+        split.WaitForPosition(pending.position);
+        split.WaitForWriters();
+        if (check) [[unlikely]] {
+            memory_manager.ReadBlockUnsafe(source, before.data(), checked * sizeof(u32));
+            split.Drain(VideoCommon::GpuSplit::DrainReason::DmaRead);
+        }
+    } else if (skipped) {
         split.WaitForWriters();
         if (check) [[unlikely]] {
             // What the read sees without the drain, compared below with what it sees after one.
@@ -1297,8 +1316,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         changed += differs ? 1 : 0;
         gpu_pages += was_gpu_written ? 1 : 0;
         changed_cpu += differs && !was_gpu_written ? 1 : 0;
-        skips += skipped ? 1 : 0;
-        stale_skips += skipped && differs ? 1 : 0;
+        skips += skipped || partial ? 1 : 0;
+        stale_skips += (skipped || partial) && differs ? 1 : 0;
         if (std::chrono::steady_clock::now() - window > std::chrono::seconds{10}) {
             LOG_INFO(HW_GPU, "MME DMA reads: {} in 10 s, {} changed by the drain, {} on GPU-written "
                      "pages, {} changed on other pages, {} without a drain ({} of them stale); "

@@ -273,26 +273,6 @@ public:
     /// Guest memory a method sent to the back writes when it runs (inline uploads, reports): a
     /// front read of it must drain first. Cleared by Drain. Copy and compute engines are noted as
     /// writers instead (NoteWriter), their ranges aren't known here.
-    void NotePendingWrite(GPUVAddr address, u64 size) {
-        if (pending_write_count == pending_writes.size()) {
-            pending_write_overflow = true;
-            return;
-        }
-        pending_writes[pending_write_count++] = {address, address + size};
-    }
-    /// A range nothing sent may still write without a drain or the writers' wait first.
-    [[nodiscard]] bool OverlapsPendingWrite(GPUVAddr address, u64 size) const {
-        if (pending_write_overflow) {
-            return true;
-        }
-        for (size_t i = 0; i < pending_write_count; ++i) {
-            if (address < pending_writes[i].second && pending_writes[i].first < address + size) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     /// Ring positions: what the front has sent so far, and what the back has run.
     [[nodiscard]] u64 SentPosition() {
         FlushState();
@@ -301,6 +281,65 @@ public:
     [[nodiscard]] u64 ConsumedPosition() const {
         return consumed.load(std::memory_order_acquire);
     }
+
+    /// How a noted write is known to have run: once the back is past `position` (noted after
+    /// the entry that makes it was sent), with the copy and compute writers (WaitForWriters),
+    /// or only once everything sent so far has run.
+    enum class WriteKnown : u8 { Position, Writers, Drain };
+    void NotePendingWrite(GPUVAddr address, u64 size, WriteKnown known = WriteKnown::Position) {
+        if (pending_write_count == pending_writes.size()) {
+            // Drop the ones the back has run.
+            const u64 done = consumed.load(std::memory_order_acquire);
+            size_t kept = 0;
+            for (size_t i = 0; i < pending_write_count; ++i) {
+                if (pending_writes[i].known != WriteKnown::Position ||
+                    pending_writes[i].position > done) {
+                    pending_writes[kept++] = pending_writes[i];
+                }
+            }
+            pending_write_count = kept;
+            if (pending_write_count == pending_writes.size()) {
+                pending_write_overflow = true;
+                return;
+            }
+        }
+        const u64 position = known == WriteKnown::Position ? SentPosition() : 0;
+        pending_writes[pending_write_count++] = {address, address + size, position, known};
+    }
+    /// What a read of the range must wait for. `drain`: everything sent; else `writers` and
+    /// `position` (0: nothing).
+    struct ReadWait {
+        bool drain;
+        bool writers;
+        u64 position;
+    };
+    [[nodiscard]] ReadWait PendingWritesFor(GPUVAddr address, u64 size) const {
+        ReadWait wait{pending_write_overflow, false, 0};
+        for (size_t i = 0; i < pending_write_count && !wait.drain; ++i) {
+            const auto& write = pending_writes[i];
+            if (!(address < write.end && write.begin < address + size)) {
+                continue;
+            }
+            switch (write.known) {
+            case WriteKnown::Position:
+                wait.position = (std::max)(wait.position, write.position);
+                break;
+            case WriteKnown::Writers:
+                wait.writers = true;
+                break;
+            case WriteKnown::Drain:
+                wait.drain = true;
+                break;
+            }
+        }
+        return wait;
+    }
+    [[nodiscard]] bool OverlapsPendingWrite(GPUVAddr address, u64 size) const {
+        const ReadWait wait = PendingWritesFor(address, size);
+        return wait.drain || wait.writers || wait.position != 0;
+    }
+    /// Waits until the back has run everything sent before `position`.
+    void WaitForPosition(u64 position);
 
     /// A QMD release that adds `payload` to the word at `address` was just sent to the back.
     u64 noted_adds{}; ///< EDEN_NX2_ACQUIRE_STATS
@@ -444,7 +483,13 @@ private:
     std::array<u64, 2048> list{};
     size_t list_count{};
     Tegra::Engines::EngineInterface* list_engine{};
-    std::array<std::pair<GPUVAddr, GPUVAddr>, 256> pending_writes{};
+    struct PendingWrite {
+        GPUVAddr begin;
+        GPUVAddr end;
+        u64 position;
+        WriteKnown known;
+    };
+    std::array<PendingWrite, 256> pending_writes{};
     size_t pending_write_count{};
     bool pending_write_overflow{};
     u64 published_local{};

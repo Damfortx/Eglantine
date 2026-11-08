@@ -3392,7 +3392,8 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
-    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u32 value);
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u32 method, u32 value,
+                         bool sent);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;
