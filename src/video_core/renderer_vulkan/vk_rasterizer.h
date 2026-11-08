@@ -204,6 +204,7 @@ private:
     /// PrepareDraw from Configure to the query segment, under both cache locks.
     bool ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is_indexed);
     void RecordDraw(bool is_indexed, u32 instance_count);
+    void RecordDrawIndirect(const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams& params);
     void ClearBody(u32 layer_count);
     /// DispatchCompute from the cache locks on, with the pipeline looked up.
     void DispatchComputeBody(ComputePipeline* pipeline, u64 native_key);

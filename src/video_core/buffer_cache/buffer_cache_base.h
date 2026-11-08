@@ -46,6 +46,7 @@
 #include "video_core/mt/capture.h"
 #include "video_core/mt/role.h"
 #include "video_core/mt/stable_slot_vector.h"
+#include "video_core/mt/seq_diet.h"
 #include "video_core/mt/tracker_lock.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -284,6 +285,13 @@ public:
     [[nodiscard]] bool MtIsRegionRegistered(DAddr device_addr, u64 size);
     /// The stale marks MtTrapWrite queued (committer, `mutex` held).
     void MtApplyStaleRanges();
+    /// DMACopy's tracker side at capture (tracker_mutex held, destination not GPU-modified):
+    /// the source's GPU-written ranges move to the destination, returned in `intervals`.
+    void MtCaptureDmaCopy(DAddr src, DAddr dst, u64 amount,
+                          std::vector<std::pair<DAddr, u64>>& intervals);
+    /// DMACopy's buffer side on the committer (`mutex` held), the guest copy already made.
+    void MtCommitDmaCopy(DAddr src, DAddr dst, u64 amount,
+                         std::span<const std::pair<DAddr, u64>> intervals);
     [[nodiscard]] Common::SpinRecursiveMutex& MtTrackerMutex() noexcept {
         return tracker_mutex;
     }

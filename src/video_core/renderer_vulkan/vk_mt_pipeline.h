@@ -109,6 +109,7 @@ struct Counters {
     std::atomic<u64> verify_mismatches{};
     std::atomic<u64> verify_cpu_writes{};
     std::atomic<u64> seq_mutex_writes{};
+    std::atomic<u64> dma_serial{};
     std::array<std::atomic<u64>, 16> forced_serial{};
 };
 
@@ -213,8 +214,21 @@ public:
     /// Sends the registers written since the last call (and the binds kept outside them).
     void EmitDeltas();
 
+    using IndirectParams = Maxwell3D::DrawManager::IndirectParams;
     /// RasterizerVulkan::Draw on the sequencer: capture and emit a DrawPacket (or a Serial).
-    void SeqDraw(bool is_indexed, u32 instance_count);
+    /// `indirect`: DrawIndirect's parameters (EDEN_NX2_MT_INDIRECT).
+    void SeqDraw(bool is_indexed, u32 instance_count, const IndirectParams* indirect = nullptr);
+
+    // Phase 7 (vk_mt_seq.h): fewer Serial items.
+    /// AccelerateConditionalRendering: a Command when the answer is known here (EDEN_NX2_MT_COND).
+    bool SeqConditionalRendering();
+    /// DrawIndirect as a draw packet (EDEN_NX2_MT_INDIRECT).
+    void SeqDrawIndirect();
+    /// DrawTexture as a Command with its TIC/TSC entries (EDEN_NX2_MT_DRAWTEX).
+    void SeqDrawTexture();
+    /// AccelerateDMA::BufferCopy/BufferClear as Commands (EDEN_NX2_MT_DMA=packet).
+    bool SeqDmaCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
+    bool SeqDmaClear(GPUVAddr dst_address, u64 amount, u32 value);
     /// RasterizerVulkan::DispatchCompute on the sequencer: Serial, or a ComputePacket with
     /// EDEN_NX2_MT_COMPUTE=packet.
     void SeqDispatch();
@@ -274,10 +288,12 @@ private:
         u64 seq;
         GraphicsPipeline* pipeline;
         DrawStateCopy draw_state;
+        IndirectParams indirect_params;
         u32 instance_count;
         u8 is_indexed;
         u8 native_turing;
-        u8 pad[2];
+        u8 indirect;
+        u8 pad;
         u32 inline_index_offset;
         u32 inline_index_size;
         u32 num_overlay;
@@ -309,7 +325,7 @@ private:
     /// Copies the CPU-modified parts of a range the draw binds into the packet.
     void SeqTakeUploads(DAddr device_addr, u32 size);
     /// -1, or why this draw goes as a Serial (MT::ForcedSerialNames).
-    int CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed);
+    int CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed, const IndirectParams* indirect);
     /// The captured reads, sorted and merged, into the overlay (bytes in the blob).
     void FinishOverlay();
     void ClearCapture();
@@ -332,7 +348,15 @@ private:
                         std::span<const VideoCommon::MT::UboEntry> ubos,
                         std::span<const VideoCommon::MT::UploadEntry> uploads, const u8* blob);
     void ReportView(u64 seq, const VideoCommon::MT::CaptureView& view);
-    void EmitDraw(GraphicsPipeline* pipeline, bool is_indexed, u32 instance_count);
+    void EmitDraw(GraphicsPipeline* pipeline, bool is_indexed, u32 instance_count,
+                  const IndirectParams* indirect);
+    /// The CPU-modified parts of [device_addr, +size) as heap uploads for a Command (phase 7).
+    struct HeapUploads {
+        std::vector<VideoCommon::MT::UploadEntry> uploads;
+        std::vector<u8> blob;
+    };
+    [[nodiscard]] HeapUploads* TakeHeapUploads(std::span<const std::pair<DAddr, u32>> ranges);
+    void ApplyHeapUploads(HeapUploads* heap_uploads);
     void CommitDraw(const u64* entry);
     void VerifyDraw(const DrawHeader& header, std::span<const VideoCommon::MT::OverlayEntry> overlay,
                     std::span<const VideoCommon::MT::UboEntry> ubos,
@@ -388,6 +412,7 @@ private:
     std::vector<VideoCommon::MT::UploadEntry> uploads;
     std::vector<u8> blob;
     std::vector<std::pair<DAddr, u32>> taken_ranges;
+    std::vector<u8> dma_scratch;
     u64 last_query_position = 0;
 
 public:
@@ -1042,7 +1067,8 @@ inline void Nx2DrawPipeline::SeqTakeUploads(DAddr device_addr, u32 size) {
     });
 }
 
-inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed) {
+inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed,
+                                         const IndirectParams* indirect) {
     using Maxwell = Maxwell3D::Regs;
     Maxwell3D& real = *rasterizer.maxwell3d.Real();
     Tegra::MemoryManager& memory = *rasterizer.gpu_memory;
@@ -1161,6 +1187,18 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
     // Pass 2: the buffer tracker, in the order the committer synchronizes the bindings.
     MTDetail::SeqTrackerLock lock{rasterizer.buffer_cache};
     const auto& draw_state = real.draw_manager.draw_state;
+    if (indirect != nullptr) {
+        // BindHostDrawIndirectBuffers' synchronizations (the count first).
+        const auto take = [&](GPUVAddr gpu_addr, u64 size) {
+            if (const auto device_addr = memory.GpuToCpuAddress(gpu_addr); device_addr && size != 0) {
+                SeqTakeUploads(*device_addr, static_cast<u32>(size));
+            }
+        };
+        if (indirect->include_count) {
+            take(indirect->count_start_address, sizeof(u32));
+        }
+        take(indirect->indirect_start_address, indirect->buffer_size);
+    }
     if (is_indexed && draw_state.inline_index_draw_indexes.empty()) {
         const auto& index_buffer = draw_state.index_buffer;
         const GPUVAddr begin = index_buffer.StartAddress();
@@ -1279,7 +1317,7 @@ inline void Nx2DrawPipeline::FinishOverlay() {
 }
 
 inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexed,
-                                      u32 instance_count) {
+                                      u32 instance_count, const IndirectParams* indirect) {
     Maxwell3D& real = *rasterizer.maxwell3d.Real();
     const auto& state = real.draw_manager.draw_state;
     const u32 inline_offset = static_cast<u32>((blob.size() + 7) & ~size_t{7});
@@ -1315,6 +1353,10 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     };
     header.instance_count = instance_count;
     header.is_indexed = is_indexed ? 1 : 0;
+    if (indirect != nullptr) {
+        header.indirect = 1;
+        header.indirect_params = *indirect;
+    }
     header.native_turing = real.GetNativeMacroEngine().native_turing ? 1 : 0;
     header.inline_index_offset = inline_offset;
     header.inline_index_size = inline_size;
@@ -1340,13 +1382,18 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     }
 }
 
-inline void Nx2DrawPipeline::SeqDraw(bool is_indexed, u32 instance_count) {
+inline void Nx2DrawPipeline::SeqDraw(bool is_indexed, u32 instance_count,
+                                     const IndirectParams* indirect) {
     RasterizerVulkan& r = rasterizer;
     // The draw's sync requests (CPU reads, composites) run on the committer after it.
     SCOPE_EXIT {
         r.gpu.TickWork();
     };
     const auto serial_draw = [&] {
+        if (indirect != nullptr) {
+            Serial(MT::Kind::DrawIndirect, [&] { r.DrawIndirect(); });
+            return;
+        }
         Serial(MT::Kind::Draw, [&] {
             r.PrepareDraw(is_indexed, [&] { r.RecordDraw(is_indexed, instance_count); });
         });
@@ -1368,13 +1415,13 @@ inline void Nx2DrawPipeline::SeqDraw(bool is_indexed, u32 instance_count) {
     if (!r.MeshDrawAllowed(pipeline)) {
         return;
     }
-    const int reason = CaptureDraw(pipeline, is_indexed);
+    const int reason = CaptureDraw(pipeline, is_indexed, indirect);
     if (reason >= 0) {
         ForceSerialReason(static_cast<u32>(reason));
         serial_draw();
         return;
     }
-    EmitDraw(pipeline, is_indexed, instance_count);
+    EmitDraw(pipeline, is_indexed, instance_count, indirect);
 }
 
 inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
@@ -1447,12 +1494,24 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         };
         r.mesh_draw = header.pipeline->IsMeshPipeline();
         const bool is_indexed = header.is_indexed != 0;
+        const bool indirect = header.indirect != 0;
+        if (indirect) {
+            mirror.draw_manager.indirect_state = header.indirect_params;
+            r.buffer_cache.SetDrawIndirect(&mirror.draw_manager.indirect_state);
+        }
         try {
             if (r.ConfigureDrawPipeline(header.pipeline, is_indexed)) {
-                r.RecordDraw(is_indexed, header.instance_count);
+                if (indirect) {
+                    r.RecordDrawIndirect(mirror.draw_manager.indirect_state);
+                } else {
+                    r.RecordDraw(is_indexed, header.instance_count);
+                }
             }
         } catch (const std::exception& e) {
             LOG_ERROR(Render_Vulkan, "MT: draw packet threw: {}", e.what());
+        }
+        if (indirect) {
+            r.buffer_cache.SetDrawIndirect(nullptr);
         }
     }
     if (verify) {

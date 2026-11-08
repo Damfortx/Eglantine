@@ -202,6 +202,62 @@ typename BufferCache<P>::MtTrapResult BufferCache<P>::MtTrapWrite(DAddr device_a
 }
 
 template <class P>
+void BufferCache<P>::MtCaptureDmaCopy(DAddr src, DAddr dst, u64 amount,
+                                      std::vector<std::pair<DAddr, u64>>& intervals) {
+    MT::TrackerScope tracker_scope{tracker_mutex};
+    MT::BumpWriteGeneration(dst, amount);
+    gpu_modified_ranges.ForEachInRange(src, amount, [&](DAddr begin, DAddr end) {
+        intervals.emplace_back(dst + (begin - src), end - begin);
+    });
+    gpu_modified_ranges.Subtract(dst, amount);
+    for (const auto& [addr, size] : intervals) {
+        gpu_modified_ranges.Add(addr, size);
+        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+            Tegra::Nx2MarkGpuWritten(addr, size);
+        }
+    }
+    if (!intervals.empty()) {
+        memory_tracker.MarkRegionAsGpuModified(dst, amount);
+    }
+}
+
+template <class P>
+void BufferCache<P>::MtCommitDmaCopy(DAddr src, DAddr dst, u64 amount,
+                                     std::span<const std::pair<DAddr, u64>> intervals) {
+    ClearDownload(dst, amount);
+    MarkVertexBuffersStale(dst, amount);
+    BufferId buffer_a;
+    BufferId buffer_b;
+    do {
+        channel_state->has_deleted_buffers = false;
+        buffer_a = FindBuffer(src, static_cast<u32>(amount), false);
+        buffer_b = FindBuffer(dst, static_cast<u32>(amount), false);
+    } while (channel_state->has_deleted_buffers);
+    auto& src_buffer = slot_buffers[buffer_a];
+    auto& dest_buffer = slot_buffers[buffer_b];
+    // Their CPU-modified bytes were captured (MtApplyUploads): no SynchronizeBuffer.
+    std::array copies{BufferCopy{
+        .src_offset = src_buffer.Offset(src),
+        .dst_offset = dest_buffer.Offset(dst),
+        .size = amount,
+    }};
+    for (const auto& [addr, size] : intervals) {
+        QueueFenceDownload(addr, size);
+        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+            Nx2NoteListWrite(buffer_b, addr, size);
+        }
+    }
+    const auto& copy = copies[0];
+    src_buffer.MarkUsage(copy.src_offset, copy.size);
+    dest_buffer.MarkUsage(copy.dst_offset, copy.size);
+    runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+    if (!intervals.empty() &&
+        (Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate())) {
+        runtime.Finish();
+    }
+}
+
+template <class P>
 void BufferCache<P>::MtApplyStaleRanges() {
     if (!mt_stale_pending.load(std::memory_order_acquire)) {
         return;

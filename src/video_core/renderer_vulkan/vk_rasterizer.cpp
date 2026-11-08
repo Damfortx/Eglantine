@@ -61,6 +61,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/mt/mirror_3d.h"
 #include "video_core/renderer_vulkan/vk_mt_pipeline.h"
+#include "video_core/renderer_vulkan/vk_mt_seq.h"
 
 // The multithreaded back's routing (vk_mt_pipeline.h): on the sequencer, run the call on the
 // committer and wait (Serial) or queue it there (Command). Elsewhere these do nothing.
@@ -823,84 +824,93 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
-    MT_SERIAL(DrawIndirect, DrawIndirect())
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        mt->SeqDrawIndirect();
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
-    PrepareDraw(params.is_indexed, [this, &params] {
-        if (mesh_draw) {
-            // Indirect task/mesh draws would need vkCmdDrawMeshTasksIndirectEXT's layout.
-            static bool logged{};
-            if (!std::exchange(logged, true)) {
-                LOG_WARNING(Render_Vulkan, "Indirect task/mesh draw skipped");
+    PrepareDraw(params.is_indexed, [this, &params] { RecordDrawIndirect(params); });
+    buffer_cache.SetDrawIndirect(nullptr);
+}
+
+void RasterizerVulkan::RecordDrawIndirect(
+    const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams& params) {
+    if (mesh_draw) {
+        // Indirect task/mesh draws would need vkCmdDrawMeshTasksIndirectEXT's layout.
+        static bool logged{};
+        if (!std::exchange(logged, true)) {
+            LOG_WARNING(Render_Vulkan, "Indirect task/mesh draw skipped");
+        }
+        return;
+    }
+    const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
+    const auto& buffer = indirect_buffer.first;
+    const auto& offset = indirect_buffer.second;
+    if (params.is_byte_count) {
+        scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
+                          stride = params.stride](vk::CommandBuffer cmdbuf) {
+            if (scheduler.GraphicsPipelineMissing()) {
+                return;
             }
-            return;
-        }
-        const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
-        const auto& buffer = indirect_buffer.first;
-        const auto& offset = indirect_buffer.second;
-        if (params.is_byte_count) {
-            scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
-                              stride = params.stride](vk::CommandBuffer cmdbuf) {
-                if (scheduler.GraphicsPipelineMissing()) {
-                    return;
-                }
-                cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
-                                                static_cast<u32>(stride));
-            });
-            return;
-        }
-        if (params.include_count) {
-            const auto count = buffer_cache.GetDrawIndirectCount();
-            const auto& draw_buffer = count.first;
-            const auto& offset_base = count.second;
-            scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
-                              buffer_obj = buffer->Handle(), offset_base, offset,
-                              params](vk::CommandBuffer cmdbuf) {
-                if (scheduler.GraphicsPipelineMissing()) {
-                    return;
-                }
-                if (params.is_indexed) {
-                    cmdbuf.DrawIndexedIndirectCount(
-                        buffer_obj, offset, draw_buffer_obj, offset_base,
-                        static_cast<u32>(params.max_draw_counts), static_cast<u32>(params.stride));
-                } else {
-                    cmdbuf.DrawIndirectCount(buffer_obj, offset, draw_buffer_obj, offset_base,
-                                             static_cast<u32>(params.max_draw_counts),
-                                             static_cast<u32>(params.stride));
-                }
-            });
-            return;
-        }
-        scheduler.Record([this, buffer_obj = buffer->Handle(), offset, params](vk::CommandBuffer cmdbuf) {
+            cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
+                                            static_cast<u32>(stride));
+        });
+        return;
+    }
+    if (params.include_count) {
+        const auto count = buffer_cache.GetDrawIndirectCount();
+        const auto& draw_buffer = count.first;
+        const auto& offset_base = count.second;
+        scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
+                          buffer_obj = buffer->Handle(), offset_base, offset,
+                          params](vk::CommandBuffer cmdbuf) {
             if (scheduler.GraphicsPipelineMissing()) {
                 return;
             }
             if (params.is_indexed) {
-                cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
-                                           static_cast<u32>(params.max_draw_counts),
-                                           static_cast<u32>(params.stride));
+                cmdbuf.DrawIndexedIndirectCount(
+                    buffer_obj, offset, draw_buffer_obj, offset_base,
+                    static_cast<u32>(params.max_draw_counts), static_cast<u32>(params.stride));
             } else {
-                cmdbuf.DrawIndirect(buffer_obj, offset, static_cast<u32>(params.max_draw_counts),
-                                    static_cast<u32>(params.stride));
+                cmdbuf.DrawIndirectCount(buffer_obj, offset, draw_buffer_obj, offset_base,
+                                         static_cast<u32>(params.max_draw_counts),
+                                         static_cast<u32>(params.stride));
             }
         });
-
-        // Log indirect draw call
-        if (GPU::Logging::IsActive() &&
-            Settings::values.gpu_log_vulkan_calls.GetValue()) {
-            const std::string log_params = fmt::format("drawCount={}, stride={}",
-                params.max_draw_counts, params.stride);
-            GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
-                params.is_indexed ? "vkCmdDrawIndexedIndirect" : "vkCmdDrawIndirect",
-                log_params, VK_SUCCESS);
+        return;
+    }
+    scheduler.Record([this, buffer_obj = buffer->Handle(), offset, params](vk::CommandBuffer cmdbuf) {
+        if (scheduler.GraphicsPipelineMissing()) {
+            return;
+        }
+        if (params.is_indexed) {
+            cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
+                                       static_cast<u32>(params.max_draw_counts),
+                                       static_cast<u32>(params.stride));
+        } else {
+            cmdbuf.DrawIndirect(buffer_obj, offset, static_cast<u32>(params.max_draw_counts),
+                                static_cast<u32>(params.stride));
         }
     });
-    buffer_cache.SetDrawIndirect(nullptr);
+
+    // Log indirect draw call
+    if (GPU::Logging::IsActive() &&
+        Settings::values.gpu_log_vulkan_calls.GetValue()) {
+        const std::string log_params = fmt::format("drawCount={}, stride={}",
+            params.max_draw_counts, params.stride);
+        GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
+            params.is_indexed ? "vkCmdDrawIndexedIndirect" : "vkCmdDrawIndirect",
+            log_params, VK_SUCCESS);
+    }
 }
 
 void RasterizerVulkan::DrawTexture() {
-    MT_SERIAL(DrawTexture, DrawTexture())
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        mt->SeqDrawTexture();
+        return;
+    }
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -1855,7 +1865,9 @@ void RasterizerVulkan::TickFrame() {
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {
-    MT_SERIAL(ConditionalRendering, AccelerateConditionalRendering())
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        return mt->SeqConditionalRendering();
+    }
     gpu_memory->FlushCaching();
     return query_cache.AccelerateHostConditionalRendering();
 }
@@ -2076,8 +2088,7 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
     if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
-        return mt_pipeline->Serial(MT::Kind::Dma,
-                                   [&] { return BufferClear(src_address, amount, value); });
+        return mt_pipeline->SeqDmaClear(src_address, amount, value);
     }
     std::scoped_lock lock{buffer_cache.mutex};
     return buffer_cache.DMAClear(src_address, amount, value);
@@ -2085,8 +2096,7 @@ bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
     if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
-        return mt_pipeline->Serial(MT::Kind::Dma,
-                                   [&] { return BufferCopy(src_address, dest_address, amount); });
+        return mt_pipeline->SeqDmaCopy(src_address, dest_address, amount);
     }
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
