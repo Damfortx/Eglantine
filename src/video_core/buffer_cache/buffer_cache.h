@@ -891,6 +891,25 @@ void BufferCache<P>::PopAsyncBuffers() {
 
 template <class P>
 bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
+    // GPU-modified ranges only lie on pages marked GPU-written (Nx2MarkGpuWritten, never cleared,
+    // on Switch 2): title 1 asks for ~450,000 invalidated ranges a second, nearly all constant
+    // buffer words on pages the GPU never wrote, each a tree lookup.
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && size != 0) {
+        static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_GPU_MODIFIED_FAST");
+        if (Tegra::Nx2Switch(mode, true)) {
+            bool written = false;
+            for (DAddr page = addr & ~DAddr{DEVICE_PAGESIZE - 1}; page < addr + size;
+                 page += DEVICE_PAGESIZE) {
+                if (Tegra::Nx2IsGpuWritten(page)) {
+                    written = true;
+                    break;
+                }
+            }
+            if (!written) {
+                return false;
+            }
+        }
+    }
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
     return gpu_modified_ranges.Intersects(addr, size);
