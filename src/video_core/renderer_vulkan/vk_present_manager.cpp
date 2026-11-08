@@ -180,7 +180,12 @@ Frame* PresentManager::GetRenderFrame() {
     free_queue.pop_front();
 
     // Wait for the presentation to be finished so all frame resources are free
+    const bool stats = PresentStatsOn();
+    const u64 wait_start = stats ? PresentStatsNow() : 0;
     frame->present_done.Wait();
+    if (stats) {
+        PresentStatsAdd(PresentWait::Frame, wait_start);
+    }
     frame->present_done.Reset();
 
     return frame;
@@ -194,7 +199,12 @@ void PresentManager::Present(Frame* frame) {
             frame_cv.notify_one();
         });
     } else {
+        const bool stats = PresentStatsOn();
+        const u64 wait_start = stats ? PresentStatsNow() : 0;
         scheduler.WaitWorker();
+        if (stats) {
+            PresentStatsAdd(PresentWait::Worker, wait_start);
+        }
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }
@@ -566,8 +576,14 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     };
 
     // Submit the image copy/blit to the swapchain
+    const bool stats = PresentStatsOn();
     {
+        const u64 lock_start = stats ? PresentStatsNow() : 0;
         std::scoped_lock submit_lock{scheduler.submit_mutex};
+        if (stats) {
+            PresentStatsAdd(PresentWait::SubmitLock, lock_start);
+        }
+        const u64 submit_start = stats ? PresentStatsNow() : 0;
         switch (const VkResult result =
                     device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
         case VK_SUCCESS:
@@ -579,10 +595,16 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             vk::Check(result);
             break;
         }
+        if (stats) {
+            PresentStatsAdd(PresentWait::Submit, submit_start);
+        }
     }
 
     // Present
     swapchain.Present(render_semaphore);
+    if (stats) {
+        PresentStatsCountPresent();
+    }
 }
 
 } // namespace Vulkan

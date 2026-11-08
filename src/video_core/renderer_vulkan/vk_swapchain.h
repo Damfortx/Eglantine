@@ -20,6 +20,17 @@ namespace Vulkan {
 class Device;
 class Scheduler;
 
+/// EDEN_NX2_PRESENT_STATS: time the presenting thread spends blocked per present, by site:
+/// a = GetRenderFrame present_done fence, b = Present WaitWorker, c = vkAcquireNextImageKHR,
+/// d = frame pacing tick wait, e = present QueueSubmit + vkQueuePresentKHR (incl. submit_mutex).
+/// Logged as per-second averages every 10 s. Definitions live in vk_swapchain.cpp.
+enum class PresentWait : u32 { Frame, Worker, Acquire, Pacing, Submit, SubmitLock, PresentLock, PresentCall, Count };
+[[nodiscard]] bool PresentStatsOn();
+[[nodiscard]] u64 PresentStatsNow();
+void PresentStatsAdd(PresentWait site, u64 start_ns);
+/// Counts one present and logs the window when 10 s have passed.
+void PresentStatsCountPresent();
+
 class Swapchain {
 public:
     explicit Swapchain(
@@ -145,6 +156,8 @@ private:
     bool has_imm{false};
     bool has_mailbox{false};
     bool has_fifo_relaxed{false};
+    /// EDEN_NX2_PRESENT_MAILBOX, latched at swapchain creation (see CreateSwapchain).
+    bool force_mailbox{false};
 
     bool is_outdated{};
     bool is_suboptimal{};

@@ -6,16 +6,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 #ifdef __ANDROID__
 #include <android/api-level.h>
 #endif
 
+#include "common/cpu_features.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
@@ -41,8 +46,8 @@ VkSurfaceFormatKHR ChooseSwapSurfaceFormat(vk::Span<VkSurfaceFormatKHR> formats)
     return found != formats.end() ? *found : formats[0];
 }
 
-static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
-                                              bool has_fifo_relaxed) {
+static VkPresentModeKHR ChooseSwapPresentModeBase(bool has_imm, bool has_mailbox,
+                                                  bool has_fifo_relaxed) {
     // Mailbox doesn't lock the application like FIFO (vsync)
     // FIFO present mode locks the framerate to the monitor's refresh rate
     Settings::VSyncMode setting = [has_imm, has_mailbox]() {
@@ -90,6 +95,26 @@ static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
     }
 }
 
+// EDEN_NX2_PRESENT_MAILBOX: present a FIFO request with MAILBOX when the surface has it, so
+// vkAcquireNextImageKHR/vkQueuePresentKHR don't block on vblank (no tearing, frames may drop).
+// Not with frame generation, which relies on FIFO pacing.
+static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
+                                              bool has_fifo_relaxed, bool force_mailbox) {
+    const VkPresentModeKHR mode = ChooseSwapPresentModeBase(has_imm, has_mailbox, has_fifo_relaxed);
+    if (force_mailbox && has_mailbox && !Settings::values.frame_gen.GetValue() &&
+        (mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    }
+    return mode;
+}
+
+struct PresentStatsState {
+    std::array<std::atomic<u64>, static_cast<size_t>(PresentWait::Count)> ns{};
+    std::atomic<u64> presents{};
+    std::atomic<u64> window_start{};
+};
+PresentStatsState g_present_stats;
+
 VkExtent2D ChooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities, u32 width, u32 height) {
     constexpr auto undefined_size{(std::numeric_limits<u32>::max)()};
     if (capabilities.currentExtent.width != undefined_size) {
@@ -116,6 +141,46 @@ VkCompositeAlphaFlagBitsKHR ChooseAlphaFlags(const VkSurfaceCapabilitiesKHR& cap
 }
 
 } // Anonymous namespace
+
+bool PresentStatsOn() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_PRESENT_STATS");
+    return Tegra::Nx2Switch(mode, false);
+}
+
+u64 PresentStatsNow() {
+    return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+}
+
+void PresentStatsAdd(PresentWait site, u64 start_ns) {
+    g_present_stats.ns[static_cast<size_t>(site)].fetch_add(PresentStatsNow() - start_ns,
+                                                            std::memory_order_relaxed);
+}
+
+void PresentStatsCountPresent() {
+    constexpr u64 window_ns = 10'000'000'000ULL;
+    const u64 now = PresentStatsNow();
+    g_present_stats.presents.fetch_add(1, std::memory_order_relaxed);
+    u64 start = g_present_stats.window_start.load(std::memory_order_relaxed);
+    if (start == 0) {
+        g_present_stats.window_start.compare_exchange_strong(start, now);
+        return;
+    }
+    if (now - start < window_ns ||
+        !g_present_stats.window_start.compare_exchange_strong(start, now)) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - start) / 1e9;
+    std::array<double, static_cast<size_t>(PresentWait::Count)> ms{};
+    for (size_t i = 0; i < ms.size(); ++i) {
+        ms[i] = static_cast<double>(g_present_stats.ns[i].exchange(0, std::memory_order_relaxed)) /
+                1e6 / seconds;
+    }
+    const u64 presents = g_present_stats.presents.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "Present waits per second: a={:.2f} b={:.2f} c={:.2f} d={:.2f} e-submit={:.2f} "
+             "(lock {:.2f}) e-present={:.2f} (lock {:.2f}) ms ({} presents)",
+             ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[7], ms[6], presents);
+}
 
 Swapchain::Swapchain(
     VkSurfaceKHR_T* surface_,
@@ -169,6 +234,8 @@ void Swapchain::Create(
 }
 
 bool Swapchain::AcquireNextImage(bool may_flush) {
+    const bool stats = PresentStatsOn();
+    const u64 acquire_start = stats ? PresentStatsNow() : 0;
     const VkResult result = device.GetLogical().AcquireNextImageKHR(
         *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
         VK_NULL_HANDLE, &image_index);
@@ -187,6 +254,9 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     default:
         LOG_ERROR(Render_Vulkan, "vkAcquireNextImageKHR returned {}", string_VkResult(result));
         break;
+    }
+    if (stats) {
+        PresentStatsAdd(PresentWait::Acquire, acquire_start);
     }
 
     const auto wait_with_frame_pacing = [this, may_flush] {
@@ -209,15 +279,25 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     }
     };
 
+    // EDEN_NX2_PRESENT_TICKWAIT_SKIP: skip the wait for the GPU work recorded since this image's
+    // last use (and the Target_N fps limiter). The swapchain image is still guarded by its
+    // semaphores and PresentManager's present_done fence still throttles the composites.
+    static const char tickwait_skip_mode = Tegra::Nx2EnvMode("EDEN_NX2_PRESENT_TICKWAIT_SKIP");
+    if (!Tegra::Nx2Switch(tickwait_skip_mode, false)) {
+        const u64 pacing_start = stats ? PresentStatsNow() : 0;
 #ifdef __ANDROID__
-    if (android_get_device_api_level() >= 30) {
-        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
-    } else {
-        wait_with_frame_pacing();
-    }
+        if (android_get_device_api_level() >= 30) {
+            scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+        } else {
+            wait_with_frame_pacing();
+        }
 #else
-    wait_with_frame_pacing();
+        wait_with_frame_pacing();
 #endif
+        if (stats) {
+            PresentStatsAdd(PresentWait::Pacing, pacing_start);
+        }
+    }
 
     resource_ticks[image_index] = scheduler.CurrentTick();
 
@@ -238,8 +318,19 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pImageIndices = &image_index,
         .pResults = nullptr,
     };
-    std::scoped_lock lock{scheduler.submit_mutex};
-    switch (const VkResult result = present_queue.Present(present_info)) {
+    const bool stats = PresentStatsOn();
+    const u64 present_start = stats ? PresentStatsNow() : 0;
+    std::unique_lock lock{scheduler.submit_mutex};
+    const u64 present_call = stats ? PresentStatsNow() : 0;
+    if (stats) {
+        PresentStatsAdd(PresentWait::PresentLock, present_start);
+    }
+    const VkResult result = present_queue.Present(present_info);
+    lock.unlock();
+    if (stats) {
+        PresentStatsAdd(PresentWait::PresentCall, present_call);
+    }
+    switch (result) {
     case VK_SUCCESS:
         break;
     case VK_SUBOPTIMAL_KHR:
@@ -275,9 +366,19 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
 
     const VkCompositeAlphaFlagBitsKHR alpha_flags{ChooseAlphaFlags(capabilities)};
     surface_format = ChooseSwapSurfaceFormat(formats);
-    present_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed);
+    // Latched per creation so 'a' doesn't make NeedsPresentModeUpdate() recreate every 30 s;
+    // for A/B use separate runs (0 vs 1).
+    static const char mailbox_mode = Tegra::Nx2EnvMode("EDEN_NX2_PRESENT_MAILBOX");
+    force_mailbox = Tegra::Nx2Switch(mailbox_mode, false);
+    present_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed, force_mailbox);
 
-    u32 requested_image_count{capabilities.minImageCount + 1};
+    // EDEN_NX2_PRESENT_EXTRA=<n>: n more images than minImageCount + 1, read at creation. The
+    // PresentManager caps its frames at 7, so more swapchain images than that buy nothing.
+    static const u32 extra_images = [] {
+        const char* value = std::getenv("EDEN_NX2_PRESENT_EXTRA");
+        return value != nullptr ? static_cast<u32>(std::clamp(std::atoi(value), 0, 6)) : 0U;
+    }();
+    u32 requested_image_count{capabilities.minImageCount + 1 + extra_images};
     // Ensure Triple buffering if possible.
     if (capabilities.maxImageCount > 0) {
         if (requested_image_count > capabilities.maxImageCount) {
@@ -288,6 +389,10 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
         }
     } else {
         requested_image_count = (std::max)(requested_image_count, 3U);
+    }
+    if (extra_images > 0) {
+        requested_image_count = (std::max)(capabilities.minImageCount,
+                                           (std::min)(requested_image_count, 7U));
     }
     VkSwapchainCreateInfoKHR swapchain_ci{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -378,7 +483,8 @@ void Swapchain::Destroy() {
 }
 
 bool Swapchain::NeedsPresentModeUpdate() const {
-    const auto requested_mode = ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed);
+    const auto requested_mode =
+        ChooseSwapPresentMode(has_imm, has_mailbox, has_fifo_relaxed, force_mailbox);
     return present_mode != requested_mode;
 }
 
