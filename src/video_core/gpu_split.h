@@ -191,10 +191,11 @@ public:
         }
     }
 
-    /// A word a macro writes to one of the 3D engine's const_buffer.buffer registers (`method`):
-    /// consecutive ones go to the back as one multi-method entry (one buffer write, not one entry
-    /// and one write a word). The 16 registers all write at const_buffer.offset and advance it.
-    /// Title 1's macros write ~1.3 million such words a second.
+    /// A word a macro writes to one of the 3D engine's const_buffer.buffer registers (`method`),
+    /// or to the compute engine's inline upload data: consecutive ones of one engine go to the
+    /// back as one multi-method entry (one write, not one entry and one write a word). The 16
+    /// constant buffer registers all write at const_buffer.offset and advance it. Title 1's
+    /// macros write ~1.3 million constant buffer words a second and ~360,000 upload words.
     void ConstBufferWord(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
         if (cb_run_count != 0 && (cb_run_engine != engine || cb_run_count == cb_run.size())) {
             FlushConstBufferRun();

@@ -1394,7 +1394,17 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                 return false;
             }
             FrontApply(fs, address, value);
-            split.MacroWrite(this, address, value);
+            // Inline upload words go to the back as one multi-method entry per run: as words of
+            // their own, each was the last of its method and wrote its 4 bytes through
+            // AccelerateInlineToMemory (~360,000 a second in title 1). EDEN_NX2_UPLOAD_BATCH=0
+            // sends them one by one (=a alternates).
+            static const char upload_batch = Tegra::Nx2EnvMode("EDEN_NX2_UPLOAD_BATCH");
+            if (address == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
+                Tegra::Nx2Switch(upload_batch, true)) {
+                split.ConstBufferWord(this, address, value);
+            } else {
+                split.MacroWrite(this, address, value);
+            }
             return true;
         });
     if (!result.success) {
