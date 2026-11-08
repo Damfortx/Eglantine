@@ -411,6 +411,50 @@ public:
     /// committer's FindSampler and resolvers creating samplers).
     std::mutex sampler_create_mutex;
 
+    // ---- MT resolver reads (texture_cache_mt.h; docs/mt-phase5-spec.md §7.1) ----
+    // Resolver threads, EpochGuard held, no lock. Results are validated at commit.
+
+    struct MtResolvedView {
+        ImageViewId view{};
+        u32 view_gen{};
+        ImageId image{};
+        u32 image_gen{};
+        u32 image_version{};
+        const ImageView* object{}; ///< valid while the EpochGuard is held
+    };
+    enum class MtViewResolve : u8 { Ok, Null, Miss, NotClean };
+
+    /// VisitImageView + PrepareImageView for an image that needs no preparation besides the
+    /// LRU touch: the view of `entry` (whose IsValidEntry the sequencer computed).
+    [[nodiscard]] MtViewResolve TryResolveViewCaptured(const TextureCacheChannelInfo& channel,
+                                                       const TICEntry& entry, bool valid_entry,
+                                                       bool blacklist,
+                                                       MtResolvedView& out) const noexcept;
+    /// The same from a view id found earlier (a resolver's L1 cache).
+    [[nodiscard]] MtViewResolve TryResolveViewId(ImageViewId id, bool blacklist,
+                                                 MtResolvedView& out) const noexcept;
+    enum class MtSamplerResolve : u8 { Ok, Null, Miss };
+    [[nodiscard]] MtSamplerResolve TryResolveSamplerCaptured(const TextureCacheChannelInfo& channel,
+                                                             const TSCEntry& entry, SamplerId& out,
+                                                             u32& gen) const noexcept;
+    /// Resolver: FindSampler's creation under sampler_create_mutex.
+    [[nodiscard]] SamplerId CreateSamplerFromResolver(TextureCacheChannelInfo& channel,
+                                                      const TSCEntry& entry);
+    /// Resolver: the sampler object (samplers are never erased).
+    [[nodiscard]] Sampler* MtSamplerObject(SamplerId id) const noexcept {
+        return &slot_samplers.UncheckedAt(id);
+    }
+    /// IsRescaling(view) for a resolved view (reads the image's atomic flags).
+    [[nodiscard]] bool IsRescalingResolved(const MtResolvedView& view) const noexcept;
+    /// Committer: whether a resolved view is still what the resolver saw (I4).
+    [[nodiscard]] bool MtValidateView(const MtResolvedView& view) const noexcept;
+    /// Committer: what PrepareImageView does for a resolver-clean view (the LRU touch; storage
+    /// writes mark the image modified).
+    void MtApplyViewIntent(const MtResolvedView& view, bool written, bool blacklist);
+    [[nodiscard]] TextureCacheChannelInfo* MtChannelState() const noexcept {
+        return channel_state;
+    }
+
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 

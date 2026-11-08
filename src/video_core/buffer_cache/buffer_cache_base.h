@@ -274,6 +274,30 @@ public:
         slot_buffers.SetEpochManager(manager);
     }
 
+    // ---- MT resolver reads (buffer_cache_mt.h; docs/mt-phase5-spec.md §7.2) ----
+    struct MtResolvedRange {
+        BufferId id{};
+        u32 gen{};
+        u32 offset{};
+        const Buffer* buffer{}; ///< valid while the resolver's EpochGuard is held
+    };
+    enum class MtRangeResolve : u8 { Ok, Null, Miss };
+    /// Resolver: FindBuffer without creation, synchronization or LRU. Lock-free.
+    [[nodiscard]] MtRangeResolve TryResolveRange(DAddr device_addr, u32 size,
+                                                 bool sparse_compatible,
+                                                 MtResolvedRange& out) const noexcept;
+    /// The null buffer (slot 0, never erased), from any thread.
+    [[nodiscard]] const Buffer& MtNullBuffer() const noexcept {
+        return slot_buffers.UncheckedAt(NULL_BUFFER_ID);
+    }
+    [[nodiscard]] u64 MtBufferEpoch() const noexcept {
+        return buffer_epoch.load(std::memory_order_acquire);
+    }
+    /// Committer: whether a resolved buffer is still the one the resolver saw.
+    [[nodiscard]] bool MtValidateBuffer(BufferId id, u32 gen) const noexcept {
+        return id == NULL_BUFFER_ID || slot_buffers.IsCurrent(id, gen);
+    }
+
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);

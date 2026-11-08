@@ -146,4 +146,39 @@ void BufferCache<P>::MtApplyUploads(std::span<const MT::UploadEntry> uploads, co
     }
 }
 
+template <class P>
+auto BufferCache<P>::TryResolveRange(DAddr device_addr, u32 size, bool sparse_compatible,
+                                     MtResolvedRange& out) const noexcept -> MtRangeResolve {
+    const u64 page = device_addr >> CACHING_PAGEBITS;
+    if (device_addr == 0 || page >= page_table.size()) {
+        out = MtResolvedRange{NULL_BUFFER_ID, 0, 0, &slot_buffers.UncheckedAt(NULL_BUFFER_ID)};
+        return MtRangeResolve::Null;
+    }
+    const BufferId id = std::atomic_ref<BufferId>{const_cast<BufferId&>(page_table[page])}.load(
+        std::memory_order_acquire);
+    if (!id) {
+        return MtRangeResolve::Miss;
+    }
+    const u32 gen = slot_buffers.Generation(id);
+    if ((gen & 1) == 0) {
+        return MtRangeResolve::Miss;
+    }
+    const Buffer& buffer = slot_buffers.UncheckedAt(id);
+    // CreateBuffer would make or join a buffer: a structure change for the committer.
+    if (!buffer.IsInBounds(device_addr, size)) {
+        return MtRangeResolve::Miss;
+    }
+    if constexpr (requires { buffer.IsSparseCompatible(); }) {
+        if (sparse_compatible && !buffer.IsSparseCompatible()) {
+            return MtRangeResolve::Miss;
+        }
+    }
+    const u32 offset = buffer.Offset(device_addr);
+    if (slot_buffers.Generation(id) != gen) {
+        return MtRangeResolve::Miss;
+    }
+    out = MtResolvedRange{id, gen, offset, &buffer};
+    return MtRangeResolve::Ok;
+}
+
 } // namespace VideoCommon
