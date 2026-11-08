@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "common/logging.h"
@@ -43,6 +44,7 @@
 #include "video_core/mt/resolve_sync.h"
 #include "video_core/mt/role.h"
 #include "video_core/mt/spmc_stream.h"
+#include "video_core/mt/tracker_lock.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2.h"
 #include "video_core/shader_handle_program.h"
@@ -113,6 +115,15 @@ struct Counters {
     std::atomic<u64> verify_checks{};
     std::atomic<u64> verify_mismatches{};
     std::atomic<u64> verify_cpu_writes{};
+    std::atomic<u64> seq_mutex_writes{};
+    std::atomic<u64> dma_serial{};
+    std::atomic<u64> ubo_gen_hits{};
+    std::atomic<u64> ubo_gen_misses{};
+    std::atomic<u64> ubo_gen_unprotected{};
+    // Stage times (EDEN_NX2_MT_STATS), ns.
+    std::atomic<u64> seq_capture_ns{};
+    std::atomic<u64> wait_committed_ns{};
+    std::atomic<u64> committer_idle_ns{};
     std::array<std::atomic<u64>, 16> forced_serial{};
     // Phase 5.
     std::atomic<u64> ring_waits{};
@@ -229,8 +240,21 @@ public:
     /// Sends the registers written since the last call (and the binds kept outside them).
     void EmitDeltas();
 
+    using IndirectParams = Maxwell3D::DrawManager::IndirectParams;
     /// RasterizerVulkan::Draw on the sequencer: capture and emit a DrawPacket (or a Serial).
-    void SeqDraw(bool is_indexed, u32 instance_count);
+    /// `indirect`: DrawIndirect's parameters (EDEN_NX2_MT_INDIRECT).
+    void SeqDraw(bool is_indexed, u32 instance_count, const IndirectParams* indirect = nullptr);
+
+    // Phase 7 (vk_mt_seq.h): fewer Serial items.
+    /// AccelerateConditionalRendering: a Command when the answer is known here (EDEN_NX2_MT_COND).
+    bool SeqConditionalRendering();
+    /// DrawIndirect as a draw packet (EDEN_NX2_MT_INDIRECT).
+    void SeqDrawIndirect();
+    /// DrawTexture as a Command with its TIC/TSC entries (EDEN_NX2_MT_DRAWTEX).
+    void SeqDrawTexture();
+    /// AccelerateDMA::BufferCopy/BufferClear as Commands (EDEN_NX2_MT_DMA=packet).
+    bool SeqDmaCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
+    bool SeqDmaClear(GPUVAddr dst_address, u64 amount, u32 value);
     /// RasterizerVulkan::DispatchCompute on the sequencer: Serial, or a ComputePacket with
     /// EDEN_NX2_MT_COMPUTE=packet.
     void SeqDispatch();
@@ -292,10 +316,12 @@ private:
         u64 seq;
         GraphicsPipeline* pipeline;
         DrawStateCopy draw_state;
+        IndirectParams indirect_params;
         u32 instance_count;
         u8 is_indexed;
         u8 native_turing;
-        u8 pad[2];
+        u8 indirect;
+        u8 pad;
         u32 inline_index_offset;
         u32 inline_index_size;
         u32 num_overlay;
@@ -346,10 +372,15 @@ private:
         }
     };
     void SeqReadDescriptor(u64 gpu_addr);
+    /// A streamed uniform buffer's bytes into the blob, or (EDEN_NX2_MT_UBO_GEN) a reference to
+    /// the committer's copy while its pages are unchanged (vk_mt_seq.h). Tracker lock held.
+    void SeqStageUniform(VideoCommon::MT::UboEntry& entry);
+    /// Committer: keeps the bytes of memo entries before anything else reads the packet.
+    void KeepUniformMemos(std::span<const VideoCommon::MT::UboEntry> ubos, const u8* blob);
     /// Copies the CPU-modified parts of a range the draw binds into the packet.
     void SeqTakeUploads(DAddr device_addr, u32 size);
     /// -1, or why this draw goes as a Serial (MT::ForcedSerialNames).
-    int CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed);
+    int CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed, const IndirectParams* indirect);
     /// The captured reads, sorted and merged, into the overlay (bytes in the blob).
     void FinishOverlay();
     void ClearCapture();
@@ -372,7 +403,15 @@ private:
                         std::span<const VideoCommon::MT::UboEntry> ubos,
                         std::span<const VideoCommon::MT::UploadEntry> uploads, const u8* blob);
     void ReportView(u64 seq, const VideoCommon::MT::CaptureView& view);
-    void EmitDraw(GraphicsPipeline* pipeline, bool is_indexed, u32 instance_count);
+    void EmitDraw(GraphicsPipeline* pipeline, bool is_indexed, u32 instance_count,
+                  const IndirectParams* indirect);
+    /// The CPU-modified parts of [device_addr, +size) as heap uploads for a Command (phase 7).
+    struct HeapUploads {
+        std::vector<VideoCommon::MT::UploadEntry> uploads;
+        std::vector<u8> blob;
+    };
+    [[nodiscard]] HeapUploads* TakeHeapUploads(std::span<const std::pair<DAddr, u32>> ranges);
+    void ApplyHeapUploads(HeapUploads* heap_uploads);
     void CommitDraw(const u64* entry);
     void VerifyDraw(const DrawHeader& header, std::span<const VideoCommon::MT::OverlayEntry> overlay,
                     std::span<const VideoCommon::MT::UboEntry> ubos,
@@ -470,6 +509,15 @@ private:
     std::vector<VideoCommon::MT::UploadEntry> uploads;
     std::vector<u8> blob;
     std::vector<std::pair<DAddr, u32>> taken_ranges;
+    std::vector<u8> dma_scratch;
+    struct UniformMemo {
+        DAddr device_addr;
+        u32 size;
+        u64 generation; ///< 0: none
+    };
+    std::array<std::array<UniformMemo, VideoCommon::MT::CaptureView::UboMemoSlots>,
+               VideoCommon::MT::CaptureView::UboMemoStages>
+        seq_ubo_memo{};
     u64 last_query_position = 0;
 
 public:
@@ -496,6 +544,7 @@ private:
     }
 
     // Committer-owned.
+    std::unique_ptr<u8[]> ubo_memo_bytes;
     std::vector<std::unique_ptr<ChannelMirrors>> mirrors;
     ChannelMirrors* current{};
     u64 last_mark{};
@@ -534,6 +583,25 @@ private:
 namespace Vulkan {
 
 namespace MTDetail {
+/// The sequencer's lock for the buffer tracker: tracker_mutex with EDEN_NX2_MT_TRAPLOCK, else
+/// the buffer cache mutex (phase 4).
+class SeqTrackerLock {
+public:
+    explicit SeqTrackerLock(BufferCache& buffer_cache)
+        : mutex{VideoCommon::MT::TrapLock() ? &buffer_cache.MtTrackerMutex()
+                                            : &buffer_cache.mutex} {
+        mutex->lock();
+    }
+    ~SeqTrackerLock() {
+        mutex->unlock();
+    }
+    SeqTrackerLock(const SeqTrackerLock&) = delete;
+    SeqTrackerLock& operator=(const SeqTrackerLock&) = delete;
+
+private:
+    Common::SpinRecursiveMutex* mutex;
+};
+
 inline void Pause() {
 #if defined(__x86_64__) || defined(_M_X64)
     __builtin_ia32_pause();
@@ -568,6 +636,13 @@ inline void Nx2DrawPipeline::Start() {
         static_cast<Nx2DrawPipeline*>(context)->BeforeWrite(device_addr, size);
     };
     AttachEpochs(VideoCommon::MT::DeferredFree());
+    if (VideoCommon::MT::UboGen()) {
+        using View = VideoCommon::MT::CaptureView;
+        seq_ubo_memo = {};
+        ubo_memo_bytes = std::make_unique<u8[]>(View::UboMemoStages * View::UboMemoSlots *
+                                                View::UboMemoBytes);
+        VideoCommon::MT::g_ubo_gen_on.store(true, std::memory_order_seq_cst);
+    }
     start_ready.store(false, std::memory_order_relaxed);
     committer = std::jthread([this](std::stop_token stop) { CommitterLoop(stop); });
     while (!start_ready.load(std::memory_order_acquire)) {
@@ -602,6 +677,7 @@ inline void Nx2DrawPipeline::Stop() {
     VideoCommon::MT::g_active.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_check.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_write_hook_on.store(false, std::memory_order_seq_cst);
+    VideoCommon::MT::g_ubo_gen_on.store(false, std::memory_order_seq_cst);
     VideoCommon::MT::g_hooks = {};
     stream.RemoveConsumer(consumer);
     AttachEpochs(false);
@@ -758,6 +834,17 @@ inline void Nx2DrawPipeline::WaitCommitted() {
         return;
     }
     counters.wait_committed.fetch_add(1, std::memory_order_relaxed);
+    const bool timed = VideoCommon::MT::Stats();
+    const auto begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    SCOPE_EXIT {
+        if (timed) {
+            counters.wait_committed_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - begin)
+                                     .count()),
+                std::memory_order_relaxed);
+        }
+    };
     for (u32 spins = 0; spins < 4096; ++spins) {
         if (stream.ConsumerPosition(consumer) >= target) {
             return;
@@ -956,6 +1043,17 @@ inline void Nx2DrawPipeline::CommitterLoop(std::stop_token stop) {
 }
 
 inline void Nx2DrawPipeline::Idle(std::stop_token& stop) {
+    const bool timed = VideoCommon::MT::Stats();
+    const auto begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    SCOPE_EXIT {
+        if (timed) {
+            counters.committer_idle_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - begin)
+                                     .count()),
+                std::memory_order_relaxed);
+        }
+    };
     for (u32 spins = 0; spins < 4096; ++spins) {
         if (stream.Peek(consumer) != nullptr || stop.stop_requested()) {
             return;
@@ -1141,6 +1239,22 @@ inline void Nx2DrawPipeline::LogStats() {
              counters.verify_mismatches.load(std::memory_order_relaxed),
              counters.verify_cpu_writes.load(std::memory_order_relaxed));
     LogResolverStats(seconds);
+    // Per-stage time (ms per second of wall time) and the phase 6/7 paths.
+    const auto ms = [&](std::atomic<u64>& value) {
+        return static_cast<double>(take(value)) / 1e6 / seconds;
+    };
+    const double stream_ms = static_cast<double>(std::exchange(stream.space_wait_ns, 0)) / 1e6 / seconds;
+    LOG_INFO(Render_Vulkan,
+             "MT stages ms/s: sequencer draws {:.1f} (waits: wait-committed {:.1f}, stream full "
+             "{:.1f}) | committer idle {:.1f} | buffer-mutex invalidations {:.0f}/s, dma serial "
+             "{:.0f}/s | ubo gen: hits {:.0f}/s, misses {:.0f}/s, unprotected {:.0f}/s",
+             ms(counters.seq_capture_ns), ms(counters.wait_committed_ns), stream_ms,
+             ms(counters.committer_idle_ns),
+             static_cast<double>(take(counters.seq_mutex_writes)) / seconds,
+             static_cast<double>(take(counters.dma_serial)) / seconds,
+             static_cast<double>(take(counters.ubo_gen_hits)) / seconds,
+             static_cast<double>(take(counters.ubo_gen_misses)) / seconds,
+             static_cast<double>(take(counters.ubo_gen_unprotected)) / seconds);
 }
 
 } // namespace Vulkan
@@ -1210,7 +1324,8 @@ inline void Nx2DrawPipeline::SeqTakeUploads(DAddr device_addr, u32 size) {
     });
 }
 
-inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed) {
+inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed,
+                                         const IndirectParams* indirect) {
     using Maxwell = Maxwell3D::Regs;
     Maxwell3D& real = *rasterizer.maxwell3d.Real();
     Tegra::MemoryManager& memory = *rasterizer.gpu_memory;
@@ -1255,10 +1370,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         size_t stage;
     };
     boost::container::small_vector<SsboCapture, 32> ssbos;
-    const bool prefers_sparse = [&] {
-        std::scoped_lock lock{rasterizer.buffer_cache.mutex};
-        return rasterizer.buffer_cache.MtPrefersSparseSources();
-    }();
+    const bool prefers_sparse = rasterizer.buffer_cache.MtPrefersSparseSources();
     for (size_t stage = 0; stage < infos.size(); ++stage) {
         const Shader::Info& info = infos[stage];
         const auto& cbufs = real.state.shader_stages[stage].const_buffers;
@@ -1353,8 +1465,20 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
     }
 
     // Pass 2: the buffer tracker, in the order the committer synchronizes the bindings.
-    std::scoped_lock lock{rasterizer.buffer_cache.mutex};
+    MTDetail::SeqTrackerLock lock{rasterizer.buffer_cache};
     const auto& draw_state = real.draw_manager.draw_state;
+    if (indirect != nullptr) {
+        // BindHostDrawIndirectBuffers' synchronizations (the count first).
+        const auto take = [&](GPUVAddr gpu_addr, u64 size) {
+            if (const auto device_addr = memory.GpuToCpuAddress(gpu_addr); device_addr && size != 0) {
+                SeqTakeUploads(*device_addr, static_cast<u32>(size));
+            }
+        };
+        if (indirect->include_count) {
+            take(indirect->count_start_address, sizeof(u32));
+        }
+        take(indirect->indirect_start_address, indirect->buffer_size);
+    }
     if (is_indexed && draw_state.inline_index_draw_indexes.empty()) {
         const auto& index_buffer = draw_state.index_buffer;
         const GPUVAddr begin = index_buffer.StartAddress();
@@ -1442,16 +1566,14 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
                 .stage = static_cast<u8>(stage),
                 .index = static_cast<u8>(index),
                 .staged = static_cast<u8>(fast ? 1 : 0),
-                .pad = 0,
+                .memo = 0,
                 .size = size,
                 .device_addr = device_addr,
                 .offset = 0,
                 .pad2 = 0,
             };
             if (fast) {
-                entry.offset = static_cast<u32>(blob.size());
-                blob.resize(blob.size() + ((size + 7) & ~7U));
-                rasterizer.device_memory.ReadBlockUnsafe(device_addr, blob.data() + entry.offset, size);
+                SeqStageUniform(entry);
             } else {
                 SeqTakeUploads(device_addr, size);
             }
@@ -1499,7 +1621,7 @@ inline void Nx2DrawPipeline::FinishOverlay() {
 }
 
 inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexed,
-                                      u32 instance_count) {
+                                      u32 instance_count, const IndirectParams* indirect) {
     Maxwell3D& real = *rasterizer.maxwell3d.Real();
     const auto& state = real.draw_manager.draw_state;
     const u32 inline_offset = static_cast<u32>((blob.size() + 7) & ~size_t{7});
@@ -1550,6 +1672,10 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     };
     header.instance_count = instance_count;
     header.is_indexed = is_indexed ? 1 : 0;
+    if (indirect != nullptr) {
+        header.indirect = 1;
+        header.indirect_params = *indirect;
+    }
     header.native_turing = real.GetNativeMacroEngine().native_turing ? 1 : 0;
     header.inline_index_offset = inline_offset;
     header.inline_index_size = inline_size;
@@ -1589,13 +1715,30 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
     }
 }
 
-inline void Nx2DrawPipeline::SeqDraw(bool is_indexed, u32 instance_count) {
+inline void Nx2DrawPipeline::SeqDraw(bool is_indexed, u32 instance_count,
+                                     const IndirectParams* indirect) {
     RasterizerVulkan& r = rasterizer;
     // The draw's sync requests (CPU reads, composites) run on the committer after it.
     SCOPE_EXIT {
         r.gpu.TickWork();
     };
+    const bool timed = VideoCommon::MT::Stats();
+    const auto begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    SCOPE_EXIT {
+        if (timed) {
+            // Capture and emit (Serial waits included; they are also counted on their own).
+            counters.seq_capture_ns.fetch_add(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - begin)
+                                     .count()),
+                std::memory_order_relaxed);
+        }
+    };
     const auto serial_draw = [&] {
+        if (indirect != nullptr) {
+            Serial(MT::Kind::DrawIndirect, [&] { r.DrawIndirect(); });
+            return;
+        }
         Serial(MT::Kind::Draw, [&] {
             r.PrepareDraw(is_indexed, [&] { r.RecordDraw(is_indexed, instance_count); });
         });
@@ -1617,13 +1760,13 @@ inline void Nx2DrawPipeline::SeqDraw(bool is_indexed, u32 instance_count) {
     if (!r.MeshDrawAllowed(pipeline)) {
         return;
     }
-    const int reason = CaptureDraw(pipeline, is_indexed);
+    const int reason = CaptureDraw(pipeline, is_indexed, indirect);
     if (reason >= 0) {
         ForceSerialReason(static_cast<u32>(reason));
         serial_draw();
         return;
     }
-    EmitDraw(pipeline, is_indexed, instance_count);
+    EmitDraw(pipeline, is_indexed, instance_count, indirect);
 }
 
 inline Nx2DrawPipeline::PacketView Nx2DrawPipeline::ParsePacket(const u64* entry) {
@@ -1660,6 +1803,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
     const auto ubo_span = packet.ubos;
     const auto upload_span = packet.uploads;
     const u8* const blob_data = packet.blob;
+    KeepUniformMemos(ubo_span, blob_data);
     if (current == nullptr) {
         return;
     }
@@ -1694,10 +1838,21 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         .ubos = ubo_span,
         .blob = blob_data,
         .verify = verify,
+        .ubo_memo = ubo_memo_bytes.get(),
     };
     {
-        std::scoped_lock lock{r.buffer_cache.mutex, r.texture_cache.mutex};
-        r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+        // EDEN_NX2_MT_LOCKSCOPE: the uploads under the buffer mutex, then ConfigureDrawPipeline
+        // takes both for the resolve only.
+        std::unique_lock buffer_lock{r.buffer_cache.mutex, std::defer_lock};
+        std::unique_lock texture_lock{r.texture_cache.mutex, std::defer_lock};
+        if (VideoCommon::MT::LockScope()) {
+            buffer_lock.lock();
+            r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+            buffer_lock.unlock();
+        } else {
+            std::lock(buffer_lock, texture_lock);
+            r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+        }
         VideoCommon::MT::t_capture = &view;
         r.mt_commit_pipeline = header.pipeline;
         SCOPE_EXIT {
@@ -1741,9 +1896,18 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
             GraphicsPipeline::mt_resolved_textures = &resolved_textures;
             counters.resolved_committed.fetch_add(1, std::memory_order_relaxed);
         }
+        const bool indirect = header.indirect != 0;
+        if (indirect) {
+            mirror.draw_manager.indirect_state = header.indirect_params;
+            r.buffer_cache.SetDrawIndirect(&mirror.draw_manager.indirect_state);
+        }
         try {
             if (r.ConfigureDrawPipeline(header.pipeline, is_indexed)) {
-                r.RecordDraw(is_indexed, header.instance_count);
+                if (indirect) {
+                    r.RecordDrawIndirect(mirror.draw_manager.indirect_state);
+                } else {
+                    r.RecordDraw(is_indexed, header.instance_count);
+                }
             }
         } catch (const std::exception& e) {
             LOG_ERROR(Render_Vulkan, "MT: draw packet threw: {}", e.what());
@@ -1752,6 +1916,9 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         GraphicsPipeline::mt_resolved_textures = nullptr;
         if (compare && shadow_sink.filled) {
             ShadowCompare(*res, header, shadow_sink);
+        }
+        if (indirect) {
+            r.buffer_cache.SetDrawIndirect(nullptr);
         }
     }
     if (verify) {
@@ -1865,7 +2032,10 @@ inline void Nx2DrawPipeline::VerifyCaptures(
         }
         bytes.resize(entry.size);
         rasterizer.device_memory.ReadBlockUnsafe(entry.device_addr, bytes.data(), entry.size);
-        if (std::memcmp(bytes.data(), blob_data + entry.offset, entry.size) != 0) {
+        const VideoCommon::MT::CaptureView memo_view{
+            .overlay = {}, .ubos = {}, .blob = blob_data, .verify = false,
+            .ubo_memo = ubo_memo_bytes.get()};
+        if (std::memcmp(bytes.data(), memo_view.UboBytes(entry), entry.size) != 0) {
             if (written_by_cpu(entry.device_addr, entry.size)) {
                 counters.verify_cpu_writes.fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -1990,7 +2160,25 @@ inline void Nx2DrawPipeline::SeqInvalidateBuffers(
     // GPU data on the written pages is downloaded first, which only the scheduler's owner may
     // do: those ranges go to the committer.
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 8> owner_ranges;
-    {
+    if (VideoCommon::MT::TrapLock()) {
+        // The tracker only; ranges with GPU-written data need the buffer cache mutex.
+        using Result = BufferCache::MtTrapResult;
+        boost::container::small_vector<std::pair<DAddr, std::size_t>, 8> mutex_ranges;
+        for (const auto& [addr, size] : regions) {
+            if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
+                owner_ranges.emplace_back(addr, size);
+            } else if (r.buffer_cache.MtTrapWrite(addr, size, false) == Result::NeedsMutex) {
+                mutex_ranges.emplace_back(addr, size);
+            }
+        }
+        if (!mutex_ranges.empty()) {
+            counters.seq_mutex_writes.fetch_add(mutex_ranges.size(), std::memory_order_relaxed);
+            std::scoped_lock lock{r.buffer_cache.mutex};
+            for (const auto& [addr, size] : mutex_ranges) {
+                r.buffer_cache.WriteMemory(addr, size);
+            }
+        }
+    } else {
         std::scoped_lock lock{r.buffer_cache.mutex};
         for (const auto& [addr, size] : regions) {
             if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
@@ -2085,10 +2273,7 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
     const auto enabled = [&](u32 cbuf) { return ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0; };
     const bool native = real.IsNativeMode();
     const bool mapping_sized = real.IsDlssDispatch();
-    const bool prefers_sparse = [&] {
-        std::scoped_lock lock{rasterizer.buffer_cache.mutex};
-        return rasterizer.buffer_cache.MtPrefersSparseSources();
-    }();
+    const bool prefers_sparse = rasterizer.buffer_cache.MtPrefersSparseSources();
     struct SsboCapture {
         DAddr device_addr;
         u32 size;
@@ -2169,7 +2354,7 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
         }
     }
 
-    std::scoped_lock lock{rasterizer.buffer_cache.mutex};
+    MTDetail::SeqTrackerLock lock{rasterizer.buffer_cache};
     const u32 alignment = rasterizer.buffer_cache.MtUniformBufferAlignment();
     const u32 skip_size = rasterizer.buffer_cache.MtSkipCacheSize();
     const auto& sizes = pipeline->UniformSizes();
@@ -2195,16 +2380,14 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
             .stage = 5,
             .index = static_cast<u8>(index),
             .staged = static_cast<u8>(fast ? 1 : 0),
-            .pad = 0,
+            .memo = 0,
             .size = size,
             .device_addr = device_addr,
             .offset = 0,
             .pad2 = 0,
         };
         if (fast) {
-            entry.offset = static_cast<u32>(blob.size());
-            blob.resize(blob.size() + ((size + 7) & ~7U));
-            rasterizer.device_memory.ReadBlockUnsafe(device_addr, blob.data() + entry.offset, size);
+            SeqStageUniform(entry);
         } else {
             SeqTakeUploads(device_addr, size);
         }
@@ -2302,6 +2485,7 @@ inline void Nx2DrawPipeline::CommitCompute(const u64* entry) {
         reinterpret_cast<const VideoCommon::MT::UploadEntry*>(cursor), header.num_upload};
     cursor += header.num_upload * sizeof(VideoCommon::MT::UploadEntry) / 8;
     const u8* const blob_data = reinterpret_cast<const u8*>(cursor);
+    KeepUniformMemos(ubo_span, blob_data);
     if (current == nullptr || !current->mirror_compute) {
         return;
     }
@@ -2333,10 +2517,20 @@ inline void Nx2DrawPipeline::CommitCompute(const u64* entry) {
         .ubos = ubo_span,
         .blob = blob_data,
         .verify = verify,
+        .ubo_memo = ubo_memo_bytes.get(),
     };
     {
-        std::scoped_lock lock{r.texture_cache.mutex, r.buffer_cache.mutex};
-        r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+        // DispatchComputeBody takes both cache mutexes itself.
+        std::unique_lock buffer_lock{r.buffer_cache.mutex, std::defer_lock};
+        std::unique_lock texture_lock{r.texture_cache.mutex, std::defer_lock};
+        if (VideoCommon::MT::LockScope()) {
+            buffer_lock.lock();
+            r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+            buffer_lock.unlock();
+        } else {
+            std::lock(texture_lock, buffer_lock);
+            r.buffer_cache.MtApplyUploads(upload_span, blob_data);
+        }
         VideoCommon::MT::t_capture = &view;
         SCOPE_EXIT {
             VideoCommon::MT::t_capture = nullptr;

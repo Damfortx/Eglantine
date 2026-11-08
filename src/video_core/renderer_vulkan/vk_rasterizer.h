@@ -210,6 +210,7 @@ private:
     /// ConfigureDrawPipeline's vertex repack layout and the dirty flags it implies.
     void ApplyVertexRepack(GraphicsPipeline* pipeline);
     void RecordDraw(bool is_indexed, u32 instance_count);
+    void RecordDrawIndirect(const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams& params);
     void ClearBody(u32 layer_count);
     /// DispatchCompute from the cache locks on, with the pipeline looked up.
     void DispatchComputeBody(ComputePipeline* pipeline, u64 native_key);

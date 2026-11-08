@@ -458,7 +458,7 @@ public:
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
-    Common::SpinRecursiveMutex mutex;
+    Common::SpinRecursiveMutex mutex{"texture"};
 
 private:
     /// Iterate over all page indices in a range

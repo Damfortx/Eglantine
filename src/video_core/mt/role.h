@@ -11,6 +11,7 @@
 
 #include "common/common_types.h"
 #include "video_core/mt/mt_switches.h"
+#include "video_core/mt/seq_diet.h"
 
 /// Thread roles of the multithreaded GPU back (docs/mt-plan.md, phase 4) and the hooks code
 /// outside the rasterizer uses to reach the committer. Everything here is inert while
@@ -152,8 +153,11 @@ inline bool PostToCommitter(void (*fn)(void*, void*), void* a, void* b) {
 
 /// MemoryManager's write paths: before the sequencer writes guest memory.
 inline void BeforeGuestWrite(u64 device_addr, u64 size) {
-    if (g_write_hook_on.load(std::memory_order_relaxed) && OnSequencer()) [[unlikely]] {
-        g_hooks.before_write(g_hooks.context, device_addr, size);
+    if (g_write_hook_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        BumpWriteGeneration(device_addr, size); // any thread (EDEN_NX2_MT_UBO_GEN)
+        if (OnSequencer()) {
+            g_hooks.before_write(g_hooks.context, device_addr, size);
+        }
     }
 }
 

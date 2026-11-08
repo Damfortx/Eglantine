@@ -23,7 +23,8 @@ inline const bool g_lock_stats_enabled = std::getenv("EDEN_NX2_LOCK_STATS") != n
 /// Records the calling thread's name for the owner lookup (once per thread).
 inline void LockStatsRegisterThread();
 /// Adds a wait of the calling thread on the thread that owned the lock when it began.
-inline void LockStatsRecord(std::thread::id owner, std::chrono::steady_clock::duration wait);
+inline void LockStatsRecord(std::thread::id owner, std::chrono::steady_clock::duration wait,
+                            const char* lock_name = nullptr);
 
 /// A recursive mutex that spins briefly before sleeping. The GPU caches' locks are taken tens of
 /// thousands of times a second by the GPU thread, the fencing thread and CPU write traps, and
@@ -31,6 +32,10 @@ inline void LockStatsRecord(std::thread::id owner, std::chrono::steady_clock::du
 /// wake-up took longer than the critical section (title 1's GPU thread spent ~8% asleep there).
 class SpinRecursiveMutex {
 public:
+    SpinRecursiveMutex() = default;
+    /// `name` tells this lock's waits apart from the other locks' in EDEN_NX2_LOCK_STATS.
+    explicit SpinRecursiveMutex(const char* name) : stats_name{name} {}
+
     void lock() {
         const std::thread::id self = std::this_thread::get_id();
         if (owner.load(std::memory_order_relaxed) == self) {
@@ -98,7 +103,7 @@ private:
             const std::thread::id holder = owner.load(std::memory_order_relaxed);
             const auto begin = std::chrono::steady_clock::now();
             WaitAndTake();
-            LockStatsRecord(holder, std::chrono::steady_clock::now() - begin);
+            LockStatsRecord(holder, std::chrono::steady_clock::now() - begin, stats_name);
             return;
         }
         WaitAndTake();
@@ -125,6 +130,7 @@ private:
     std::atomic<std::uint32_t> state{0}; ///< 0 free, 1 held, 2 held with sleepers
     std::atomic<std::thread::id> owner{};
     std::uint32_t depth{}; ///< Recursion depth, touched only by the owner
+    const char* stats_name{};
 };
 
 } // namespace Common
