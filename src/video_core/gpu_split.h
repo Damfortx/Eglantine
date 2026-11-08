@@ -7,6 +7,7 @@
 #include <deque>
 #include <unordered_map>
 #include <optional>
+#include <vector>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -304,7 +305,8 @@ public:
     /// the entry that makes it was sent), with the copy and compute writers (WaitForWriters),
     /// or only once everything sent so far has run.
     enum class WriteKnown : u8 { Position, Writers, Drain };
-    void NotePendingWrite(GPUVAddr address, u64 size, WriteKnown known = WriteKnown::Position) {
+    void NotePendingWrite(GPUVAddr address, u64 size, WriteKnown known = WriteKnown::Position,
+                          u8 tag = 0, std::optional<u32> value = std::nullopt) {
         if (pending_write_count == pending_writes.size()) {
             // Drop the ones the back has run.
             const u64 done = consumed.load(std::memory_order_acquire);
@@ -322,7 +324,9 @@ public:
             }
         }
         const u64 position = known == WriteKnown::Position ? SentPosition() : 0;
-        pending_writes[pending_write_count++] = {address, address + size, position, known};
+        pending_writes[pending_write_count++] = {address,          address + size, position,
+                                                 known,            tag,
+                                                 value.value_or(0), value.has_value() && size == 4};
     }
     /// What a read of the range must wait for. `drain`: everything sent; else `writers` and
     /// `position` (0: nothing).
@@ -351,6 +355,49 @@ public:
             }
         }
         return wait;
+    }
+    /// For a read of [address, address + size): the words that writes the back hasn't run yet
+    /// will hold, in the order they were noted, if all of those writes have a known value.
+    /// Returns false when one doesn't (the read must wait for it). Writes the back has run
+    /// are left to memory, which may have been written again since.
+    struct KnownWord {
+        GPUVAddr address;
+        u32 value;
+    };
+    [[nodiscard]] bool KnownPendingWords(GPUVAddr address, u64 size, std::vector<KnownWord>& out) {
+        out.clear();
+        if (pending_write_overflow) {
+            return false;
+        }
+        const u64 done = consumed.load(std::memory_order_acquire);
+        for (size_t i = 0; i < pending_write_count; ++i) {
+            const auto& write = pending_writes[i];
+            if (!(address < write.end && write.begin < address + size)) {
+                continue;
+            }
+            if (write.known == WriteKnown::Position && write.position <= done) {
+                continue;
+            }
+            if (!write.has_value || write.known != WriteKnown::Position) {
+                return false;
+            }
+            out.push_back({write.begin, write.value});
+        }
+        return true;
+    }
+    /// Tags (bit per tag) of the noted writes overlapping the range.
+    [[nodiscard]] u32 PendingWriteTags(GPUVAddr address, u64 size) const {
+        u32 tags = 0;
+        for (size_t i = 0; i < pending_write_count; ++i) {
+            const auto& write = pending_writes[i];
+            if (address < write.end && write.begin < address + size) {
+                tags |= 1U << write.tag;
+            }
+        }
+        return tags;
+    }
+    [[nodiscard]] bool PendingWriteOverflow() const {
+        return pending_write_overflow;
     }
     [[nodiscard]] bool OverlapsPendingWrite(GPUVAddr address, u64 size) const {
         const ReadWait wait = PendingWritesFor(address, size);
@@ -518,6 +565,9 @@ private:
         GPUVAddr end;
         u64 position;
         WriteKnown known;
+        u8 tag; ///< Who noted it (EDEN_NX2_DMA_READ_WHY): 1 I2M, 2 3D report, 0 other.
+        u32 value;      ///< The word it writes, when has_value.
+        bool has_value; ///< A 4-byte write whose value the front knows (a fence release).
     };
     std::array<PendingWrite, 256> pending_writes{};
     size_t pending_write_count{};

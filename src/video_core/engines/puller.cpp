@@ -75,11 +75,16 @@ void ReleaseFences(DmaPusher& dma_pusher) {
         VideoCommon::GpuSplit::DrainReason::Puller);
 }
 
-void NoteRelease(GPUVAddr address, u32 payload) {
+void NoteRelease(GPUVAddr address, u32 payload, u64 size = 16) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         split.NoteRelease(address, payload);
-        // Up to 16 bytes (with the timestamp) once the back runs it (front DMA reads).
-        split.NotePendingWrite(address, 16);
+        // `size` bytes (16 with the timestamp, 4 for fence releases) once the back runs it (front
+        // DMA reads). Noting fence releases as 16 bytes made title 1's MME reads of the words
+        // packed next to them (~230 a second) drain the back: EDEN_NX2_RELEASE_SIZE=0 restores
+        // that (=a alternates).
+        static const char size_mode = Tegra::Nx2EnvMode("EDEN_NX2_RELEASE_SIZE");
+        split.NotePendingWrite(address, Tegra::Nx2Switch(size_mode, true) ? size : 16,
+                               VideoCommon::GpuSplit::WriteKnown::Position, 0, payload);
     }
 }
 
@@ -375,9 +380,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
             }
         });
-        NoteRelease(sequence_address, payload);
+        const u64 release_bytes =
+            properties == VideoCommon::QueryPropertiesFlags::IsAFence ? 4 : 16;
+        NoteRelease(sequence_address, payload, release_bytes);
         if (mirror != 0) {
-            NoteRelease(mirror, payload);
+            NoteRelease(mirror, payload, release_bytes);
         }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
@@ -482,7 +489,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
-    NoteRelease(sequence_address, payload);
+    NoteRelease(sequence_address, payload, 4);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -512,7 +519,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
-        NoteRelease(address, payload);
+        NoteRelease(address, payload, 4);
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.

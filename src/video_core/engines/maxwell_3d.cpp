@@ -964,7 +964,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
         const u64 lines = std::max<u32>(upload.line_count, 1);
         const u64 size = pitch ? u64{upload.dest.pitch} * (lines - 1) + upload.line_length_in
                                : ~u64{0} >> 1;
-        split.NotePendingWrite(pitch ? upload.dest.Address() : 0, size, known);
+        split.NotePendingWrite(pitch ? upload.dest.Address() : 0, size, known, 1);
     }
     if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) [[unlikely]] {
         // Every report but an acquire writes up to 16 bytes there.
@@ -972,7 +972,7 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
             split.NotePendingWrite(
                 (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
                     fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)],
-                16, known);
+                16, known, 2);
         }
     }
 }
@@ -1293,8 +1293,64 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const bool partial = !always_drain && !on_gpu_written && !pending.drain &&
                          (pending.writers || pending.position != 0) &&
                          Tegra::Nx2Switch(partial_mode, false);
-    const bool skipped = !always_drain && !on_gpu_written && !pending.drain &&
-                         !pending.writers && pending.position == 0;
+    const bool plain_skip = !always_drain && !on_gpu_written && !pending.drain &&
+                            !pending.writers && pending.position == 0;
+    // Title 1's ~230 waiting reads a second (EDEN_NX2_DMA_READ_WHY) cover fence releases still
+    // queued, whose payloads the front knows: the read gets them laid over memory instead of
+    // draining the back. Only releases the back hasn't run count; memory has the rest.
+    // EDEN_NX2_DMA_READ_OVERLAY=0 drains as before (=a alternates).
+    static const char overlay_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_OVERLAY");
+    static std::vector<VideoCommon::GpuSplit::KnownWord> known_words;
+    known_words.clear();
+    const bool overlay = !always_drain && !on_gpu_written && !pending.drain && !pending.writers &&
+                         pending.position != 0 && !partial &&
+                         Tegra::Nx2Switch(overlay_mode, true) &&
+                         split.KnownPendingWords(source, read_bytes, known_words);
+    const bool skipped = plain_skip || overlay;
+    const auto apply_known = [&](u32* data, u32 count) {
+        for (const auto& known : known_words) {
+            if (known.address >= source && known.address + 4 <= source + u64{count} * 4 &&
+                ((known.address - source) & 3) == 0) {
+                data[(known.address - source) / 4] = known.value;
+            } else if (known.address < source + u64{count} * 4 && source < known.address + 4) {
+                // Unaligned against the read: patch byte by byte.
+                for (u64 b = 0; b < 4; ++b) {
+                    const GPUVAddr at = known.address + b;
+                    if (at >= source && at < source + u64{count} * 4) {
+                        reinterpret_cast<u8*>(data)[at - source] =
+                            static_cast<u8>(known.value >> (8 * b));
+                    }
+                }
+            }
+        }
+    };
+    // EDEN_NX2_DMA_READ_WHY: why MME DMA reads wait (logged every 10 s).
+    static const bool why = std::getenv("EDEN_NX2_DMA_READ_WHY") != nullptr;
+    if (why) [[unlikely]] {
+        static u64 n_total{}, n_gpu{}, n_overflow{}, n_drain{}, n_writers{}, n_position{};
+        static auto why_window = std::chrono::steady_clock::now();
+        ++n_total;
+        n_gpu += on_gpu_written ? 1 : 0;
+        n_overflow += split.PendingWriteOverflow() ? 1 : 0;
+        n_drain += pending.drain && !split.PendingWriteOverflow() ? 1 : 0;
+        n_writers += pending.writers ? 1 : 0;
+        n_position += pending.position != 0 ? 1 : 0;
+        static u64 n_tag[3]{};
+        const u32 tags = split.PendingWriteTags(source, read_bytes);
+        for (u32 t = 0; t < 3; ++t) {
+            n_tag[t] += (tags >> t) & 1;
+        }
+        if (std::chrono::steady_clock::now() - why_window > std::chrono::seconds{10}) {
+            LOG_INFO(HW_GPU, "MME DMA read waits in 10 s: {} reads, {} GPU-written, {} table "
+                     "overflow, {} drain-known writes, {} writers, {} positions (I2M {}, "
+                     "report {}, other {}); last {:#x} {} bytes",
+                     n_total, n_gpu, n_overflow, n_drain, n_writers, n_position, n_tag[1],
+                     n_tag[2], n_tag[0], source, read_bytes);
+            n_tag[0] = n_tag[1] = n_tag[2] = 0;
+            n_total = n_gpu = n_overflow = n_drain = n_writers = n_position = 0;
+            why_window = std::chrono::steady_clock::now();
+        }
+    }
     // A read that only waits for the copy and compute work queued before it (skipped) did so
     // for title 1's ~1,000 reads a second: each one left the back without work while the front
     // waited, so the two took turns. As DmaPusher does for command lists (IsKnownCpuCommandList),
@@ -1350,6 +1406,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         if (check) [[unlikely]] {
             // What the read sees without the drain, compared below with what it sees after one.
             memory_manager.ReadBlockUnsafe(source, before.data(), checked * sizeof(u32));
+            apply_known(before.data(), checked);
             split.Drain(VideoCommon::GpuSplit::DrainReason::DmaRead);
         }
     } else {
@@ -1389,8 +1446,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
         }, VideoCommon::GpuSplit::DrainReason::DmaRead);
     }
+    static std::vector<u32> overlaid;
+    if (!known_words.empty()) {
+        overlaid.resize(words);
+        memory_manager.ReadBlockUnsafe(source, overlaid.data(), read_bytes);
+        apply_known(overlaid.data(), words);
+    }
     for (u32 i = 0; i < words; ++i) {
-        const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        const u32 word = known_words.empty()
+                             ? memory_manager.Read<u32>(source + u64{i} * sizeof(u32))
+                             : overlaid[i];
         if (method == 0x158) {
             fs.parameters.push_back(word);
         } else if (ram + i < native_data_ram.size()) {
