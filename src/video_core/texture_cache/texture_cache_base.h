@@ -239,6 +239,13 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
+    /// FillImageViews for graphics when every view is a clean hit: its descriptor unchanged since
+    /// it was read, an image with no CPU writes to upload and no aliases to synchronize. Then it
+    /// changes nothing outside the cache (no Vulkan work), so the split's back can run it on a
+    /// helper thread while it does other work under the same locks. False, having changed
+    /// nothing, when any view needs more: the caller runs FillImageViews.
+    [[nodiscard]] bool TryFillImageViewsClean(std::span<ImageViewInOut> views, bool blacklist);
+
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 

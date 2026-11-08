@@ -551,6 +551,46 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
 }
 
 template <class P>
+bool TextureCache<P>::TryFillImageViewsClean(std::span<ImageViewInOut> views, bool blacklist) {
+    auto& table = channel_state->graphics_image_table;
+    const bool native = gpu_memory->UsesNativeTiling();
+    for (ImageViewInOut& view : views) {
+        const u32 index = Tegra::Texture::TextureHeaderIndex(view.index, table.current_limit, native);
+        if (index > table.current_limit) {
+            view.id = NULL_IMAGE_VIEW_ID;
+            continue;
+        }
+        if (!table.PeekUnchanged(*gpu_memory, index)) {
+            return false;
+        }
+        const ImageViewId id = table.bound_ids[index];
+        view.id = id;
+        if (!id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[id];
+        if (image_view.IsBuffer()) {
+            continue;
+        }
+        const Image& image = slot_images[image_view.image_id];
+        if (True(image.flags & ImageFlagBits::CpuModified) || !image.aliased_images.empty() ||
+            (blacklist && view.blacklist)) {
+            return false;
+        }
+    }
+    // What PrepareImage does for them besides: keep them recently used.
+    for (const ImageViewInOut& view : views) {
+        if (view.id) {
+            const ImageViewBase& image_view = slot_image_views[view.id];
+            if (!image_view.IsBuffer()) {
+                lru_cache.Touch(slot_images[image_view.image_id].lru_index, frame_tick);
+            }
+        }
+    }
+    return true;
+}
+
+template <class P>
 void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     if (!Settings::values.barrier_feedback_loops.GetValue()) {
         return;

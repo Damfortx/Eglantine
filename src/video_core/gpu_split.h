@@ -36,6 +36,34 @@ namespace VideoCommon {
 // On for Switch 2 titles with the 3D and compute engines' macros on the front, against copies of
 // the registers they read (Maxwell3D and KeplerCompute Front*), which sends the writes they make.
 // EDEN_NX2_SPLIT=1 keeps the macros on the back; EDEN_NX2_SPLIT=0 runs everything on one thread.
+/// A thread pinned to a core of its own that runs one job at a time for the split's back while
+/// the back does other work, then joins (title 1's draws are ~10 us each: a pinned handoff costs
+/// ~0.1 us, an unpinned one 2-3 us). It spins while jobs come, and sleeps after ~1 ms without one.
+/// EDEN_NX2_BACK_HELPER=1 turns it on (=a alternates; off by default); EDEN_NX2_HELPER_CPUS=<back>,<helper>
+/// picks the cores (default 2,3; -1 leaves a thread unpinned).
+class BackHelper {
+public:
+    static BackHelper& Get();
+    /// Whether jobs may be posted now (on, and on the split's back).
+    [[nodiscard]] bool Enabled();
+    /// Starts `job(context)` on the helper. One job at a time: Join before the next.
+    void Post(void (*job)(void*), void* context);
+    /// Waits for the posted job.
+    void Join();
+
+private:
+    BackHelper();
+    void Loop(std::stop_token stop);
+
+    alignas(64) std::atomic<u64> posted{0};
+    alignas(64) std::atomic<u64> done{0};
+    alignas(64) std::atomic<u32> sleeping{0};
+    void (*job_function)(void*) = nullptr;
+    void* job_context = nullptr;
+    bool back_pinned = false;
+    std::jthread thread;
+};
+
 class GpuSplit {
 public:
     static GpuSplit& Get() {

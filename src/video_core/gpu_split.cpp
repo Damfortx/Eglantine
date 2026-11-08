@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <sched.h>
+#include <pthread.h>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -71,6 +73,112 @@ bool Nx2AltOn() {
 } // namespace Tegra
 
 namespace VideoCommon {
+
+namespace {
+inline void CpuRelax() {
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+void PinThisThread(int cpu) {
+#ifdef __linux__
+    if (cpu < 0 || cpu >= static_cast<int>(std::thread::hardware_concurrency())) {
+        return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)cpu;
+#endif
+}
+std::pair<int, int> HelperCpus() {
+    int back = 2, helper = 3;
+    if (const char* text = std::getenv("EDEN_NX2_HELPER_CPUS")) {
+        std::sscanf(text, "%d,%d", &back, &helper);
+    }
+    if (std::thread::hardware_concurrency() < 8) {
+        return {-1, -1};
+    }
+    return {back, helper};
+}
+} // Anonymous namespace
+
+BackHelper& BackHelper::Get() {
+    static BackHelper helper;
+    return helper;
+}
+
+BackHelper::BackHelper() {
+    thread = std::jthread([this](std::stop_token stop) { Loop(stop); });
+}
+
+bool BackHelper::Enabled() {
+    // Off by default: with the back pinned it saved 0.3 us a draw (2.5%), with it unpinned
+    // nothing, and a pinned back competes with whatever else runs on its core.
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_BACK_HELPER");
+    if (!GpuSplit::OnBackThread() || !Tegra::Nx2Switch(mode, false)) {
+        return false;
+    }
+    if (!back_pinned) {
+        back_pinned = true;
+        PinThisThread(HelperCpus().first);
+    }
+    return true;
+}
+
+void BackHelper::Post(void (*job)(void*), void* context) {
+    job_function = job;
+    job_context = context;
+    posted.fetch_add(1, std::memory_order_release);
+    if (sleeping.load(std::memory_order_seq_cst) != 0) {
+        posted.notify_one();
+    }
+}
+
+void BackHelper::Join() {
+    const u64 target = posted.load(std::memory_order_relaxed);
+    while (done.load(std::memory_order_acquire) != target) {
+        CpuRelax();
+    }
+}
+
+void BackHelper::Loop(std::stop_token stop) {
+    Common::SetCurrentThreadName("GPUBackHelper");
+    PinThisThread(HelperCpus().second);
+    std::stop_callback wake{stop, [this] {
+        posted.fetch_add(1, std::memory_order_release);
+        posted.notify_one();
+    }};
+    u64 seen = 0;
+    u32 idle = 0;
+    while (!stop.stop_requested()) {
+        const u64 now = posted.load(std::memory_order_acquire);
+        if (now == seen) {
+            if (++idle < (1U << 16)) {
+                CpuRelax();
+                continue;
+            }
+            sleeping.store(1, std::memory_order_seq_cst);
+            if (posted.load(std::memory_order_seq_cst) == seen) {
+                posted.wait(seen, std::memory_order_seq_cst);
+            }
+            sleeping.store(0, std::memory_order_relaxed);
+            idle = 0;
+            continue;
+        }
+        idle = 0;
+        seen = now;
+        if (job_function != nullptr) {
+            job_function(job_context);
+        }
+        done.store(now, std::memory_order_release);
+    }
+}
+
 
 namespace {
 

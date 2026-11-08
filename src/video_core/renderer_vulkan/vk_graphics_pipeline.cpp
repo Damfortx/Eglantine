@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -519,7 +520,46 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             window = std::chrono::steady_clock::now();
         }
     }
-    {
+    // With no texture buffers (which bind through the buffer cache once the views are known), the
+    // views are resolved on the split back's helper thread while this thread updates the vertex,
+    // index and other buffers: the two caches share nothing on that path, and the helper only
+    // takes views that are clean hits (TryFillImageViewsClean), so no Vulkan work runs on it.
+    bool buffers_updated = false;
+    if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers) {
+        auto& helper = VideoCommon::BackHelper::Get();
+        if (!views.empty() && regs.transform_feedback_enabled == 0 && helper.Enabled()) {
+            struct Job {
+                TextureCache* texture_cache;
+                std::span<VideoCommon::ImageViewInOut> views;
+                bool blacklist;
+                bool clean;
+            } job{&texture_cache, std::span(views.data(), views.size()), Spec::has_images, false};
+            helper.Post(
+                [](void* context) {
+                    auto* const j = static_cast<Job*>(context);
+                    j->clean = j->texture_cache->TryFillImageViewsClean(j->views, j->blacklist);
+                },
+                &job);
+            for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+                if (Spec::enabled_stages[stage]) {
+                    buffer_cache.UnbindGraphicsTextureBuffers(stage);
+                }
+            }
+            {
+                Profile::Scope scope{Profile::Zone::UpdateBuffers};
+                buffer_cache.UpdateGraphicsBuffers(is_indexed);
+                buffer_cache.BindHostGeometryBuffers(is_indexed);
+            }
+            helper.Join();
+            if (!job.clean) {
+                Profile::Scope scope{Profile::Zone::FillImageViews};
+                texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                             Spec::has_images);
+            }
+            buffers_updated = true;
+        }
+    }
+    if (!buffers_updated) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
@@ -606,7 +646,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
 
-    {
+    if (!buffers_updated) {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);

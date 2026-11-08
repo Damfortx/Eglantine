@@ -37,6 +37,25 @@ public:
         invalidated = true;
     }
 
+    /// Whether Read would report the entry at `index` unchanged (false when it would be new),
+    /// without recording anything: for the split back's texture helper.
+    template <class MemoryManager>
+    [[nodiscard]] bool PeekUnchanged(const MemoryManager& gpu_memory, u32 index) const noexcept {
+        if (invalidated || (read_descriptors[index / 64] & (1ULL << (index % 64))) == 0) {
+            return false;
+        }
+        const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+        T entry;
+        const bool one_page =
+            (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
+        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
+            std::memcpy(std::addressof(entry), host, sizeof(T));
+        } else {
+            gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(entry), sizeof(T));
+        }
+        return !(entry != descriptors[index]);
+    }
+
     template <class MemoryManager>
     [[nodiscard]] std::pair<T, bool> Read(const MemoryManager& gpu_memory, u32 index) noexcept {
         DEBUG_ASSERT(index <= current_limit);
