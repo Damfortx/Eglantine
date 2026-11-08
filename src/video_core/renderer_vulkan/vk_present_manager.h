@@ -75,9 +75,28 @@ public:
 private:
     void PresentThread(std::stop_token token);
 
-    void CopyToSwapchain(Frame* frame);
+    /// Returns true when the frame was handed to the deferred present thread, which then owns it
+    /// and returns it to free_queue itself.
+    bool CopyToSwapchain(Frame* frame);
 
-    void CopyToSwapchainImpl(Frame* frame);
+    bool CopyToSwapchainImpl(Frame* frame);
+
+    /// EDEN_NX2_PRESENT_DEFER (sync presentation only): a job for DeferThread.
+    struct DeferredPresent {
+        Frame* frame;
+        VkSemaphore render_semaphore;
+        u32 image_index;
+    };
+
+    void QueueDeferredPresent(const DeferredPresent& job);
+
+    void RunDeferredPresent(const DeferredPresent& job);
+
+    void DeferThread(std::stop_token token);
+
+    /// Blocks until no deferred present is queued or running. Must be called (on the presenting
+    /// back thread) before any acquire, swapchain recreation/destruction or direct present.
+    void DrainDeferredPresents();
 
     void RecreateSwapchain(Frame* frame);
 
@@ -109,6 +128,15 @@ private:
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
     std::atomic<VkFormat> swapchain_image_format{};
+
+    // EDEN_NX2_PRESENT_DEFER state. defer_thread is declared last so it is destroyed (joined)
+    // before the members it uses.
+    boost::container::deque<DeferredPresent> defer_queue;
+    std::mutex defer_mutex;
+    std::condition_variable_any defer_cv;
+    std::condition_variable defer_idle_cv;
+    bool defer_busy{};
+    std::jthread defer_thread;
 };
 
 } // namespace Vulkan

@@ -214,6 +214,10 @@ void Swapchain::Create(
         return;
     }
 
+    // Callers drain any deferred present first (PresentManager::DrainDeferredPresents); the lock
+    // only guards against a present racing the destruction anyway.
+    std::scoped_lock access_lock{access_mutex};
+
     // Submitted work may still wait on the old acquire/present semaphores; destroying them under
     // it loses the device on MoltenVK (window moved to a display with a different scale).
     if (swapchain) {
@@ -236,9 +240,14 @@ void Swapchain::Create(
 bool Swapchain::AcquireNextImage(bool may_flush) {
     const bool stats = PresentStatsOn();
     const u64 acquire_start = stats ? PresentStatsNow() : 0;
-    const VkResult result = device.GetLogical().AcquireNextImageKHR(
-        *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
-        VK_NULL_HANDLE, &image_index);
+    VkResult result;
+    {
+        // External synchronization with a deferred PresentImage on another thread.
+        std::scoped_lock access_lock{access_mutex};
+        result = device.GetLogical().AcquireNextImageKHR(
+            *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
+            VK_NULL_HANDLE, &image_index);
+    }
     switch (result) {
     case VK_SUCCESS:
         break;
@@ -307,6 +316,11 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
 }
 
 void Swapchain::Present(VkSemaphore render_semaphore) {
+    PresentImage(render_semaphore, image_index);
+}
+
+void Swapchain::PresentImage(VkSemaphore render_semaphore, u32 present_index) {
+    std::scoped_lock access_lock{access_mutex};
     const auto present_queue{device.GetPresentQueue()};
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -315,7 +329,7 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pWaitSemaphores = &render_semaphore,
         .swapchainCount = 1,
         .pSwapchains = swapchain.address(),
-        .pImageIndices = &image_index,
+        .pImageIndices = &present_index,
         .pResults = nullptr,
     };
     const bool stats = PresentStatsOn();

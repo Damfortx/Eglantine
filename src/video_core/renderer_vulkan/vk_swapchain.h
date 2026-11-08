@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <mutex>
 #include <vector>
 
 #include "common/common_types.h"
@@ -53,6 +55,11 @@ public:
 
     /// Presents the rendered image to the swapchain.
     void Present(VkSemaphore render_semaphore);
+
+    /// Presents a given acquired image index. Safe to call from another thread than the one
+    /// acquiring (EDEN_NX2_PRESENT_DEFER): vkAcquireNextImageKHR and vkQueuePresentKHR on the
+    /// same swapchain need external synchronization, so both run under access_mutex.
+    void PresentImage(VkSemaphore render_semaphore, u32 present_index);
 
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {
@@ -159,8 +166,13 @@ private:
     /// EDEN_NX2_PRESENT_MAILBOX, latched at swapchain creation (see CreateSwapchain).
     bool force_mailbox{false};
 
-    bool is_outdated{};
-    bool is_suboptimal{};
+    /// Serializes vkAcquireNextImageKHR / vkQueuePresentKHR / (re)creation on this swapchain.
+    /// Lock order: access_mutex before scheduler.submit_mutex.
+    std::mutex access_mutex;
+
+    /// Atomic: a deferred present (other thread) may set them; the acquiring thread reads them.
+    std::atomic<bool> is_outdated{};
+    std::atomic<bool> is_suboptimal{};
 };
 
 } // namespace Vulkan

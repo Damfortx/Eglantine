@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -168,7 +169,14 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     }
 }
 
-PresentManager::~PresentManager() = default;
+PresentManager::~PresentManager() {
+    // Let a pending deferred present finish (it uses the frames, swapchain and semaphores).
+    DrainDeferredPresents();
+    if (defer_thread.joinable()) {
+        defer_thread.request_stop();
+        defer_thread.join();
+    }
+}
 
 Frame* PresentManager::GetRenderFrame() {
 
@@ -206,8 +214,14 @@ void PresentManager::Present(Frame* frame) {
         if (stats) {
             PresentStatsAdd(PresentWait::Worker, wait_start);
         }
-        CopyToSwapchain(frame);
-        free_queue.push_back(frame);
+        if (!CopyToSwapchain(frame)) {
+            // Locked: with EDEN_NX2_PRESENT_DEFER the defer thread also pushes to free_queue.
+            std::scoped_lock fl{free_mutex};
+            free_queue.push_back(frame);
+            free_cv.notify_one();
+        }
+        // Otherwise the defer thread frees the frame once its present ran: GetRenderFrame resets
+        // present_done at reuse, which must not race the defer thread's wait on it.
     }
 }
 
@@ -322,6 +336,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
 }
 
 void PresentManager::WaitPresent() {
+    DrainDeferredPresents();
     if (!use_present_thread) {
         return;
     }
@@ -356,7 +371,7 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
-            CopyToSwapchain(frame);
+            void(CopyToSwapchain(frame)); // never deferred with the async present thread
 
             // Free the frame for reuse
             std::scoped_lock fl{free_mutex};
@@ -366,7 +381,84 @@ void PresentManager::PresentThread(std::stop_token token) {
     }
 }
 
+void PresentManager::QueueDeferredPresent(const DeferredPresent& job) {
+    if (!defer_thread.joinable()) {
+        defer_thread = std::jthread([this](std::stop_token token) { DeferThread(token); });
+    }
+    {
+        std::scoped_lock lock{defer_mutex};
+        defer_queue.push_back(job);
+    }
+    defer_cv.notify_one();
+}
+
+void PresentManager::DrainDeferredPresents() {
+    if (!defer_thread.joinable()) {
+        return;
+    }
+    std::unique_lock lock{defer_mutex};
+    defer_idle_cv.wait(lock, [this] { return defer_queue.empty() && !defer_busy; });
+}
+
+void PresentManager::DeferThread(std::stop_token token) {
+    Common::SetCurrentThreadName("VulkanPresentDefer");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    while (true) {
+        DeferredPresent job;
+        {
+            std::unique_lock lock{defer_mutex};
+            if (!defer_cv.wait(lock, token, [this] { return !defer_queue.empty(); })) {
+                return; // stop requested (the destructor drained the queue first)
+            }
+            job = defer_queue.front();
+            defer_queue.pop_front();
+            // Popped and marked busy under one lock: a drainer never sees "empty and idle"
+            // while a job is in flight.
+            defer_busy = true;
+        }
+        RunDeferredPresent(job);
+        {
+            std::scoped_lock lock{defer_mutex};
+            defer_busy = false;
+        }
+        defer_idle_cv.notify_all();
+    }
+}
+
+void PresentManager::RunDeferredPresent(const DeferredPresent& job) {
+    Frame* const frame = job.frame;
+    try {
+        // Sleep until the blit is done, so vkQueuePresentKHR returns at once instead of spinning
+        // (NVIDIA X11/XWayland) while holding submit_mutex.
+        const VkResult wait_result = frame->present_done.Wait();
+        if (wait_result == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        if (wait_result == VK_SUCCESS) {
+            // Out of date sets Swapchain::is_outdated, which the back thread sees at its next
+            // acquire (it drains us before acquiring) and recreates through the usual path.
+            swapchain.PresentImage(job.render_semaphore, job.image_index);
+            if (PresentStatsOn()) {
+                PresentStatsCountPresent();
+            }
+        } else {
+            LOG_ERROR(Render_Vulkan, "Deferred present: fence wait failed ({})",
+                      static_cast<int>(wait_result));
+        }
+    } catch (const vk::Exception& except) {
+        // e.g. VK_ERROR_SURFACE_LOST_KHR: the back thread's next acquire hits it too and goes
+        // through CopyToSwapchain's surface/swapchain recreation.
+        LOG_ERROR(Render_Vulkan, "Deferred present failed: {}", except.what());
+    }
+
+    // Only now may the frame be reused (GetRenderFrame resets present_done).
+    std::scoped_lock fl{free_mutex};
+    free_queue.push_back(frame);
+    free_cv.notify_one();
+}
+
 void PresentManager::RecreateSwapchain(Frame* frame) {
+    DrainDeferredPresents();
     swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
     SetImageCount();
 }
@@ -407,7 +499,7 @@ void PresentManager::DiscardFrame(Frame* frame) {
     void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
 }
 
-void PresentManager::CopyToSwapchain(Frame* frame) {
+bool PresentManager::CopyToSwapchain(Frame* frame) {
     bool requires_recreation = false;
 
     for (u32 attempt = 0; attempt < MAX_PRESENT_ATTEMPTS; ++attempt) {
@@ -432,9 +524,18 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
     }
 
     DiscardFrame(frame);
+    return false;
 }
 
-void PresentManager::CopyToSwapchainImpl(Frame* frame) {
+bool PresentManager::CopyToSwapchainImpl(Frame* frame) {
+    // Finish the previous deferred present before touching the swapchain. Besides recreation
+    // safety (and safe toggling of EDEN_NX2_PRESENT_DEFER), this keeps at most one image
+    // acquired at a time, as in plain sync mode: an infinite-timeout acquire while extra images
+    // are still held (not yet presented) could block forever. It also orders the defer
+    // thread's frame_index/is_outdated updates before this thread reads them. Usually free:
+    // the previous blit finished while the next frame was emulated.
+    DrainDeferredPresents();
+
 
     // If the size of the incoming frames has changed, recreate the swapchain
     // to account for that.
@@ -601,6 +702,21 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         }
     }
 
+    // EDEN_NX2_PRESENT_DEFER (sync presentation only): hand the fence wait + vkQueuePresentKHR
+    // to the defer thread so this (GPU emulation) thread does not block on the blit. The render
+    // semaphore is per swapchain image; it is signalled again only after this image is acquired
+    // again, which needs this present to have been submitted first (and we drain before every
+    // acquire anyway).
+    static const char present_defer = Tegra::Nx2EnvMode("EDEN_NX2_PRESENT_DEFER");
+    if (!use_present_thread && Tegra::Nx2Switch(present_defer, true)) {
+        QueueDeferredPresent({
+            .frame = frame,
+            .render_semaphore = render_semaphore,
+            .image_index = static_cast<u32>(swapchain.GetImageIndex()),
+        });
+        return true;
+    }
+
     // EDEN_NX2_PRESENT_FENCE_FIRST: wait for the blit on its fence (asleep) before presenting. On
     // X11/XWayland the NVIDIA driver spins in vkQueuePresentKHR (~2 ms a present, under
     // submit_mutex) until the GPU is done with the image; on Wayland it returns at once.
@@ -618,6 +734,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     if (stats) {
         PresentStatsCountPresent();
     }
+    return false;
 }
 
 } // namespace Vulkan
