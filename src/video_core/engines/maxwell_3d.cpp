@@ -1442,9 +1442,31 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
     if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+        // The buffer cache holds GPU data there (indirect arguments a dispatch wrote): the flush
+        // downloads it, which waits for the host GPU to finish everything (runtime.Finish), ms
+        // each. EDEN_NX2_DMA_READ_WHY also logs these (count, time, why the read drained).
+        const u64 begin = why ? VideoCommon::Nx2Profile::Now() : 0;
         split.Run([memory = &memory_manager, source, read_bytes] {
             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
         }, VideoCommon::GpuSplit::DrainReason::DmaRead);
+        if (why) [[unlikely]] {
+            static u64 n_flush{}, flush_ns{}, n_flush_gpu{}, n_flush_skipped{}, n_flush_ram{};
+            static auto flush_window = std::chrono::steady_clock::now();
+            ++n_flush;
+            flush_ns += VideoCommon::Nx2Profile::Now() - begin;
+            n_flush_gpu += on_gpu_written ? 1 : 0;
+            n_flush_skipped += skipped || partial ? 1 : 0;
+            n_flush_ram += method == 0x158 ? 0 : 1;
+            if (std::chrono::steady_clock::now() - flush_window > std::chrono::seconds{10}) {
+                LOG_INFO(HW_GPU, "MME DMA read downloads in 10 s: {} ({:.1f} ms), {} on "
+                         "GPU-written pages, {} after a skipped drain, {} into data RAM (rest "
+                         "macro parameters); last {:#x} {} bytes",
+                         n_flush, static_cast<double>(flush_ns) / 1e6, n_flush_gpu,
+                         n_flush_skipped, n_flush_ram, source, read_bytes);
+                n_flush = flush_ns = n_flush_gpu = n_flush_skipped = n_flush_ram = 0;
+                flush_window = std::chrono::steady_clock::now();
+            }
+        }
     }
     static std::vector<u32> overlaid;
     if (!known_words.empty()) {

@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <vector>
 #include <cstdlib>
 #include <optional>
@@ -39,11 +41,56 @@ namespace {
 constexpr u32 Gf100BindClassMask = 0xffff;
 constexpr u32 Gf100BindValidMask =  0x1f0000 | Gf100BindClassMask;
 
+// EDEN_NX2_PULLER_STATS: which puller sites wait for the back ("GPU split drains per second:
+// puller" counts them all together). `behind`: the back hadn't run everything sent (a Run always
+// waits: it sends its own work first). Logged every 10 s.
+enum class PullerSite : u32 {
+    TriggerDrain,    ///< SemaphoreOperation acquire not predicted: DrainBack
+    TriggerFences,   ///< ... still unmet after it: ReleaseFences
+    ResumeDrain,     ///< CanResumeAcquire polling a suspended acquire
+    ExecDrain,       ///< SEM_EXECUTE acquire not predicted: DrainBack
+    ExecFences,      ///< ... then ReleaseFences (always)
+    ExecSkipped,     ///< ... neither, EDEN_NX2_SEM_EXECUTE_NODRAIN
+    ReadFlush,       ///< ReadSemaphoreWord downloading a GPU-written word (Run)
+    Legacy,          ///< pre-Ampere acquires
+    Count,
+};
+void NotePullerSite(PullerSite site, bool run = false) {
+    static const bool stats = std::getenv("EDEN_NX2_PULLER_STATS") != nullptr;
+    if (!stats) [[likely]] {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    const bool behind =
+        split.Active() && (run || split.ConsumedPosition() < split.SentPosition());
+    static std::array<u64, static_cast<size_t>(PullerSite::Count)> calls{}, behinds{};
+    static auto window = std::chrono::steady_clock::now();
+    ++calls[static_cast<size_t>(site)];
+    behinds[static_cast<size_t>(site)] += behind ? 1 : 0;
+    if (std::chrono::steady_clock::now() - window < std::chrono::seconds{10}) {
+        return;
+    }
+    static constexpr std::array<const char*, static_cast<size_t>(PullerSite::Count)> names{
+        "acquire drain", "acquire fences", "resume poll",   "sem_execute drain",
+        "sem_execute fences", "sem_execute skipped", "word flush", "legacy acquire"};
+    std::string line;
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (calls[i] != 0) {
+            line += fmt::format(" | {} {} ({} behind)", names[i], calls[i], behinds[i]);
+        }
+    }
+    LOG_INFO(HW_GPU, "Puller waits in 10 s:{}", line);
+    calls = {};
+    behinds = {};
+    window = std::chrono::steady_clock::now();
+}
+
 // Reads a semaphore word, flushing a GPU-written copy out of the buffer cache first.
 u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
     if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
         device && dma_pusher.rasterizer->MustFlushRegion(*device, sizeof(u32),
                                                           VideoCommon::CacheType::BufferCache)) {
+        NotePullerSite(PullerSite::ReadFlush, true);
         // The flush downloads through the Vulkan scheduler, which the split's back owns.
         VideoCommon::GpuSplit::Get().Run([rasterizer = dma_pusher.rasterizer, device = *device] {
             rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
@@ -225,8 +272,28 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         VideoCommon::GpuSplit::Get().NotePredictedAcquire();
         return true;
     }
+    // Title 1 polled ~13,000 times a second, ~330 of them draining a busy back, for semaphores
+    // the CPU or another channel releases. Without a queued release for the address the back
+    // can't meet it soon: check memory and the waiter latch without draining, and drain only
+    // every 8th poll (writes nobody noted, e.g. shaders). EDEN_NX2_RESUME_LAZY=0 drains every
+    // poll (=a alternates).
+    static const char lazy_mode = Tegra::Nx2EnvMode("EDEN_NX2_RESUME_LAZY");
+    if (auto& split = VideoCommon::GpuSplit::Get();
+        split.Active() && Tegra::Nx2Switch(lazy_mode, false) &&
+        !split.HasPendingRelease(pending_acquire->address)) {
+        // A queued release could still change a word that matches now (equal acquires): only
+        // without one is memory the answer.
+        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
+            pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
+            return true;
+        }
+        if ((++lazy_polls & 7) != 0) {
+            return false;
+        }
+    }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
+    NotePullerSite(PullerSite::ResumeDrain);
     DrainBack();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
@@ -429,6 +496,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                          VideoCommon::GpuSplit::Get().last_add_address);
             }
         }
+        NotePullerSite(PullerSite::TriggerDrain);
         DrainBack();
         const bool met_now = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
         NoteAcquireDrain(dma_pusher, had_pending ? 1 : 2, static_cast<u32>(op), acquire.address,
@@ -442,6 +510,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
+        NotePullerSite(PullerSite::TriggerFences, true);
         ReleaseFences(dma_pusher);
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             pending_acquire = acquire;
@@ -451,6 +520,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             waiters.Remove(this);
         }
     } else {
+        NotePullerSite(PullerSite::Legacy);
         DrainBack();
         do {
             const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
@@ -538,8 +608,20 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         VideoCommon::GpuSplit::Get().NotePredictedAcquire();
         return;
     }
+    // These acquires never block (see below: an unmet one only logs and the channel goes on),
+    // so the drain and the fence release that follow change nothing the front does next: they
+    // only made it wait for the back (and the back submit) at every acquire no queued release
+    // predicts. EDEN_NX2_SEM_EXECUTE_NODRAIN=1 goes on without them (=a alternates; off by
+    // default). The back still runs every release in order, before anything sent after this.
+    static const char nodrain_mode = Tegra::Nx2EnvMode("EDEN_NX2_SEM_EXECUTE_NODRAIN");
+    if (VideoCommon::GpuSplit::Get().Active() && Tegra::Nx2Switch(nodrain_mode, false)) {
+        NotePullerSite(PullerSite::ExecSkipped);
+        return;
+    }
     const bool had_pending = VideoCommon::GpuSplit::Get().HasPendingRelease(address);
+    NotePullerSite(PullerSite::ExecDrain);
     DrainBack();
+    NotePullerSite(PullerSite::ExecFences, true);
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
     NoteAcquireDrain(dma_pusher, had_pending ? 3 : 4, 100 + operation, address, payload,
