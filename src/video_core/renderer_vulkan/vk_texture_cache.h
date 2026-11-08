@@ -655,7 +655,7 @@ class ImageView : public VideoCommon::ImageViewBase {
 public:
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::ImageViewInfo&, ImageId, Image&);
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::ImageViewInfo&, ImageId, Image&,
-                       const SlotVector<Image>&);
+                       const VideoCommon::MT::StableSlotVector<Image>&);
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::ImageInfo&,
                        const VideoCommon::ImageViewInfo&, GPUVAddr);
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::NullImageViewParams&);
@@ -733,7 +733,7 @@ private:
                                          std::optional<Shader::TextureType> texture_type = std::nullopt);
 
     const Device* device = nullptr;
-    const SlotVector<Image>* slot_images = nullptr;
+    const VideoCommon::MT::StableSlotVector<Image>* slot_images = nullptr;
 
     std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
     std::optional<StorageViews> storage_views;

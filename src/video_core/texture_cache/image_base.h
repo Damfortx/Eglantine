@@ -13,6 +13,7 @@
 
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "video_core/mt/atomic_flags.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_info.h"
 #include "video_core/texture_cache/types.h"
@@ -60,6 +61,10 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    /// aliased_images is not empty (kept by NoteAliasesChanged, for lock-free readers).
+    HasAliases = 1 << 24,
+    /// Deleted: its slot may be reused; readers holding its id must re-resolve.
+    Dead = 1 << 25,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -120,7 +125,27 @@ struct ImageBase {
 
     size_t channel = 0;
 
-    ImageFlagBits flags = ImageFlagBits::CpuModified;
+    /// Atomic so resolver threads can check bits without the cache lock (docs/mt-plan.md).
+    MT::AtomicEnumFlags<ImageFlagBits> flags = ImageFlagBits::CpuModified;
+    /// Bumped whenever a resolved view of this image may be stale: CPU modified, remapped,
+    /// aliases changed, rescaled, deleted. Readers compare it at commit.
+    MT::CopyableAtomic<u32> version{0};
+    /// Frame of the last LRU touch, to touch at most once per frame from the committer.
+    MT::CopyableAtomic<u64> last_touch_frame{0};
+
+    void BumpVersion() noexcept {
+        version.fetch_add(1, std::memory_order_release);
+    }
+
+    /// Call after aliased_images changed.
+    void NoteAliasesChanged() noexcept {
+        if (aliased_images.empty()) {
+            flags &= ~ImageFlagBits::HasAliases;
+        } else {
+            flags |= ImageFlagBits::HasAliases;
+        }
+        BumpVersion();
+    }
 
     GPUVAddr gpu_addr = 0;
     VAddr cpu_addr = 0;

@@ -108,7 +108,7 @@ public:
                                 ComputePassDescriptorQueue& compute_pass_descriptor_queue,
                                 DescriptorPool& descriptor_pool);
 
-    void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
+    void TickFrame(VideoCommon::MT::StableSlotVector<Buffer>& slot_buffers) noexcept;
 
     /// Returns the mask of bindings whose repacked state changed.
     u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);

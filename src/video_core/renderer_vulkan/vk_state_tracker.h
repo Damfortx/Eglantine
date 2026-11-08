@@ -292,6 +292,14 @@ public:
 
     void InvalidateState();
 
+    /// The dirty flags tracked (the channel's engine; a mirror's under the multithreaded back).
+    void SetFlags(Tegra::Engines::Maxwell3D::DirtyState::Flags* new_flags) noexcept {
+        flags = new_flags;
+    }
+    [[nodiscard]] Tegra::Engines::Maxwell3D::DirtyState::Flags* GetFlags() const noexcept {
+        return flags;
+    }
+
 private:
     static constexpr auto INVALID_TOPOLOGY = static_cast<Maxwell::PrimitiveTopology>(~0u);
 

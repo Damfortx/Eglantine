@@ -94,7 +94,7 @@ public:
     void PostCopyBarrier();
     void Finish();
 
-    void TickFrame(Common::SlotVector<Buffer>&) noexcept {}
+    void TickFrame(VideoCommon::MT::StableSlotVector<Buffer>&) noexcept {}
 
     void ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value);
 

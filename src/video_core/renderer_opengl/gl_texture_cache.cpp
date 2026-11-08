@@ -1101,7 +1101,7 @@ bool Image::ScaleDown(bool ignore) {
 }
 
 ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewInfo& info,
-                     ImageId image_id_, Image& image, const SlotVector<Image>&)
+                     ImageId image_id_, Image& image, const VideoCommon::MT::StableSlotVector<Image>&)
     : VideoCommon::ImageViewBase{info, image.info, image_id_, image.gpu_addr},
       views{runtime.null_image_views} {
     const Device& device = runtime.device;

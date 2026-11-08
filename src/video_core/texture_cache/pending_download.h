@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <utility>
 #include "common/slot_vector.h"
+#include "video_core/mt/stable_slot_vector.h"
 
 namespace VideoCommon {
 
@@ -18,7 +19,7 @@ struct PendingImageDownload {
     Common::SlotId object_id;
     std::shared_ptr<Image> retired_image{};
 
-    Image& GetImage(Common::SlotVector<Image>& images) const {
+    Image& GetImage(MT::StableSlotVector<Image>& images) const {
         return retired_image ? *retired_image : images[object_id];
     }
 };
@@ -27,7 +28,7 @@ struct PendingImageDownload {
 // for the same live image therefore observe the same contents. Keep the first
 // occurrence so reverse CPU writeback order remains unchanged for aliases.
 template <class Image, class Downloads>
-size_t DeduplicatePendingImageDownloads(Downloads& downloads, Common::SlotVector<Image>& images) {
+size_t DeduplicatePendingImageDownloads(Downloads& downloads, MT::StableSlotVector<Image>& images) {
     std::unordered_set<const Image*> seen;
     const size_t previous_size = downloads.size();
     const auto end = std::remove_if(downloads.begin(), downloads.end(), [&](const auto& download) {

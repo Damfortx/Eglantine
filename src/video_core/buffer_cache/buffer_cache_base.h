@@ -43,6 +43,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/mt/stable_slot_vector.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -592,7 +593,10 @@ private:
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
-    Common::SlotVector<Buffer> slot_buffers;
+    // Stable storage: resolver threads hold references across inserts (docs/mt-plan.md).
+    MT::StableSlotVector<Buffer> slot_buffers;
+    /// Bumped when a buffer goes away (DeleteBuffer, including the joins of JoinOverlap).
+    std::atomic<u64> buffer_epoch{0};
 #ifdef YUZU_LEGACY
     static constexpr size_t TICKS_TO_DESTROY = 6;
 #else
@@ -612,6 +616,9 @@ private:
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 
     MemoryTracker memory_tracker;
+    /// Guards memory_tracker once the sequencer, CPU write traps and the committer share it
+    /// (multithreaded back; unused on the single-threaded path).
+    std::mutex tracker_mutex;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
     /// Set (by the GPU thread) whenever downloads are queued for the next fence; cleared once a
     /// commit leaves none. Fences check it before taking the contended cache lock.

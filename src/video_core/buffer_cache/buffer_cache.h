@@ -2288,10 +2288,13 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
     const u64 page_begin = device_addr_begin / CACHING_PAGESIZE;
     const u64 page_end = Common::DivCeil(device_addr_end, CACHING_PAGESIZE);
     for (u64 page = page_begin; page != page_end; ++page) {
+        // Release stores: lock-free readers (resolvers) load entries with acquire and then
+        // read the buffer they name.
         if constexpr (insert) {
-            page_table[page] = buffer_id;
+            std::atomic_ref<BufferId>{page_table[page]}.store(buffer_id, std::memory_order_release);
         } else {
-            page_table[page] = BufferId{};
+            std::atomic_ref<BufferId>{page_table[page]}.store(BufferId{},
+                                                              std::memory_order_release);
         }
     }
 }
@@ -2600,6 +2603,8 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+    // Resolved buffer ranges recorded with an older epoch are re-validated at commit.
+    buffer_epoch.fetch_add(1, std::memory_order_release);
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }

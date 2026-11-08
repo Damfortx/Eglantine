@@ -1009,6 +1009,7 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
             const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
             if (is_new_tc) {
                 pair->second = CreateImageView(descriptor);
+                channel_state->image_views_mt.InsertOrAssign(descriptor, pair->second);
                 if (pair->second != NULL_IMAGE_VIEW_ID) {
                     image_view_descriptors[pair->second].emplace_back(current_channel_id,
                                                                       descriptor);
@@ -1050,6 +1051,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+            image.BumpVersion();
             return;
         }
         if (True(image.flags & ImageFlagBits::SparseTiles)) {
@@ -1064,6 +1066,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
             return;
         }
         image.flags |= ImageFlagBits::CpuModified;
+        image.BumpVersion();
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
         }
@@ -1194,6 +1197,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
                 UntrackImage(image, id);
             }
         }
+        image.BumpVersion();
         image.dirty_layers.clear(); // all of it
         if (True(image.flags & ImageFlagBits::Remapped)) {
             continue;
@@ -1970,6 +1974,7 @@ void TextureCache<P>::MarkLayersWritten(Image& image, DAddr cpu_addr, size_t siz
         image.flags |= ImageFlagBits::CpuModified;
         image.dirty_layers.assign(Common::DivCeil(layers, 64U), 0);
     }
+    image.BumpVersion();
     const DAddr begin = (std::max<DAddr>)(cpu_addr, image.cpu_addr) - image.cpu_addr;
     const DAddr end = (std::min<DAddr>)(cpu_addr + size, image.cpu_addr + image.guest_size_bytes) -
                       image.cpu_addr;
@@ -1994,6 +1999,7 @@ void TextureCache<P>::MarkRangeWritten(Image& image, DAddr cpu_addr, size_t size
         return;
     }
     image.flags |= ImageFlagBits::CpuModified;
+    image.BumpVersion();
     image.dirty_ranges.emplace_back(begin - image.cpu_addr, end - begin);
 }
 
@@ -2030,6 +2036,7 @@ bool TextureCache<P>::BindSparseTiles(Image& image, std::span<const LevelRect> r
     if constexpr (requires { &Image::BindTiles; }) {
         const u64 bound_bytes = ImageMemoryBytes(image);
         const bool bound = image.BindTiles(rects);
+        image.BumpVersion(); // sparse remap
         // RegisterImage counts what an image has bound by then; later binds are added here.
         if (True(image.flags & ImageFlagBits::Registered)) {
             total_used_memory += ImageMemoryBytes(image) - bound_bytes;
@@ -2045,6 +2052,7 @@ bool TextureCache<P>::BackSparseTilesWhole(Image& image) {
     if constexpr (requires { &Image::BackTilesWhole; }) {
         const u64 bound_bytes = ImageMemoryBytes(image);
         const bool backed = image.BackTilesWhole();
+        image.BumpVersion(); // sparse remap
         if (True(image.flags & ImageFlagBits::Registered)) {
             total_used_memory += ImageMemoryBytes(image) - bound_bytes;
         }
@@ -2109,6 +2117,7 @@ std::vector<u32> TextureCache<P>::BindSparseLayers(Image& image, std::span<const
     if constexpr (requires { &Image::BindLayers; }) {
         const u64 bound_bytes = ImageMemoryBytes(image);
         std::vector<u32> bound = image.BindLayers(layers);
+        image.BumpVersion(); // sparse remap
         // RegisterImage counts what an image has bound by then; later binds are added here.
         if (True(image.flags & ImageFlagBits::Registered)) {
             total_used_memory += ImageMemoryBytes(image) - bound_bytes;
@@ -2649,6 +2658,7 @@ bool TextureCache<P>::ScaleUp(Image& image) {
     if (!rescaled) {
         return false;
     }
+    image.BumpVersion();
     InvalidateScale(image);
     return true;
 }
@@ -2659,6 +2669,7 @@ bool TextureCache<P>::ScaleDown(Image& image) {
     if (!rescaled) {
         return false;
     }
+    image.BumpVersion();
     InvalidateScale(image);
     return true;
 }
@@ -3125,6 +3136,7 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
     const auto [pair, is_new] = channel_state->samplers.try_emplace(config);
     if (is_new) {
         pair->second = slot_samplers.insert(runtime, config);
+        channel_state->samplers_mt.InsertOrAssign(config, pair->second);
     }
     return pair->second;
 }
@@ -3401,6 +3413,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
         // Before the map views go in: WriteMemory only finds images through them, and the
         // rasterizer skips it on ranges without these bits (Nx2MayHoldTexture).
         Tegra::Nx2MarkTexturePages(image.cpu_addr, image.guest_size_bytes);
+        texture_page_count.Add(image.cpu_addr, image.guest_size_bytes, 1);
         auto map_id =
             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
@@ -3412,6 +3425,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ForEachSparseSegment(
         image, [this, image_id, &sparse_maps](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
             Tegra::Nx2MarkTexturePages(cpu_addr, size);
+            texture_page_count.Add(cpu_addr, size, 1);
             auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
             ForEachCPUPage(cpu_addr, size,
                            [this, map_id](u64 page) { page_table[page].push_back(map_id); });
@@ -3467,6 +3481,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
             }
             image_map_ids.erase(vector_it);
         });
+        texture_page_count.Add(image.cpu_addr, image.guest_size_bytes, -1);
         slot_map_views.erase(map_id);
         return;
     }
@@ -3480,6 +3495,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
         const auto& map_range = slot_map_views[map_view_id];
         const DAddr cpu_addr = map_range.cpu_addr;
         const std::size_t size = map_range.size;
+        texture_page_count.Add(cpu_addr, size, -1);
         ForEachCPUPage(cpu_addr, size, [this, image_id](u64 page) {
             const auto page_it = page_table.find(page);
             if (page_it == page_table.end()) {
@@ -3625,6 +3641,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
                 return other_alias.id == image_id;
             });
         other_image.CheckAliasState();
+        other_image.NoteAliasesChanged();
         ASSERT_MSG(num_removed_aliases == 1, "Invalid number of removed aliases: {}",
                    num_removed_aliases);
     }
@@ -3644,6 +3661,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         slot_image_views.erase(image_view_id);
     }
     ++view_epoch; // Erased views: memoized ImageViewIds may be reused (TryReuseGraphicsBindings)
+    image.flags |= ImageFlagBits::Dead;
+    image.BumpVersion();
     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
                                                        uncommitted_downloads, committed_downloads);
     if (retained) {
@@ -3695,6 +3714,7 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
             if (const auto it = image_views.find(descriptor);
                 it != image_views.end() && it->second == removed) {
                 image_views.erase(it);
+                channel_storage[channel].image_views_mt.Erase(descriptor);
             }
         }
         image_view_descriptors.erase(refs);
@@ -3828,6 +3848,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
                         image.gpu_addr);
             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+            image.BumpVersion();
         }
         MarkModification(image);
     }

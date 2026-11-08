@@ -37,6 +37,9 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
+#include "video_core/mt/concurrent_map.h"
+#include "video_core/mt/page_counter.h"
+#include "video_core/mt/stable_slot_vector.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
@@ -92,6 +95,9 @@ public:
     // TODO: still relies on bad iterators :(
     std::unordered_map<TICEntry, ImageViewId> image_views;
     std::unordered_map<TSCEntry, SamplerId> samplers;
+    /// Lock-free twins of image_views/samplers for resolver threads, kept in step with them.
+    MT::SingleWriterMap<TICEntry, ImageViewId> image_views_mt;
+    MT::SingleWriterMap<TSCEntry, SamplerId> samplers_mt;
 
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
@@ -597,6 +603,10 @@ private:
 
     DAddr virtual_invalid_space{};
 
+    /// Registered images per 64 KiB device page: the sequencer's texture-page write barrier
+    /// (I5) checks it before writing guest memory.
+    MT::PageCounter texture_page_count;
+
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
 
@@ -620,11 +630,12 @@ private:
 
     using PendingDownload = PendingImageDownload<Image>;
 
-    Common::SlotVector<Image> slot_images;
+    // Stable storage: resolver threads hold references across inserts (docs/mt-plan.md).
+    MT::StableSlotVector<Image> slot_images;
     Common::SlotVector<ImageMapView> slot_map_views;
-    Common::SlotVector<ImageView> slot_image_views;
+    MT::StableSlotVector<ImageView> slot_image_views;
     Common::SlotVector<ImageAlloc> slot_image_allocs;
-    Common::SlotVector<Sampler> slot_samplers;
+    MT::StableSlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;
     Common::SlotVector<BufferDownload> slot_buffer_downloads;
 

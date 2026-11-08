@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common/thread_worker.h"
+#include "video_core/mt/engine_ptr.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -169,7 +170,7 @@ private:
     void Validate();
 
     const GraphicsPipelineCacheKey key;
-    Tegra::Engines::Maxwell3D* maxwell3d;
+    VideoCommon::MT::ThreadEnginePtr<Tegra::Engines::Maxwell3D> maxwell3d;
     Tegra::MemoryManager* gpu_memory;
     const Device& device;
     TextureCache& texture_cache;

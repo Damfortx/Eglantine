@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/mt/engine_ptr.h"
 
 namespace Tegra {
 
@@ -81,8 +82,9 @@ protected:
     P* channel_state = nullptr;
     size_t current_channel_id{UNSET_CHANNEL};
     size_t current_address_space{};
-    Tegra::Engines::Maxwell3D* maxwell3d{};
-    Tegra::Engines::KeplerCompute* kepler_compute{};
+    // Thread-overridable: the multithreaded back's committer/resolvers see their mirrors.
+    MT::ThreadEnginePtr<Tegra::Engines::Maxwell3D> maxwell3d{};
+    MT::ThreadEnginePtr<Tegra::Engines::KeplerCompute> kepler_compute{};
     Tegra::MemoryManager* gpu_memory{};
     u64 program_id{};
 

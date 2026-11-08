@@ -254,7 +254,7 @@ class ImageView : public VideoCommon::ImageViewBase {
 
 public:
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::ImageViewInfo&, ImageId, Image&,
-                       const SlotVector<Image>&);
+                       const VideoCommon::MT::StableSlotVector<Image>&);
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::ImageInfo&,
                        const VideoCommon::ImageViewInfo&, GPUVAddr);
     explicit ImageView(TextureCacheRuntime&, const VideoCommon::ImageInfo& info,
