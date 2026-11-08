@@ -893,7 +893,7 @@ inline void Nx2DrawPipeline::ShadowCompare(const MT::ResolvedDraw& res, const Dr
     }
     for (u32 i = 0; i < res.num_buffers; ++i) {
         const MT::BufferRef& ref = res.buffers[i];
-        if (ref.kind == MT::KindIndex && header.draw_state.draw_indexed == false) {
+        if (ref.kind == MT::KindIndex && header.is_indexed == 0) {
             continue;
         }
         const VideoCommon::BufferId bound =
