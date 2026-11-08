@@ -1285,9 +1285,36 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
-    MT_COMMAND(Query, [this, gpu_addr, type, flags, payload, subreport] {
-        Query(gpu_addr, type, flags, payload, subreport);
-    })
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        // A payload report the query cache writes at once (no fence, no counter): written here,
+        // in order with the sequencer's captures and the front's position-noted writes (R7).
+        if (type == VideoCommon::QueryType::Payload && !Settings::IsGPULevelHigh() &&
+            False(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
+            const auto cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+            if (!cpu_addr) {
+                return;
+            }
+            const bool has_timestamp = True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
+            VideoCommon::MT::BeforeGuestWrite(*cpu_addr, has_timestamp ? 16 : 4);
+            u8* const pointer = device_memory.GetPointer<u8>(*cpu_addr);
+            if (has_timestamp) {
+                u8* const pointer_timestamp = device_memory.GetPointer<u8>(*cpu_addr + 8);
+                const u64 timestamp = gpu.GetTicks();
+                const u64 value = static_cast<u64>(payload);
+                std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+                std::memcpy(pointer, &value, sizeof(value));
+            } else {
+                std::memcpy(pointer, &payload, sizeof(payload));
+            }
+            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*cpu_addr, payload);
+            return;
+        }
+        mt->Command(MT::Kind::Query, [this, gpu_addr, type, flags, payload, subreport] {
+            Query(gpu_addr, type, flags, payload, subreport);
+        });
+        mt->NoteQueryEmitted();
+        return;
+    }
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 
@@ -1560,7 +1587,11 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
-    MT_SERIAL(InvalidateRegion, OnCacheInvalidation(addr, size))
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        const std::pair<DAddr, std::size_t> region{addr, size};
+        mt->SeqCacheInvalidations(std::span(&region, 1));
+        return;
+    }
 
     if (MayHoldTexture(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
@@ -1574,7 +1605,10 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, std::size_t>> regions) {
-    MT_SERIAL(InvalidateRegion, OnCacheInvalidations(regions))
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        mt->SeqCacheInvalidations(regions);
+        return;
+    }
     // What OnCacheInvalidation does for each region, with each cache's lock taken once.
     namespace Profile = VideoCommon::Nx2Profile;
     if (Profile::Enabled()) [[unlikely]] {
@@ -1624,7 +1658,6 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
-    MT_SERIAL(InvalidateGPUCache, InvalidateGPUCache())
     gpu.InvalidateGPUCache();
 }
 
@@ -1825,7 +1858,6 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
-    MT_SERIAL(InlineToMemory, AccelerateInlineToMemory(address, copy_size, memory))
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (gpu_memory->UsesNativeTiling()) {
         u32 first_word{};
@@ -1840,6 +1872,14 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
             LOG_INFO(Render_Vulkan, "Semaphore watch: inline write {:#x} size {} first word {:#x}",
                      address, copy_size, first_word);
         }
+    }
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        if (mt->SeqInlineToMemory(address, cpu_addr, copy_size, memory)) {
+            return;
+        }
+        mt->Serial(MT::Kind::InlineToMemory,
+                   [&] { AccelerateInlineToMemory(address, copy_size, memory); });
+        return;
     }
     if (!cpu_addr) [[unlikely]] {
         gpu_memory->WriteBlock(address, memory.data(), copy_size);

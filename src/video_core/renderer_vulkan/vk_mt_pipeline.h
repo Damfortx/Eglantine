@@ -212,6 +212,17 @@ public:
     /// RasterizerVulkan::InnerInvalidation on the sequencer (FlushCaching).
     void SeqInnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences);
 
+    /// The buffer cache part of an invalidation on the sequencer.
+    void SeqInvalidateBuffers(std::span<const std::pair<DAddr, std::size_t>> regions);
+    /// RasterizerVulkan::OnCacheInvalidation(s) on the sequencer (guest CPU writes gathered at
+    /// a fence): images only once the committer recorded everything before.
+    void SeqCacheInvalidations(std::span<const std::pair<DAddr, std::size_t>> regions);
+
+    /// RasterizerVulkan::AccelerateInlineToMemory on the sequencer: the write and its deferred
+    /// invalidation here when it lands outside GPU-written buffer data; false to run it Serial.
+    bool SeqInlineToMemory(GPUVAddr address, std::optional<DAddr> cpu_addr, size_t copy_size,
+                           std::span<const u8> memory);
+
     void ForceSerialReason(u32 reason) {
         counters.forced_serial[reason].fetch_add(1, std::memory_order_relaxed);
     }
@@ -346,6 +357,15 @@ private:
     std::vector<VideoCommon::MT::UploadEntry> uploads;
     std::vector<u8> blob;
     std::vector<std::pair<DAddr, u32>> taken_ranges;
+    u64 last_query_position = 0;
+
+public:
+    /// Sequencer: a query report was just emitted.
+    void NoteQueryEmitted() {
+        last_query_position = stream.WritePosition();
+    }
+
+private:
     std::chrono::steady_clock::time_point last_stats{std::chrono::steady_clock::now()};
 
     // Committer-owned.
@@ -1501,12 +1521,87 @@ inline void Nx2DrawPipeline::SeqInnerInvalidation(
             }
         }
     }
-    // Buffers: GPU data on the written pages is downloaded first, which only the scheduler's
-    // owner may do: those ranges go to the committer.
+    SeqInvalidateBuffers(sequences);
+    // Queries: pages that ever held one (set before the entry goes in, so a query the committer
+    // has not inserted yet is covered by checking for reports still in flight).
+    const bool queries_in_flight = stream.ConsumerPosition(consumer) < last_query_position;
+    std::vector<std::pair<DAddr, std::size_t>>* query_ranges = nullptr;
+    for (const auto& [addr, size] : sequences) {
+        if (queries_in_flight || Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, addr, size)) {
+            if (query_ranges == nullptr) {
+                query_ranges = new std::vector<std::pair<DAddr, std::size_t>>();
+            }
+            query_ranges->emplace_back(addr, size);
+        }
+    }
+    if (query_ranges != nullptr) {
+        Command(MT::Kind::Query, [rp = &r, query_ranges] {
+            for (const auto& [addr, size] : *query_ranges) {
+                rp->query_cache.InvalidateRegion(addr, size);
+            }
+            delete query_ranges;
+        });
+    }
+    r.pipeline_cache.InvalidateRegions(sequences);
+}
+
+} // namespace Vulkan
+
+namespace Vulkan {
+
+inline bool Nx2DrawPipeline::SeqInlineToMemory(GPUVAddr address, std::optional<DAddr> cpu_addr,
+                                               size_t copy_size, std::span<const u8> memory) {
+    RasterizerVulkan& r = rasterizer;
+    if (!cpu_addr) {
+        return false;
+    }
+    // As AccelerateInlineToMemory: writes into GPU-written buffer data are uploaded into the
+    // buffer (committer); the rest only invalidate, at the next FlushCaching.
+    static const bool defer = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const char inline_mode = Tegra::Nx2EnvMode("EDEN_NX2_INLINE_FAST");
+    const bool inline_fast = Tegra::Nx2Switch(inline_mode, true);
+    if (!defer || !inline_fast || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const u64 last = (*cpu_addr + copy_size + Core::DEVICE_PAGESIZE - 1) &
+                     ~u64{Core::DEVICE_PAGEMASK};
+    for (u64 page = *cpu_addr & ~u64{Core::DEVICE_PAGEMASK}; page < last;
+         page += u64{1} << Tegra::Nx2WrittenPageBits) {
+        if (Tegra::Nx2IsGpuWritten(page)) {
+            return false;
+        }
+    }
+    // The memory manager's write hook waits for the committer first over image/command-list
+    // pages (I5, R4).
+    r.gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    r.buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+    if (stream.ConsumerPosition(consumer) < last_query_position ||
+        Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, *cpu_addr, copy_size)) {
+        // Pending query results must not land over the new words later.
+        Command(MT::Kind::Query, [rp = &r, addr = *cpu_addr, copy_size] {
+            rp->query_cache.InvalidateRegion(addr, copy_size);
+        });
+    }
+    r.gpu_memory->AccumulateInvalidation(address, copy_size);
+    return true;
+}
+
+} // namespace Vulkan
+
+namespace Vulkan {
+
+inline void Nx2DrawPipeline::SeqInvalidateBuffers(
+    std::span<const std::pair<DAddr, std::size_t>> regions) {
+    RasterizerVulkan& r = rasterizer;
+    // GPU data on the written pages is downloaded first, which only the scheduler's owner may
+    // do: those ranges go to the committer.
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 8> owner_ranges;
     {
         std::scoped_lock lock{r.buffer_cache.mutex};
-        for (const auto& [addr, size] : sequences) {
+        for (const auto& [addr, size] : regions) {
             if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
                 owner_ranges.emplace_back(addr, size);
             } else {
@@ -1514,26 +1609,35 @@ inline void Nx2DrawPipeline::SeqInnerInvalidation(
             }
         }
     }
-    boost::container::small_vector<std::pair<DAddr, std::size_t>, 8> query_ranges;
-    for (const auto& [addr, size] : sequences) {
-        if (!fast || Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, addr, size)) {
-            query_ranges.emplace_back(addr, size);
-        }
-    }
-    if (!owner_ranges.empty() || !query_ranges.empty()) {
+    if (!owner_ranges.empty()) {
         Serial(MT::Kind::InvalidateRegion, [&] {
-            if (!owner_ranges.empty()) {
-                std::scoped_lock lock{r.buffer_cache.mutex};
-                for (const auto& [addr, size] : owner_ranges) {
-                    r.buffer_cache.WriteMemory(addr, size);
-                }
-            }
-            for (const auto& [addr, size] : query_ranges) {
-                r.query_cache.InvalidateRegion(addr, size);
+            std::scoped_lock lock{r.buffer_cache.mutex};
+            for (const auto& [addr, size] : owner_ranges) {
+                r.buffer_cache.WriteMemory(addr, size);
             }
         });
     }
-    r.pipeline_cache.InvalidateRegions(sequences);
+}
+
+inline void Nx2DrawPipeline::SeqCacheInvalidations(
+    std::span<const std::pair<DAddr, std::size_t>> regions) {
+    RasterizerVulkan& r = rasterizer;
+    if (std::ranges::any_of(regions, [](const auto& region) {
+            return region.first != 0 && region.second != 0 &&
+                   Tegra::Nx2MayHoldTexture(region.first, region.second);
+        })) {
+        // Draws captured before these writes must not see them in a refreshed image.
+        counters.write_barriers.fetch_add(1, std::memory_order_relaxed);
+        WaitCommitted();
+        std::scoped_lock lock{r.texture_cache.mutex};
+        for (const auto& [addr, size] : regions) {
+            if (addr != 0 && size != 0) {
+                r.texture_cache.WriteMemory(addr, size);
+            }
+        }
+    }
+    SeqInvalidateBuffers(regions);
+    r.pipeline_cache.InvalidateRegions(regions);
 }
 
 } // namespace Vulkan
