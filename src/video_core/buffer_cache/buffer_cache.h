@@ -206,7 +206,7 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
     MT::TrackerScope tracker_scope{tracker_mutex};
-    MT::BumpWriteGeneration(device_addr, size);
+    MT::BumpWriteGeneration(device_addr, size, true);
     Nx2NoteListHostWrite(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
@@ -238,12 +238,13 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
         DownloadMemory(page_begin, page_end - page_begin);
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+    MT::NoteGuestWrite(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
 }
 
 template <class P>
 void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
-    MT::BumpWriteGeneration(device_addr, size);
+    MT::BumpWriteGeneration(device_addr, size, true);
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return;
@@ -265,7 +266,7 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
     MT::TrackerScope tracker_scope{tracker_mutex};
-    MT::BumpWriteGeneration(device_addr, size);
+    MT::BumpWriteGeneration(device_addr, size, true);
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return false;
@@ -900,7 +901,7 @@ void BufferCache<P>::PopAsyncBuffers() {
         // Only what no write replaced since the copy was taken: the rest is older than guest
         // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
         ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
-            MT::BumpWriteGeneration(start, end - start);
+            MT::BumpWriteGeneration(start, end - start, true);
             device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
                                            end - start);
             gpu_modified_ranges.Subtract(start, end - start);
@@ -2395,7 +2396,9 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
     if (const MT::CaptureView* const capture = MT::t_capture) [[unlikely]] {
         if (capture->verify && device_addr != 0 && size != 0 &&
             IsRegionCpuModified(device_addr, size)) {
-            if (capture->uncaptured_syncs++ == 0) {
+            if (MT::GuestCpuWrites().WrittenSince(capture->cpu_write_since, device_addr, size)) {
+                ++capture->concurrent_cpu_syncs;
+            } else if (capture->uncaptured_syncs++ == 0) {
                 capture->first_uncaptured_addr = device_addr;
                 capture->first_uncaptured_size = size;
             }
@@ -2634,7 +2637,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     const u8* const mapped_memory = download_staging.mapped_span.data();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
-        MT::BumpWriteGeneration(device_addr, download.copy.size);
+        MT::BumpWriteGeneration(device_addr, download.copy.size, true);
         device_memory.WriteBlockUnsafe(
             device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
             download.copy.size);
@@ -2691,7 +2694,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             // Undo the modified offset
             const u64 dst_offset = copy.dst_offset - download_staging.offset;
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
-            MT::BumpWriteGeneration(copy_device_addr, copy.size);
+            MT::BumpWriteGeneration(copy_device_addr, copy.size, true);
             device_memory.WriteBlockUnsafe(copy_device_addr, copy_mapped_memory, copy.size);
         }
     } else {
@@ -2699,7 +2702,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         for (const BufferCopy& copy : copies) {
             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
-            MT::BumpWriteGeneration(copy_device_addr, copy.size);
+            MT::BumpWriteGeneration(copy_device_addr, copy.size, true);
             device_memory.WriteBlockUnsafe(copy_device_addr, immediate_buffer.data(), copy.size);
         }
     }
@@ -2746,7 +2749,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     if (!do_not_mark) {
         Buffer& buffer = slot_buffers[buffer_id];
         MT::TrackerScope tracker_scope{tracker_mutex};
-        MT::BumpWriteGeneration(buffer.CpuAddr(), buffer.SizeBytes());
+        MT::BumpWriteGeneration(buffer.CpuAddr(), buffer.SizeBytes(), true);
         memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
     }
 

@@ -64,6 +64,10 @@ struct CaptureView {
     mutable u64 uncaptured_syncs = 0;
     mutable u64 first_uncaptured_addr = 0;
     mutable u64 first_uncaptured_size = 0;
+    /// EDEN_NX2_MT_VERIFY: GuestCpuWrites() at the capture (writes after it are races, not
+    /// capture misses), and the syncs it explained.
+    u64 cpu_write_since = 0;
+    mutable u64 concurrent_cpu_syncs = 0;
 
     /// Copies [gpu_addr, +size) when one entry holds all of it.
     [[nodiscard]] bool Read(u64 gpu_addr, void* out, size_t size) const noexcept {

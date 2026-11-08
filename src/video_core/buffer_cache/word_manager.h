@@ -12,6 +12,7 @@
 #include <span>
 #include <utility>
 #include <vector>
+#include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
 #include "common/common_funcs.h"
@@ -184,12 +185,23 @@ struct WordManager {
         bool pending = false;
         size_t pending_offset{};
         size_t pending_pointer{};
-        const auto release = [&]() {
-            func(cpu_addr + pending_offset * BYTES_PER_PAGE,
-                 (pending_pointer - pending_offset) * BYTES_PER_PAGE);
-        };
         std::vector<std::pair<VAddr, u64>> ranges;
         const bool affects_upload = clear && (type == Type::CPU || type == Type::CachedCPU);
+        // Clearing CPU bits re-protects the pages (ApplyCollectedRanges): the callers read guest
+        // memory in `func`, so they run after it. Read first, a guest CPU write between the
+        // read and the protection was lost (neither uploaded nor trapped).
+        boost::container::small_vector<std::pair<VAddr, u64>, 8> after_protect;
+        const auto emit = [&](VAddr range_addr, u64 range_size) {
+            if (affects_upload) {
+                after_protect.emplace_back(range_addr, range_size);
+            } else {
+                func(range_addr, range_size);
+            }
+        };
+        const auto release = [&]() {
+            emit(cpu_addr + pending_offset * BYTES_PER_PAGE,
+                 (pending_pointer - pending_offset) * BYTES_PER_PAGE);
+        };
         IterateWords(offset, size, [&](size_t index, u64 mask) {
             const u64 before_cpu = affects_upload ? CpuWord(index) : 0;
             const u64 before_untracked = affects_upload ? UntrackedWord(index) : 0;
@@ -223,7 +235,7 @@ struct WordManager {
                 } else if (pending_pointer == base_offset + pages_offset) {
                     pending_pointer += pages_size;
                 } else {
-                    func(cpu_addr + pending_offset * BYTES_PER_PAGE, (pending_pointer - pending_offset) * BYTES_PER_PAGE);
+                    emit(cpu_addr + pending_offset * BYTES_PER_PAGE, (pending_pointer - pending_offset) * BYTES_PER_PAGE);
                     pending_offset = base_offset + pages_offset;
                     pending_pointer = base_offset + pages_offset + pages_size;
                 }
@@ -234,6 +246,9 @@ struct WordManager {
         }
         if (!ranges.empty()) {
             ApplyCollectedRanges(ranges, 1);
+        }
+        for (const auto& [range_addr, range_size] : after_protect) {
+            func(range_addr, range_size);
         }
     }
 

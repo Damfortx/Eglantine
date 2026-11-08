@@ -210,7 +210,7 @@ bool BufferCache<P>::MtIsRegionRegistered(DAddr device_addr, u64 size) {
 template <class P>
 typename BufferCache<P>::MtTrapResult BufferCache<P>::MtTrapWrite(DAddr device_addr, u64 size,
                                                                   bool trap) {
-    MT::BumpWriteGeneration(device_addr, size);
+    MT::BumpWriteGeneration(device_addr, size, true);
     {
         MT::TrackerScope tracker_scope{tracker_mutex};
         // Registration is checked under the tracker lock: a buffer the committer creates
@@ -229,6 +229,7 @@ typename BufferCache<P>::MtTrapResult BufferCache<P>::MtTrapWrite(DAddr device_a
             return MtTrapResult::NeedsMutex;
         }
         memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+        MT::NoteGuestWrite(device_addr, size);
         if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
             mt_stale_ranges.emplace_back(device_addr, size);
             mt_stale_pending.store(true, std::memory_order_release);

@@ -97,9 +97,90 @@ inline WriteGenerations& UboWriteGenerations() {
 /// Set while EDEN_NX2_MT_UBO_GEN runs (the committer is up): write paths bump generations.
 inline std::atomic<bool> g_ubo_gen_on{};
 
-inline void BumpWriteGeneration(u64 device_addr, u64 size) {
+/// EDEN_NX2_MT_VERIFY: the guest CPU writes the GPU side heard of (traps, invalidations), so the
+/// verifier can tell a write made by a game thread between a draw's capture and its commit (a
+/// race the old single-threaded back had as well, at another point in time) from a capture bug.
+class CpuWriteLog {
+public:
+    static constexpr u64 Entries = 4096;
+    static constexpr u64 PageMask = ~u64{0xfff};
+
+    void Record(u64 device_addr, u64 size) noexcept {
+        const u64 n = count.fetch_add(1, std::memory_order_acq_rel) + 1;
+        Entry& entry = ring[n & (Entries - 1)];
+        entry.n.store(0, std::memory_order_relaxed);
+        entry.begin.store(device_addr & PageMask, std::memory_order_relaxed);
+        entry.end.store((device_addr + size + 0xfff) & PageMask, std::memory_order_relaxed);
+        entry.n.store(n, std::memory_order_release);
+    }
+
+    [[nodiscard]] u64 Snapshot() const noexcept {
+        return count.load(std::memory_order_acquire);
+    }
+
+    /// Whether a write recorded after `since` may overlap [device_addr, +size) (true when the
+    /// log wrapped or an entry is being written).
+    [[nodiscard]] bool WrittenSince(u64 since, u64 device_addr, u64 size) const noexcept {
+        const u64 current = count.load(std::memory_order_acquire);
+        if (current == since) {
+            return false;
+        }
+        if (current - since >= Entries) {
+            return true;
+        }
+        const u64 begin = device_addr & PageMask;
+        const u64 end = (device_addr + size + 0xfff) & PageMask;
+        for (u64 n = since + 1; n <= current; ++n) {
+            const Entry& entry = ring[n & (Entries - 1)];
+            if (entry.n.load(std::memory_order_acquire) != n) {
+                return true;
+            }
+            if (entry.begin.load(std::memory_order_relaxed) < end &&
+                begin < entry.end.load(std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    struct Entry {
+        std::atomic<u64> n{0};
+        std::atomic<u64> begin{0};
+        std::atomic<u64> end{0};
+    };
+    alignas(64) std::atomic<u64> count{0};
+    std::array<Entry, Entries> ring{};
+};
+
+inline CpuWriteLog& GuestCpuWrites() {
+    static CpuWriteLog log;
+    return log;
+}
+
+/// Set while the committer runs with EDEN_NX2_MT_VERIFY.
+inline std::atomic<bool> g_cpu_write_log_on{};
+
+/// `guest`: a write a draw's capture may race with: guest CPU writes the GPU side heard of
+/// (traps, WriteMemory, invalidations), asynchronous downloads of GPU data into guest memory,
+/// and a deleted buffer's range handed back to guest memory (DeleteBuffer marks it
+/// CPU-modified). Not the ordered writes the GPU side makes (copies, inline uploads,
+/// semaphores).
+/// EDEN_NX2_MT_VERIFY: a guest CPU write marked CPU-modified in the tracker (recorded again at
+/// the marking: the sequencer's capture may hold the tracker lock between the trap's start and
+/// its marking).
+inline void NoteGuestWrite(u64 device_addr, u64 size) {
+    if (g_cpu_write_log_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        GuestCpuWrites().Record(device_addr, size);
+    }
+}
+
+inline void BumpWriteGeneration(u64 device_addr, u64 size, bool guest = false) {
     if (g_ubo_gen_on.load(std::memory_order_relaxed)) {
         UboWriteGenerations().Bump(device_addr, size);
+    }
+    if (guest && g_cpu_write_log_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        GuestCpuWrites().Record(device_addr, size);
     }
 }
 
