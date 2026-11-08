@@ -307,6 +307,21 @@ public:
     enum class WriteKnown : u8 { Position, Writers, Drain };
     void NotePendingWrite(GPUVAddr address, u64 size, WriteKnown known = WriteKnown::Position,
                           u8 tag = 0, std::optional<u32> value = std::nullopt) {
+        // Writes known with the writers only ever make reads of their range wait for the
+        // writers, so one entry a range is enough: title 1's inline QMDs reuse their addresses
+        // and, kept until a drain, overflowed the table a few times a second (every MME DMA
+        // read then drained). Off by default: with it title 1 issued ~2x the compute dispatches a draw
+        // (it adapts its work to what it measures?) and lost 10 fps. EDEN_NX2_WRITERS_DEDUP=1 (=a).
+        static const char dedup_mode = Tegra::Nx2EnvMode("EDEN_NX2_WRITERS_DEDUP");
+        if (known == WriteKnown::Writers && Tegra::Nx2Switch(dedup_mode, false)) {
+            for (size_t i = 0; i < pending_write_count; ++i) {
+                const auto& write = pending_writes[i];
+                if (write.known == WriteKnown::Writers && write.begin == address &&
+                    write.end == address + size) {
+                    return;
+                }
+            }
+        }
         if (pending_write_count == pending_writes.size()) {
             // Drop the ones the back has run.
             const u64 done = consumed.load(std::memory_order_acquire);
