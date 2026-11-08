@@ -59,9 +59,10 @@ bool BufferCache<P>::MtPrefersSparseSources() {
 
 template <class P>
 Binding BufferCache<P>::MtStorageBinding(GPUVAddr gpu_addr, u64 next_qword, u32 cbuf_index,
-                                         bool is_written) const {
-    return StorageBufferBindingFromDescriptor(gpu_addr, next_qword, cbuf_index, is_written, false,
-                                              false);
+                                         bool is_written, bool native_pointer,
+                                         bool mapping_sized) const {
+    return StorageBufferBindingFromDescriptor(gpu_addr, next_qword, cbuf_index, is_written,
+                                              native_pointer, mapping_sized);
 }
 
 template <class P>

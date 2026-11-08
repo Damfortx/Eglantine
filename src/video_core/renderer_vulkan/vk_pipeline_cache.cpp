@@ -774,7 +774,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
         // once the slot holds a buffer.
         if (pipeline && !pipeline->null_pointer_slots.empty() && pipeline->pointer_rebuilds < 4 &&
             NullPointerSlotFilled(*pipeline)) {
-            auto rebuilt{CreateComputePipeline(key, shader, pipeline.get())};
+            auto rebuilt{VideoCommon::MT::RunOnCommitter(
+                [&] { return CreateComputePipeline(key, shader, pipeline.get()); })};
             if (rebuilt) {
                 LOG_INFO(Render_Vulkan,
                          "Compute pipeline {:016x} rebuilt: a pointer slot null at its translation "
@@ -789,7 +790,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
         }
         return pipeline.get();
     }
-    pipeline = CreateComputePipeline(key, shader);
+    pipeline = VideoCommon::MT::RunOnCommitter([&] { return CreateComputePipeline(key, shader); });
     return pipeline.get();
 }
 

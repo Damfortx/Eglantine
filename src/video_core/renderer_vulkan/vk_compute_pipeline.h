@@ -63,6 +63,14 @@ public:
     std::vector<u64> null_pointer_slots;
     u32 pointer_rebuilds{};
 
+    /// Immutable after construction (the multithreaded back's sequencer reads them).
+    [[nodiscard]] const Shader::Info& GetInfo() const noexcept {
+        return info;
+    }
+    [[nodiscard]] const VideoCommon::ComputeUniformBufferSizes& UniformSizes() const noexcept {
+        return uniform_buffer_sizes;
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();

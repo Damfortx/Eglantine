@@ -216,12 +216,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 const u32 secondary_offset{desc.secondary_cbuf_offset + index_offset};
                 const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
                                              secondary_offset};
-                const u32 lhs_raw{gpu_memory.Read<u32>(addr) << desc.shift_left};
-                const u32 rhs_raw{gpu_memory.Read<u32>(separate_addr) << desc.secondary_shift_left};
+                const u32 lhs_raw{VideoCommon::MT::ReadCaptured<u32>(gpu_memory, addr) << desc.shift_left};
+                const u32 rhs_raw{VideoCommon::MT::ReadCaptured<u32>(gpu_memory, separate_addr) << desc.secondary_shift_left};
                 return TexturePair(lhs_raw | rhs_raw, via_header_index);
             }
         }
-        return TexturePair(gpu_memory.Read<u32>(addr), via_header_index);
+        return TexturePair(VideoCommon::MT::ReadCaptured<u32>(gpu_memory, addr), via_header_index);
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {
         for (u32 index = 0; index < desc.count; ++index) {

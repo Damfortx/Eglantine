@@ -257,7 +257,8 @@ public:
     [[nodiscard]] bool MtPageHoldsGpuData(DAddr device_addr, u64 size);
     [[nodiscard]] bool MtPrefersSparseSources();
     [[nodiscard]] Binding MtStorageBinding(GPUVAddr gpu_addr, u64 next_qword, u32 cbuf_index,
-                                           bool is_written) const;
+                                           bool is_written, bool native_pointer = false,
+                                           bool mapping_sized = false) const;
     /// Takes the CPU-modified parts of the range out of the tracker (SynchronizeBuffer's walk):
     /// emit(device_addr, size) for each, whose bytes the caller copies now.
     template <typename Func>

@@ -1489,15 +1489,37 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
         // Small buffers the GPU has not written are streamed, as graphics ones are: synchronizing
         // them made every dispatch re-protect pages an inline upload had just unprotected (two
         // VirtualProtect calls per dispatch, ~4,000 dispatches a second in title 1).
-        const bool use_fast_buffer =
+        bool use_fast_buffer =
             needs_alignment_stream ||
             (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
              !memory_tracker.IsRegionGpuModified(binding.device_addr, size));
+        // The multithreaded back's committer (compute packets: stage 5).
+        const MT::UboEntry* captured = nullptr;
+        if (const MT::CaptureView* const capture = MT::t_capture) [[unlikely]] {
+            captured = capture->FindUbo(5, index);
+            if (captured == nullptr) {
+                ++capture->ubo_misses;
+            } else {
+                const bool staged = captured->staged != 0;
+                if (capture->verify && (staged != use_fast_buffer ||
+                                        (staged && captured->size != size))) {
+                    ++capture->decision_mismatches;
+                }
+                use_fast_buffer = staged;
+                if (!staged) {
+                    captured = nullptr;
+                }
+            }
+        }
         if constexpr (!IS_OPENGL) {
             if (use_fast_buffer) {
                 const std::span<u8> span =
                     runtime.BindMappedUniformBuffer(0, binding_index, size);
-                device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
+                if (captured != nullptr) [[unlikely]] {
+                    std::memcpy(span.data(), MT::t_capture->blob + captured->offset, size);
+                } else {
+                    device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
+                }
                 return;
             }
         }

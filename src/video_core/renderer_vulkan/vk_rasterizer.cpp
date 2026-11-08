@@ -483,6 +483,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 }
 
 void RasterizerVulkan::ReportDrawFailure(std::string_view reason) {
+    // The multithreaded back reports from the sequencer and the committer.
+    static std::mutex seen_mutex;
+    std::scoped_lock seen_lock{seen_mutex};
     static std::set<std::tuple<u64, u64, std::string_view>> seen;
     const auto& regs = maxwell3d->regs;
     const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
@@ -494,8 +497,12 @@ void RasterizerVulkan::ReportDrawFailure(std::string_view reason) {
 }
 
 bool RasterizerVulkan::MeshDrawAllowed(GraphicsPipeline* pipeline) {
-    // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
-    mesh_draw = pipeline->IsMeshPipeline();
+    // Task/mesh pipelines: the draw's vertex count is the number of task workgroups. (The
+    // multithreaded back's committer sets mesh_draw from the packet's pipeline.)
+    const bool is_mesh = pipeline->IsMeshPipeline();
+    if (!VideoCommon::MT::OnSequencer()) {
+        mesh_draw = is_mesh;
+    }
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
     // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
     // to compare the same scene with and without them in one run.
@@ -506,7 +513,7 @@ bool RasterizerVulkan::MeshDrawAllowed(GraphicsPipeline* pipeline) {
     if (no_mesh_file && (no_mesh_check++ % 1024) == 0) {
         no_mesh = std::filesystem::exists(no_mesh_file);
     }
-    if (mesh_draw && (no_mesh || !device.IsExtMeshShaderSupported())) {
+    if (is_mesh && (no_mesh || !device.IsExtMeshShaderSupported())) {
         ReportDrawFailure(no_mesh ? "EDEN_NX2_NO_MESH" : "no VK_EXT_mesh_shader");
         return false;
     }
@@ -1153,7 +1160,10 @@ bool SyncFixEnabled() {
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {
-    MT_SERIAL(Dispatch, DispatchCompute())
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        mt->SeqDispatch();
+        return;
+    }
     VideoCommon::MT::MirrorCheckCompute(*kepler_compute);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     // As PrepareDraw: both cache locks once for the dispatch.
@@ -1172,6 +1182,10 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
+    DispatchComputeBody(pipeline, native_key);
+}
+
+void RasterizerVulkan::DispatchComputeBody(ComputePipeline* pipeline, u64 native_key) {
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
     // Command list pages the dispatch writes are copied for the split's front right after it.
     buffer_cache.Nx2CollectListCopies(true);

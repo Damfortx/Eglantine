@@ -261,6 +261,20 @@ public:
     }
 
     bool IsNativeMode() const { return native_mode; }
+    /// Multithreaded back: what a dispatch's state reads besides the registers, carried to the
+    /// committer's mirror (EDEN_NX2_MT_COMPUTE=packet).
+    struct MtDispatchState {
+        bool native_mode;
+        bool dlss_active;
+    };
+    [[nodiscard]] MtDispatchState MtGetDispatchState() const {
+        return {native_mode, dlss_chain.active};
+    }
+    void MtSetDispatchState(const MtDispatchState& state) {
+        native_mode = state.native_mode;
+        dlss_chain.active = state.dlss_active;
+        indirect_compute.reset();
+    }
     /// Whether the current native dispatch belongs to a recognized game DLSS evaluation.
     bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
     /// Whether the matrix multiplies (tensor-core instructions) of the program being dispatched

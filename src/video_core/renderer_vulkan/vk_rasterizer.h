@@ -205,6 +205,8 @@ private:
     bool ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is_indexed);
     void RecordDraw(bool is_indexed, u32 instance_count);
     void ClearBody(u32 layer_count);
+    /// DispatchCompute from the cache locks on, with the pipeline looked up.
+    void DispatchComputeBody(ComputePipeline* pipeline, u64 native_key);
     /// The draw's pipeline for the dynamic states: the multithreaded back's committer records a
     /// packet's (the cache's current one belongs to the sequencer).
     GraphicsPipeline* DynamicStatePipeline() {
