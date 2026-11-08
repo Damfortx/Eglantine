@@ -66,7 +66,12 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
+// Bump CACHE_VERSION for translation changes, as before: a cache from an older version is then
+// translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
+// too only when the record layout (environment or key serialization) changes, which deletes older
+// caches. 20 changed the environment layout; the keys last changed before it.
 constexpr u32 CACHE_VERSION = 21;
+constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 20;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -648,6 +653,24 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
 
+// EDEN_NX2_BACKGROUND_PIPELINES=0: cached pipelines boot skips are built when first needed, on
+// the GPU thread, as before. EDEN_NX2_BACKGROUND_PIPELINE_THREADS sets how many threads build
+// them (default a quarter of the host's, 1 to 6).
+bool BackgroundPipelinesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_BACKGROUND_PIPELINES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+size_t BackgroundPipelineThreads() {
+    if (const char* value = std::getenv("EDEN_NX2_BACKGROUND_PIPELINE_THREADS")) {
+        return std::clamp<size_t>(static_cast<size_t>(std::strtoull(value, nullptr, 10)), 1, 16);
+    }
+    return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 6);
+}
+
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
     static const bool all = [] {
@@ -659,6 +682,7 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    StopBackgroundPipelines();
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -774,6 +798,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
+    VideoCommon::CacheUpgrade main_upgrade;
+    VideoCommon::CacheUpgrade mesh_upgrade;
+    std::unordered_set<u64> boot_graphics; ///< Graphics keys built at boot (loading thread)
+    std::vector<std::pair<GraphicsPipelineCacheKey, std::vector<FileEnvironment>>> deferred_graphics;
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
@@ -859,9 +887,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
+            if (BackgroundPipelinesEnabled()) {
+                deferred_graphics.emplace_back(key, std::move(envs));
+            }
             return;
         }
         ++queued_graphics;
+        boot_graphics.insert(hash);
 
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
@@ -884,11 +916,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         ++state.total;
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
-                               load_graphics);
+                               load_graphics, false, MIN_COMPATIBLE_CACHE_VERSION, &main_upgrade);
     if (device.IsExtMeshShaderSupported()) {
         loading_mesh_file = true;
         VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
-                                   load_compute, load_graphics, true);
+                                   load_compute, load_graphics, true, MIN_COMPATIBLE_CACHE_VERSION,
+                                   &mesh_upgrade);
     }
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
@@ -904,6 +937,105 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+
+    // A cache from an older compatible version: its records were translated again above. Write
+    // it back under the current version without the ones that failed (deferred ones are kept).
+    const auto finish_upgrade = [&](VideoCommon::CacheUpgrade& upgrade,
+                                    const std::filesystem::path& filename) {
+        if (upgrade.from_version == 0 || stop_loading.stop_requested()) {
+            return;
+        }
+        std::vector<const std::string*> kept;
+        size_t retranslated = 0, dropped = 0;
+        for (size_t index = 0; index < upgrade.records.size(); ++index) {
+            const std::string& record = upgrade.records[index];
+            if (upgrade.is_compute[index]) {
+                ComputePipelineCacheKey key;
+                if (record.size() < sizeof(key)) {
+                    ++dropped;
+                    continue;
+                }
+                std::memcpy(&key, record.data() + record.size() - sizeof(key), sizeof(key));
+                const auto it = compute_cache.find(key);
+                if (it == compute_cache.end() || !it->second) {
+                    ++dropped;
+                    continue;
+                }
+                ++retranslated;
+            } else {
+                GraphicsPipelineCacheKey key;
+                if (record.size() < sizeof(key)) {
+                    ++dropped;
+                    continue;
+                }
+                std::memcpy(&key, record.data() + record.size() - sizeof(key), sizeof(key));
+                if (boot_graphics.contains(key.Hash())) {
+                    const auto it = graphics_cache.find(key);
+                    if (it == graphics_cache.end() || !it->second) {
+                        ++dropped;
+                        continue;
+                    }
+                    ++retranslated;
+                }
+            }
+            kept.push_back(&record);
+        }
+        VideoCommon::RewritePipelines(filename, CACHE_VERSION, upgrade.from_version, kept);
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline cache from version {} kept: {} records re-translated, {} dropped ({} "
+                 "kept for later)",
+                 upgrade.from_version, retranslated, dropped, kept.size() - retranslated);
+    };
+    finish_upgrade(main_upgrade, pipeline_cache_filename);
+    finish_upgrade(mesh_upgrade, mesh_pipeline_cache_filename);
+
+    if (!deferred_graphics.empty() && !stop_loading.stop_requested()) {
+        const size_t threads = BackgroundPipelineThreads();
+        LOG_INFO(Render_Vulkan, "Building {} cached graphics pipelines in the background ({} threads)",
+                 deferred_graphics.size(), threads);
+        background_left.store(deferred_graphics.size(), std::memory_order_relaxed);
+        background_start = std::chrono::steady_clock::now();
+        background_active.store(true, std::memory_order_release);
+        background_workers.reset(new Common::ThreadWorker(threads, "VkPipelinePrebuild", {},
+                                                          Common::ThreadPlacement::Background));
+        for (auto& deferred : deferred_graphics) {
+            background_workers->QueueWork([this, key = deferred.first,
+                                           envs_ = std::move(deferred.second)]() mutable {
+                bool build = !background_stop.load(std::memory_order_relaxed);
+                if (build) {
+                    std::scoped_lock lock{background_mutex};
+                    build = !background_claimed.contains(key);
+                }
+                std::unique_ptr<GraphicsPipeline> pipeline;
+                if (build) {
+                    ShaderPools pools;
+                    boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+                    for (auto& env : envs_) {
+                        env_ptrs.push_back(&env);
+                    }
+                    pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
+                }
+                std::unique_lock lock{background_mutex};
+                if (pipeline && !background_claimed.contains(key)) {
+                    background_ready.emplace(key, std::move(pipeline));
+                }
+                if (background_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    const auto seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - background_start).count();
+                    LOG_INFO(Render_Vulkan,
+                             "Background pipelines done in {:.1f} s: {} ready, {} taken by draws, "
+                             "{} built by the GPU thread first",
+                             seconds, background_ready.size() + background_taken, background_taken,
+                             background_claimed.size());
+                    background_claimed.clear();
+                    background_active.store(false, std::memory_order_release);
+                }
+                lock.unlock();
+                // A pipeline dropped here was never bound, so no GPU work can still use it.
+                pipeline.reset();
+            });
+        }
+    }
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -1008,7 +1140,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     auto& pipeline{pair->second};
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
-        pipeline = CreateGraphicsPipeline();
+        pipeline = TakeBackgroundPipeline(graphics_key);
+        if (!pipeline) {
+            pipeline = CreateGraphicsPipeline();
+        }
     }
     if (!pipeline) {
         return nullptr;
@@ -1077,6 +1212,27 @@ void PipelineCache::EvictUnusedPipelines() {
     }
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
              EvictAfterFrames, graphics_cache.size());
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
+    const GraphicsPipelineCacheKey& key) {
+    std::scoped_lock lock{background_mutex};
+    if (const auto it = background_ready.find(key); it != background_ready.end()) {
+        auto pipeline = std::move(it->second);
+        background_ready.erase(it);
+        ++background_taken;
+        return pipeline;
+    }
+    if (background_active.load(std::memory_order_acquire)) {
+        background_claimed.insert(key);
+    }
+    return nullptr;
+}
+
+void PipelineCache::StopBackgroundPipelines() {
+    background_stop.store(true, std::memory_order_relaxed);
+    // Joins the threads: a build in progress finishes, queued ones are dropped.
+    background_workers.reset();
 }
 
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {

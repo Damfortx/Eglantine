@@ -1098,6 +1098,14 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
     FrontWrite(split, fs, method, argument, is_last_call, false);
 }
 
+void Maxwell3D::FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                              const u32* words, u32 count, bool ends_method) {
+    auto& fs = Front(system, split);
+    for (u32 i = 0; i < count; ++i) {
+        FrontWrite(split, fs, method + i, words[i], ends_method && i + 1 == count, false);
+    }
+}
+
 void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
                                      u32 method, const u32* base_start, u32 amount,
                                      u32 methods_pending) {
@@ -1305,7 +1313,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
     if (check) [[unlikely]] {
         if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-            memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+            split.Run([memory = &memory_manager, source, read_bytes] {
+                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+            }, VideoCommon::GpuSplit::DrainReason::DmaRead);
         }
         std::array<u32, 64> after{};
         memory_manager.ReadBlockUnsafe(source, after.data(), checked * sizeof(u32));
@@ -1331,7 +1341,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
     if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+        split.Run([memory = &memory_manager, source, read_bytes] {
+            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+        }, VideoCommon::GpuSplit::DrainReason::DmaRead);
     }
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
