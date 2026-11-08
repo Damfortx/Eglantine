@@ -384,16 +384,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         gpu_memory->FlushCaching();
     }
 
-    const auto report_failure = [&](std::string_view reason) {
-        static std::set<std::tuple<u64, u64, std::string_view>> seen;
-        const auto& regs = maxwell3d->regs;
-        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-        if (seen.size() < 64 && seen.emplace(vs, ps, reason).second) {
-            LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,
-                        regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
-        }
-    };
+    const auto report_failure = [&](std::string_view reason) { ReportDrawFailure(reason); };
     GraphicsPipeline* const pipeline{[&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
@@ -437,50 +428,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         submitted = true;
         return;
     }
-    // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
-    mesh_draw = pipeline->IsMeshPipeline();
-    // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
-    // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
-    // to compare the same scene with and without them in one run.
-    static const bool no_mesh_always{std::getenv("EDEN_NX2_NO_MESH") != nullptr};
-    static const char* const no_mesh_file{std::getenv("EDEN_NX2_NO_MESH_FILE")};
-    static bool no_mesh{no_mesh_always};
-    static u32 no_mesh_check{};
-    if (no_mesh_file && (no_mesh_check++ % 1024) == 0) {
-        no_mesh = std::filesystem::exists(no_mesh_file);
-    }
-    if (mesh_draw && (no_mesh || !device.IsExtMeshShaderSupported())) {
-        report_failure(no_mesh ? "EDEN_NX2_NO_MESH" : "no VK_EXT_mesh_shader");
+    if (!MeshDrawAllowed(pipeline)) {
         return;
     }
-    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-    // update engine as channel may be different.
-    pipeline->SetEngine(maxwell3d, gpu_memory);
-    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
-        maxwell3d->regs, pipeline->HasDynamicVertexInput());
-    if (repack_dirty) {
-        auto& flags = maxwell3d->dirty.flags;
-        flags[VideoCommon::Dirty::VertexBuffers] = true;
-        flags[Dirty::VertexInput] = true;
-        for (u32 binding = 0; binding < 32; ++binding) {
-            if (repack_dirty & (1U << binding)) {
-                flags[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
-            }
-        }
-    }
-    if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
-        report_failure("configure failed");
+    if (!ConfigureDrawPipeline(pipeline, is_indexed)) {
         return;
     }
-
-    {
-        Profile::Scope scope{Profile::Zone::DynamicState};
-        UpdateDynamicStates();
-    }
-
-    query_cache.NotifySegment(true);
-    HandleTransformFeedback();
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         draw_func();
@@ -529,6 +482,112 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
 }
 
+void RasterizerVulkan::ReportDrawFailure(std::string_view reason) {
+    static std::set<std::tuple<u64, u64, std::string_view>> seen;
+    const auto& regs = maxwell3d->regs;
+    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+    if (seen.size() < 64 && seen.emplace(vs, ps, reason).second) {
+        LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,
+                    regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
+    }
+}
+
+bool RasterizerVulkan::MeshDrawAllowed(GraphicsPipeline* pipeline) {
+    // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
+    mesh_draw = pipeline->IsMeshPipeline();
+    // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
+    // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
+    // to compare the same scene with and without them in one run.
+    static const bool no_mesh_always{std::getenv("EDEN_NX2_NO_MESH") != nullptr};
+    static const char* const no_mesh_file{std::getenv("EDEN_NX2_NO_MESH_FILE")};
+    static bool no_mesh{no_mesh_always};
+    static u32 no_mesh_check{};
+    if (no_mesh_file && (no_mesh_check++ % 1024) == 0) {
+        no_mesh = std::filesystem::exists(no_mesh_file);
+    }
+    if (mesh_draw && (no_mesh || !device.IsExtMeshShaderSupported())) {
+        ReportDrawFailure(no_mesh ? "EDEN_NX2_NO_MESH" : "no VK_EXT_mesh_shader");
+        return false;
+    }
+    return true;
+}
+
+bool RasterizerVulkan::ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is_indexed) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // update engine as channel may be different.
+    pipeline->SetEngine(maxwell3d, gpu_memory);
+    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+        maxwell3d->regs, pipeline->HasDynamicVertexInput());
+    if (repack_dirty) {
+        auto& flags = maxwell3d->dirty.flags;
+        flags[VideoCommon::Dirty::VertexBuffers] = true;
+        flags[Dirty::VertexInput] = true;
+        for (u32 binding = 0; binding < 32; ++binding) {
+            if (repack_dirty & (1U << binding)) {
+                flags[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
+            }
+        }
+    }
+    if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+        ReportDrawFailure("configure failed");
+        return false;
+    }
+
+    {
+        Profile::Scope scope{Profile::Zone::DynamicState};
+        UpdateDynamicStates();
+    }
+
+    query_cache.NotifySegment(true);
+    HandleTransformFeedback();
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    return true;
+}
+
+void RasterizerVulkan::RecordDraw(bool is_indexed, u32 instance_count) {
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const u32 num_instances{instance_count};
+    const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+
+    if (mesh_draw) {
+        scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+            if (scheduler.GraphicsPipelineMissing()) {
+                return;
+            }
+            cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
+        });
+        return;
+    }
+    scheduler.Record([this, draw_params](vk::CommandBuffer cmdbuf) {
+        if (scheduler.GraphicsPipelineMissing()) {
+            return;
+        }
+        if (draw_params.is_indexed) {
+            cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
+                               draw_params.first_index, draw_params.base_vertex,
+                               draw_params.base_instance);
+        } else {
+            cmdbuf.Draw(draw_params.num_vertices, draw_params.num_instances,
+                        draw_params.base_vertex, draw_params.base_instance);
+        }
+    });
+
+    // Log draw call
+    if (GPU::Logging::IsActive() &&
+        Settings::values.gpu_log_vulkan_calls.GetValue()) {
+        const std::string params = is_indexed ?
+            fmt::format("vertices={}, instances={}, firstIndex={}, baseVertex={}, baseInstance={}",
+                draw_params.num_vertices, draw_params.num_instances,
+                draw_params.first_index, draw_params.base_vertex, draw_params.base_instance) :
+            fmt::format("vertices={}, instances={}, firstVertex={}, firstInstance={}",
+                draw_params.num_vertices, draw_params.num_instances,
+                draw_params.base_vertex, draw_params.base_instance);
+        GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
+            is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
+    }
+}
 
 namespace {
 // EDEN_NX2_WINDOW_TRACE: describe clears and draws into screen-sized colour targets (debug aid).
@@ -612,7 +671,6 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
-    MT_SERIAL(Draw, Draw(is_indexed, instance_count))
     Tegra::g_nx2_draws.fetch_add(1, std::memory_order_relaxed);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
@@ -742,48 +800,11 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
-    PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
-        const auto& draw_state = maxwell3d->draw_manager.draw_state;
-        const u32 num_instances{instance_count};
-        const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
-
-        if (mesh_draw) {
-            scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
-                if (scheduler.GraphicsPipelineMissing()) {
-                    return;
-                }
-                cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
-            });
-            return;
-        }
-        scheduler.Record([this, draw_params](vk::CommandBuffer cmdbuf) {
-            if (scheduler.GraphicsPipelineMissing()) {
-                return;
-            }
-            if (draw_params.is_indexed) {
-                cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
-                                   draw_params.first_index, draw_params.base_vertex,
-                                   draw_params.base_instance);
-            } else {
-                cmdbuf.Draw(draw_params.num_vertices, draw_params.num_instances,
-                            draw_params.base_vertex, draw_params.base_instance);
-            }
-        });
-
-        // Log draw call
-        if (GPU::Logging::IsActive() &&
-            Settings::values.gpu_log_vulkan_calls.GetValue()) {
-            const std::string params = is_indexed ?
-                fmt::format("vertices={}, instances={}, firstIndex={}, baseVertex={}, baseInstance={}",
-                    draw_params.num_vertices, draw_params.num_instances,
-                    draw_params.first_index, draw_params.base_vertex, draw_params.base_instance) :
-                fmt::format("vertices={}, instances={}, firstVertex={}, firstInstance={}",
-                    draw_params.num_vertices, draw_params.num_instances,
-                    draw_params.base_vertex, draw_params.base_instance);
-            GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
-                is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
-        }
-    });
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        mt->SeqDraw(is_indexed, instance_count);
+        return;
+    }
+    PrepareDraw(is_indexed, [this, is_indexed, instance_count] { RecordDraw(is_indexed, instance_count); });
 }
 
 void RasterizerVulkan::DrawIndirect() {
@@ -912,7 +933,6 @@ void RasterizerVulkan::DrawTexture() {
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
-    MT_SERIAL(Clear, Clear(layer_count))
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
@@ -922,9 +942,25 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                  regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        // The invalidations here; the clear (registers only, no guest reads) on the committer.
+        gpu_memory->FlushCaching();
+        const auto& surface = maxwell3d->regs.clear_surface;
+        if (!surface.R && !surface.G && !surface.B && !surface.A && !surface.Z && !surface.S) {
+            return;
+        }
+        mt->Command(MT::Kind::Clear, [this, layer_count] {
+            FlushWork();
+            ClearBody(layer_count);
+        });
+        return;
+    }
     FlushWork();
     gpu_memory->FlushCaching();
+    ClearBody(layer_count);
+}
 
+void RasterizerVulkan::ClearBody(u32 layer_count) {
     auto& regs = maxwell3d->regs;
     const bool use_color = regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
                            regs.clear_surface.A;
@@ -1414,7 +1450,10 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
-    MT_SERIAL(InvalidateRegion, InnerInvalidation(sequences))
+    if (VideoCommon::MT::OnSequencer()) [[unlikely]] {
+        mt->SeqInnerInvalidation(sequences);
+        return;
+    }
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
@@ -2103,7 +2142,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
     }
 
     if (device.IsExtVertexInputDynamicStateSupported()) {
-        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {
+        if (auto* gp = DynamicStatePipeline(); gp && gp->HasDynamicVertexInput()) {
             UpdateVertexInput(regs);
         }
     }
@@ -2638,7 +2677,7 @@ void RasterizerVulkan::UpdateAlphaToCoverageEnable(Tegra::Engines::Maxwell3D::Re
     if (!device.SupportsDynamicState3AlphaToCoverageEnable()) {
         return;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    GraphicsPipeline* const pipeline = DynamicStatePipeline();
     const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToCoverage() &&
                         regs.anti_alias_alpha_control.alpha_to_coverage != 0;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
@@ -2658,7 +2697,7 @@ void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& r
         });
         return;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+    GraphicsPipeline* const pipeline = DynamicStatePipeline();
     const bool enable = pipeline != nullptr && pipeline->SupportsAlphaToOne() &&
                         regs.anti_alias_alpha_control.alpha_to_one != 0;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {

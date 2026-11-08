@@ -1199,9 +1199,28 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
-    const bool use_fast_buffer = needs_alignment_stream
+    bool use_fast_buffer = needs_alignment_stream
         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
             && !memory_tracker.IsRegionGpuModified(device_addr, size));
+    // The multithreaded back's committer: the sequencer decided and, if streamed, read the bytes.
+    const MT::UboEntry* captured = nullptr;
+    if (const MT::CaptureView* const capture = MT::t_capture) [[unlikely]] {
+        captured = capture->FindUbo(static_cast<u32>(stage), index);
+        if (captured == nullptr) {
+            ++capture->ubo_misses;
+        } else {
+            const bool staged = captured->staged != 0;
+            if (capture->verify && (staged != use_fast_buffer ||
+                                    (staged && (captured->size != size ||
+                                                captured->device_addr != device_addr)))) {
+                ++capture->decision_mismatches;
+            }
+            use_fast_buffer = staged;
+            if (!staged) {
+                captured = nullptr;
+            }
+        }
+    }
     if (use_fast_buffer) {
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
@@ -1229,13 +1248,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             // stream allocation again instead of allocating and copying (uniform_stream_reuse.h).
             // EDEN_NX2_UBOREUSE=0 turns it off.
             if (VideoCommon::UniformStreamReuseEnabled()) {
-                streamed = VideoCommon::BindSmallUniformReusing(
-                    runtime, device_memory, stage, index, binding_index, device_addr, size);
+                if (captured != nullptr) [[unlikely]] {
+                    MT::CapturedBytes bytes{MT::t_capture->blob + captured->offset, device_addr};
+                    streamed = VideoCommon::BindSmallUniformReusing(
+                        runtime, bytes, stage, index, binding_index, device_addr, size);
+                } else {
+                    streamed = VideoCommon::BindSmallUniformReusing(
+                        runtime, device_memory, stage, index, binding_index, device_addr, size);
+                }
             }
         }
         if (!streamed) {
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-            device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            if (captured != nullptr) [[unlikely]] {
+                std::memcpy(span.data(), MT::t_capture->blob + captured->offset, size);
+            } else {
+                device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            }
         }
         return;
     }
@@ -2310,6 +2339,18 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 /// untracked bits is already synchronized.
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    // The multithreaded back's committer recording a packet: the sequencer took these bytes
+    // from guest memory at capture (guest memory may hold later writes now).
+    if (const MT::CaptureView* const capture = MT::t_capture) [[unlikely]] {
+        if (capture->verify && device_addr != 0 && size != 0 &&
+            memory_tracker.IsRegionCpuModified(device_addr, size)) {
+            if (capture->uncaptured_syncs++ == 0) {
+                capture->first_uncaptured_addr = device_addr;
+                capture->first_uncaptured_size = size;
+            }
+        }
+        return true;
+    }
     // A vertex, index, or storage buffer the guest has not written since its last upload
     // has a clean dirty bitmap. Walking that bitmap on every later draw is the bulk of
     // the "update buffers" time.
@@ -2680,12 +2721,12 @@ template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                              bool is_written, bool native_pointer,
                                              bool mapping_sized) const {
-    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    const GPUVAddr gpu_addr = MT::ReadCaptured<u64>(*gpu_memory, ssbo_addr);
 
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
-    const u64 next_qword = mapping_sized ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
+    const u64 next_qword = mapping_sized ? 0 : MT::ReadCaptured<u64>(*gpu_memory, ssbo_addr + 8);
     return StorageBufferBindingFromDescriptor(gpu_addr, next_qword, cbuf_index, is_written,
                                               native_pointer, mapping_sized);
 }
@@ -2761,11 +2802,11 @@ Binding BufferCache<P>::MemoStorageBufferBinding(StorageBufferMemo& memo, GPUVAd
     // The generation is read first, so a change racing with the derivation can't be memoized
     // under a value that later matches.
     const u64 generation = gpu_memory->LayoutGeneration();
-    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    const GPUVAddr gpu_addr = MT::ReadCaptured<u64>(*gpu_memory, ssbo_addr);
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
-    const u64 next_qword = mapping_sized ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
+    const u64 next_qword = mapping_sized ? 0 : MT::ReadCaptured<u64>(*gpu_memory, ssbo_addr + 8);
     const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) |
                       (mapping_sized ? 4U : 0U);
     if (memo.generation == generation && memo.channel == channel_state &&
@@ -2887,3 +2928,5 @@ std::pair<typename BufferCache<P>::Buffer*, u32> BufferCache<P>::GetDrawIndirect
 }
 
 } // namespace VideoCommon
+
+#include "video_core/buffer_cache/buffer_cache_mt.h"

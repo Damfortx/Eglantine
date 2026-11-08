@@ -16,6 +16,7 @@
 #include "common/assert.h"
 #include "core/memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/mt/capture.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon {
@@ -48,7 +49,9 @@ public:
         T entry;
         const bool one_page =
             (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
-        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
+        if (MT::t_capture != nullptr && MT::t_capture->Read(gpu_addr, &entry, sizeof(T)))
+            [[unlikely]] {
+        } else if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
             std::memcpy(std::addressof(entry), host, sizeof(T));
         } else {
             gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(entry), sizeof(T));
@@ -69,7 +72,10 @@ public:
         // contiguous in host memory, so a single page lookup replaces the generic block read.
         const bool one_page =
             (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
-        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
+        // The multithreaded back's committer reads the entry the sequencer captured.
+        if (MT::t_capture != nullptr &&
+            MT::t_capture->Read(gpu_addr, std::addressof(result.first), sizeof(T))) [[unlikely]] {
+        } else if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
             std::memcpy(std::addressof(result.first), host, sizeof(T));
         } else {
             gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));

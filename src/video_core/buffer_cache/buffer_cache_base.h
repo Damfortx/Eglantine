@@ -43,6 +43,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/mt/capture.h"
 #include "video_core/mt/stable_slot_vector.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -246,6 +247,25 @@ public:
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
+
+    // Multithreaded back (buffer_cache_mt.h). Sequencer, with `mutex` held: what the draw path
+    // decides and reads from the tracker and guest memory, ahead of the committer.
+    [[nodiscard]] bool MtHasHostBuffer(DAddr device_addr) const noexcept;
+    [[nodiscard]] u32 MtUniformBufferAlignment();
+    [[nodiscard]] u32 MtSkipCacheSize() const noexcept;
+    [[nodiscard]] bool MtIsRegionGpuModified(DAddr device_addr, u64 size);
+    [[nodiscard]] bool MtPageHoldsGpuData(DAddr device_addr, u64 size);
+    [[nodiscard]] bool MtPrefersSparseSources();
+    [[nodiscard]] Binding MtStorageBinding(GPUVAddr gpu_addr, u64 next_qword, u32 cbuf_index,
+                                           bool is_written) const;
+    /// Takes the CPU-modified parts of the range out of the tracker (SynchronizeBuffer's walk):
+    /// emit(device_addr, size) for each, whose bytes the caller copies now.
+    template <typename Func>
+    void MtTakeUploads(DAddr device_addr, u32 size, Func&& emit);
+    /// The tracker side of MarkWrittenBuffer, at capture.
+    void MtCaptureWrittenRange(DAddr device_addr, u32 size);
+    /// Committer: copies captured bytes into the buffers that hold their ranges.
+    void MtApplyUploads(std::span<const MT::UploadEntry> uploads, const u8* blob);
 
     bool OnCPUWrite(DAddr device_addr, u64 size);
 

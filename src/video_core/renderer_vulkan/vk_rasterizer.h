@@ -8,6 +8,7 @@
 
 #include <array>
 #include <memory>
+#include <string_view>
 
 #include <boost/container/static_vector.hpp>
 
@@ -197,6 +198,19 @@ private:
 
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
+    void ReportDrawFailure(std::string_view reason);
+    /// Sets mesh_draw; false (reported) when the draw is to be skipped.
+    bool MeshDrawAllowed(GraphicsPipeline* pipeline);
+    /// PrepareDraw from Configure to the query segment, under both cache locks.
+    bool ConfigureDrawPipeline(GraphicsPipeline* pipeline, bool is_indexed);
+    void RecordDraw(bool is_indexed, u32 instance_count);
+    void ClearBody(u32 layer_count);
+    /// The draw's pipeline for the dynamic states: the multithreaded back's committer records a
+    /// packet's (the cache's current one belongs to the sequencer).
+    GraphicsPipeline* DynamicStatePipeline() {
+        return mt_commit_pipeline != nullptr ? mt_commit_pipeline
+                                             : pipeline_cache.CurrentGraphicsPipeline();
+    }
     bool TryNx2IndirectReset();
 
     void FlushWork();
@@ -279,6 +293,7 @@ private:
 
     /// EDEN_NX2_MT: the committer pipeline (null when off).
     std::unique_ptr<Nx2DrawPipeline> mt;
+    GraphicsPipeline* mt_commit_pipeline = nullptr;
 };
 
 } // namespace Vulkan

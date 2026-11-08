@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/mt/role.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -1190,10 +1191,15 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     auto& pipeline{pair->second};
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
-        pipeline = TakeBackgroundPipeline(graphics_key);
-        if (!pipeline) {
-            pipeline = CreateGraphicsPipeline();
-        }
+        // The multithreaded back's sequencer creates it on the committer while it waits: the
+        // build reads guest memory and registers at this point and uses committer-owned pools.
+        pipeline = VideoCommon::MT::RunOnCommitter([this] {
+            std::unique_ptr<GraphicsPipeline> created = TakeBackgroundPipeline(graphics_key);
+            if (!created) {
+                created = CreateGraphicsPipeline();
+            }
+            return created;
+        });
     }
     if (!pipeline) {
         return nullptr;

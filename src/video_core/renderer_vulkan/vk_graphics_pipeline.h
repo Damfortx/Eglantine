@@ -102,6 +102,17 @@ public:
     }
 
     /// Switch 2 task/mesh pipeline: drawn with vkCmdDrawMeshTasksEXT.
+    /// Immutable after construction (read by the multithreaded back's sequencer at capture).
+    [[nodiscard]] const std::array<Shader::Info, NUM_STAGES>& StageInfos() const noexcept {
+        return stage_infos;
+    }
+    [[nodiscard]] const std::array<u32, 5>& EnabledUniformBufferMasks() const noexcept {
+        return enabled_uniform_buffer_masks;
+    }
+    [[nodiscard]] const VideoCommon::UniformBufferSizes& UniformSizes() const noexcept {
+        return uniform_buffer_sizes;
+    }
+
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
