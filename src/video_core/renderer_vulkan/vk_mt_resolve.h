@@ -559,6 +559,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     const u32 tic_limit = regs.tex_header.limit;
     const u32 tsc_limit = via_header_index ? tic_limit : regs.tex_sampler.limit;
     const bool native_tiling = r.gpu_memory->UsesNativeTiling();
+    const bool allow_refresh = VideoCommon::MT::ResolverRefresh();
     u32 view_cursor = 0;
     u32 sampler_cursor = 0;
     u32 buffer_cursor = 0;
@@ -581,7 +582,8 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         const bool valid = bit / 64 < packet.tic_valid.size() &&
                            ((packet.tic_valid[bit / 64] >> (bit % 64)) & 1) != 0;
         TextureCache::MtResolvedView resolved;
-        switch (texture_cache.TryResolveViewCaptured(channel, entry, valid, blacklist, resolved)) {
+        switch (texture_cache.TryResolveViewCaptured(channel, entry, valid, blacklist, resolved,
+                                                     allow_refresh)) {
         case TextureCache::MtViewResolve::Ok:
             view_objects[bit] = resolved.object;
             view_rescaled[bit] = texture_cache.IsRescalingResolved(resolved) ? 1 : 0;
@@ -591,6 +593,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             ref.image_gen = resolved.image_gen;
             ref.image_version = resolved.image_version;
             ref.null = 0;
+            ref.refresh = resolved.refresh ? 1 : 0;
             return true;
         case TextureCache::MtViewResolve::Null:
             return true;
@@ -1101,7 +1104,8 @@ inline void Nx2DrawPipeline::PrepareResolvedTextures(const MT::ResolvedDraw& res
                 .image_version = ref.image_version,
                 .object = &texture_cache.NullImageViewObject(),
             };
-            texture_cache.MtApplyViewIntent(resolved, ref.written != 0, ref.blacklist != 0);
+            texture_cache.MtApplyViewIntent(resolved, ref.written != 0, ref.blacklist != 0,
+                                            ref.refresh != 0);
         }
     }
     commit_samplers.clear();

@@ -127,6 +127,15 @@ namespace VideoCommon::MT {
     return on;
 }
 
+/// EDEN_NX2_MT_RREFRESH (on): a view whose image is only CPU-modified resolves on the resolver
+/// (no longer view-not-clean); the committer uploads the image's guest memory at commit, as
+/// PrepareImage would (the image's version still validates the result).
+[[nodiscard]] inline bool ResolverRefresh() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_RREFRESH");
+    static const bool on = Tegra::Nx2Switch(mode, true);
+    return on;
+}
+
 /// EDEN_NX2_MT_REPLAY (on): the committer's scheduler records go into per-render-pass POD op
 /// lists (one scheduler record per list), with bind elision; =2 also checks the order the
 /// worker runs the ops in. =0 off.

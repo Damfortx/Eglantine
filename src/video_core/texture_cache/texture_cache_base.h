@@ -421,18 +421,22 @@ public:
         u32 image_gen{};
         u32 image_version{};
         const ImageView* object{}; ///< valid while the EpochGuard is held
+        bool refresh{}; ///< CPU-modified: the committer uploads it at commit (allow_refresh)
     };
     enum class MtViewResolve : u8 { Ok, Null, Miss, NotClean };
 
     /// VisitImageView + PrepareImageView for an image that needs no preparation besides the
     /// LRU touch: the view of `entry` (whose IsValidEntry the sequencer computed).
+    /// `allow_refresh` (EDEN_NX2_MT_RREFRESH): an image that is only CPU-modified resolves too,
+    /// with `out.refresh` set (MtApplyViewIntent uploads it).
     [[nodiscard]] MtViewResolve TryResolveViewCaptured(const TextureCacheChannelInfo& channel,
                                                        const TICEntry& entry, bool valid_entry,
-                                                       bool blacklist,
-                                                       MtResolvedView& out) const noexcept;
+                                                       bool blacklist, MtResolvedView& out,
+                                                       bool allow_refresh = false) const noexcept;
     /// The same from a view id found earlier (a resolver's L1 cache).
     [[nodiscard]] MtViewResolve TryResolveViewId(ImageViewId id, bool blacklist,
-                                                 MtResolvedView& out) const noexcept;
+                                                 MtResolvedView& out,
+                                                 bool allow_refresh = false) const noexcept;
     enum class MtSamplerResolve : u8 { Ok, Null, Miss };
     [[nodiscard]] MtSamplerResolve TryResolveSamplerCaptured(const TextureCacheChannelInfo& channel,
                                                              const TSCEntry& entry, SamplerId& out,
@@ -449,8 +453,9 @@ public:
     /// Committer: whether a resolved view is still what the resolver saw (I4).
     [[nodiscard]] bool MtValidateView(const MtResolvedView& view) const noexcept;
     /// Committer: what PrepareImageView does for a resolver-clean view (the LRU touch; storage
-    /// writes mark the image modified).
-    void MtApplyViewIntent(const MtResolvedView& view, bool written, bool blacklist);
+    /// writes mark the image modified; `refresh`: RefreshContents of a CPU-modified image).
+    void MtApplyViewIntent(const MtResolvedView& view, bool written, bool blacklist,
+                           bool refresh = false);
     [[nodiscard]] TextureCacheChannelInfo* MtChannelState() const noexcept {
         return channel_state;
     }

@@ -64,7 +64,7 @@ struct ViewRef {
     u8 written;
     u8 blacklist;
     u8 null;
-    u8 pad;
+    u8 refresh; ///< EDEN_NX2_MT_RREFRESH: CPU-modified, the committer refreshes it
 };
 static_assert(sizeof(ViewRef) == 24);
 

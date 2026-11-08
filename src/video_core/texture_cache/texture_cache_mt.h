@@ -34,8 +34,8 @@ inline constexpr ImageFlagBits UncleanImageFlags =
 } // namespace MtDetail
 
 template <class P>
-auto TextureCache<P>::TryResolveViewId(ImageViewId id, bool blacklist,
-                                       MtResolvedView& out) const noexcept -> MtViewResolve {
+auto TextureCache<P>::TryResolveViewId(ImageViewId id, bool blacklist, MtResolvedView& out,
+                                       bool allow_refresh) const noexcept -> MtViewResolve {
     if (id == NULL_IMAGE_VIEW_ID) {
         out = MtResolvedView{};
         return MtViewResolve::Null;
@@ -57,7 +57,12 @@ auto TextureCache<P>::TryResolveViewId(ImageViewId id, bool blacklist,
         const Image& image = slot_images.UncheckedAt(image_id);
         const u32 version = image.version.load(std::memory_order_acquire);
         const ImageFlagBits flags = image.flags.Load(std::memory_order_acquire);
-        const bool unclean = True(flags & MtDetail::UncleanImageFlags) ||
+        // A CPU-modified image needs only RefreshContents from PrepareImage when nothing else
+        // makes it unclean: with allow_refresh the committer does that at commit.
+        const ImageFlagBits unclean_flags =
+            allow_refresh ? MtDetail::UncleanImageFlags & ~ImageFlagBits::CpuModified
+                          : MtDetail::UncleanImageFlags;
+        const bool unclean = True(flags & unclean_flags) ||
                              (blacklist && True(flags & ImageFlagBits::Rescaled));
         if (slot_image_views.Generation(id) != view_gen ||
             slot_images.Generation(image_id) != image_gen ||
@@ -74,6 +79,7 @@ auto TextureCache<P>::TryResolveViewId(ImageViewId id, bool blacklist,
             .image_gen = image_gen,
             .image_version = version,
             .object = &view,
+            .refresh = True(flags & ImageFlagBits::CpuModified),
         };
         return MtViewResolve::Ok;
     }
@@ -83,8 +89,8 @@ auto TextureCache<P>::TryResolveViewId(ImageViewId id, bool blacklist,
 template <class P>
 auto TextureCache<P>::TryResolveViewCaptured(const TextureCacheChannelInfo& channel,
                                              const TICEntry& entry, bool valid_entry,
-                                             bool blacklist,
-                                             MtResolvedView& out) const noexcept -> MtViewResolve {
+                                             bool blacklist, MtResolvedView& out,
+                                             bool allow_refresh) const noexcept -> MtViewResolve {
     if (!valid_entry) {
         out = MtResolvedView{};
         return MtViewResolve::Null;
@@ -95,7 +101,7 @@ auto TextureCache<P>::TryResolveViewCaptured(const TextureCacheChannelInfo& chan
     if (!found) {
         return MtViewResolve::Miss;
     }
-    return TryResolveViewId(*found, blacklist, out);
+    return TryResolveViewId(*found, blacklist, out, allow_refresh);
 }
 
 template <class P>
@@ -155,11 +161,16 @@ bool TextureCache<P>::MtValidateView(const MtResolvedView& view) const noexcept 
 }
 
 template <class P>
-void TextureCache<P>::MtApplyViewIntent(const MtResolvedView& view, bool written, bool blacklist) {
+void TextureCache<P>::MtApplyViewIntent(const MtResolvedView& view, bool written, bool blacklist,
+                                        bool refresh) {
     if (view.object == nullptr) {
         return;
     }
     Image& image = slot_images[view.image];
+    if (refresh) {
+        // PrepareImage's RefreshContents (a no-op if an earlier draw refreshed it already).
+        RefreshContents(image, view.image);
+    }
     if (blacklist) {
         image.scale_rating = 0;
     }
