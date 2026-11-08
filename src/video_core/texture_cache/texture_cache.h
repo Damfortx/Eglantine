@@ -2789,7 +2789,29 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         constexpr size_t MaxScanBytes = 64_MiB;
         if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
             const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
-            if (scan_bytes <= MaxScanBytes) {
+            static const char direct_mode = Tegra::Nx2EnvMode("EDEN_NX2_ASTC_SCAN_DIRECT");
+            const bool direct = Tegra::Nx2Switch(direct_mode, true);
+            if (scan_bytes <= MaxScanBytes && direct) {
+                // Scan the guest bytes in place when they are contiguous; otherwise in chunks,
+                // stopping at the first block with alpha. Copying the whole image up front cost
+                // ~2.4% of the split back for title 1 (it streams ASTC textures in all the time).
+                const GPUVAddr scan_addr = gpu_addr;
+                if (const u8* const span = gpu_memory->GetSpan(scan_addr, scan_bytes)) {
+                    new_info.astc_opaque = AstcDataLooksOpaque({span, scan_bytes});
+                } else {
+                    constexpr size_t ChunkBytes = 256_KiB; // a multiple of the 16-byte block
+                    astc_scan_buffer.resize((std::min)(scan_bytes, ChunkBytes));
+                    bool opaque = true;
+                    for (size_t offset = 0; opaque && offset < scan_bytes; offset += ChunkBytes) {
+                        const size_t chunk = (std::min)(ChunkBytes, scan_bytes - offset);
+                        gpu_memory->ReadBlockUnsafe(scan_addr + offset, astc_scan_buffer.data(),
+                                                    chunk);
+                        opaque = AstcDataLooksOpaque({astc_scan_buffer.data(), chunk});
+                    }
+                    new_info.astc_opaque = opaque;
+                }
+                ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
+            } else if (scan_bytes <= MaxScanBytes) {
                 astc_scan_buffer.resize(scan_bytes);
                 gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
                 new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
