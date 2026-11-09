@@ -177,7 +177,7 @@ private:
     MemoryAllocator& memory_allocator;
 };
 
-/// Compresses an RGBA8 image level to BC1 or BC3 blocks in a buffer (bc_encoder.comp).
+/// Compresses an RGBA8 image level to BC1, BC3 or BC7 blocks in a buffer (bc_encoder.comp).
 class BcEncoderPass final : public ComputePass {
 public:
     explicit BcEncoderPass(const Device& device_, Scheduler& scheduler_,
@@ -187,7 +187,8 @@ public:
 
     /// Encodes every layer of one level (`source` is its RGBA8 storage view) into `buffer`,
     /// `out_offset` bytes past `buffer_offset`; blocks are row-major, layer after layer.
-    void Encode(VkImageView source, u32 width, u32 height, u32 layers, bool bc3, VkBuffer buffer,
+    /// `mode`: 0 = BC1 (8 bytes a block), 1 = BC3, 2 = BC7 (16 bytes a block).
+    void Encode(VkImageView source, u32 width, u32 height, u32 layers, u32 mode, VkBuffer buffer,
                 VkDeviceSize buffer_offset, VkDeviceSize buffer_size, VkDeviceSize out_offset);
 
 private:

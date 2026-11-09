@@ -234,7 +234,7 @@ struct BcEncoderPushConstants {
     u32 blocks_y;
     u32 width;
     u32 height;
-    u32 bc3;
+    u32 mode;       // 0 = BC1, 1 = BC3, 2 = BC7
     u32 out_offset; // in 8-byte units
 };
 
@@ -844,7 +844,7 @@ BcEncoderPass::BcEncoderPass(const Device& device_, Scheduler& scheduler_,
 
 BcEncoderPass::~BcEncoderPass() = default;
 
-void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers, bool bc3,
+void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers, u32 mode,
                            VkBuffer buffer, VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
                            VkDeviceSize out_offset) {
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -857,7 +857,7 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers
         .blocks_y = Common::DivCeil(height, 4U),
         .width = width,
         .height = height,
-        .bc3 = bc3 ? 1U : 0U,
+        .mode = mode,
         .out_offset = static_cast<u32>(out_offset / 8),
     };
     const VkPipeline vk_pipeline = *pipeline;

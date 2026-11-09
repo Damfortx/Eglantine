@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Compresses one level of an RGBA8 image (the ASTC decoder's output) to BC1 or BC3, one 4x4 block
-// per invocation, so re-compressed ASTC never round-trips through the CPU. Colour endpoints are
-// the block's bounding box, oriented along the colours' covariance and inset by 1/16; each texel
-// takes the nearest palette entry. Values are encoded as stored (sRGB data stays sRGB, like the
-// CPU path).
+// Compresses one level of an RGBA8 image (the ASTC decoder's output) to BC1, BC3 or BC7, one 4x4
+// block per invocation, so re-compressed ASTC never round-trips through the CPU. BC1/BC3 colour
+// endpoints are the block's bounding box, oriented along the colours' covariance and inset by
+// 1/16; each texel takes the nearest palette entry. BC7 uses mode 6 only (one subset, RGBA 7.7.7.7
+// endpoints with a p-bit each, 4-bit indices): endpoints along the principal axis of the block's
+// RGBA, then least-squares refits from the chosen indices, keeping the best try. Values are
+// encoded as stored (sRGB data stays sRGB, like the CPU path).
 
 #version 460 core
 
@@ -22,7 +24,7 @@ layout (push_constant) uniform PushConstants {
     uint blocks_y;
     uint width;
     uint height;
-    uint bc3;
+    uint mode;       // 0 = BC1, 1 = BC3, 2 = BC7
     uint out_offset; // in 8-byte units
 };
 
@@ -156,6 +158,207 @@ uvec2 EncodeAlpha(in vec4 texels[16]) {
     return uvec2(bits_lo, bits_hi);
 }
 
+// ---- BC7 mode 6 ----
+
+const uint BC7_WEIGHTS4[16] = uint[16](0u, 4u, 9u, 13u, 17u, 21u, 26u, 30u, 34u, 38u, 43u, 47u,
+                                       51u, 55u, 60u, 64u);
+
+// Palette entry `index` between the 8-bit endpoints c0 and c1, as the decoder computes it.
+vec4 Bc7Interpolate(uvec4 c0, uvec4 c1, uint index) {
+    const uint w = BC7_WEIGHTS4[index];
+    return vec4(((64u - w) * c0 + w * c1 + 32u) >> 6u);
+}
+
+// An endpoint (0..255 per channel) quantized to 7 bits plus the p-bit with the smaller error.
+// Opaque blocks keep p = 1 so alpha decodes to exactly 255.
+void Bc7QuantizeEndpoint(vec4 e, bool force_p1, out uvec4 q, out uint p) {
+    e = clamp(e, 0.0, 255.0);
+    const uvec4 q_odd = uvec4(clamp(round((e - 1.0) * 0.5), 0.0, 127.0));
+    if (force_p1) {
+        q = q_odd;
+        p = 1u;
+        return;
+    }
+    const uvec4 q_even = uvec4(clamp(round(e * 0.5), 0.0, 127.0));
+    const vec4 d_even = vec4(q_even * 2u) - e;
+    const vec4 d_odd = vec4(q_odd * 2u + 1u) - e;
+    if (dot(d_odd, d_odd) < dot(d_even, d_even)) {
+        q = q_odd;
+        p = 1u;
+    } else {
+        q = q_even;
+        p = 0u;
+    }
+}
+
+// Each texel's nearest palette entry (projection onto the endpoint line, then the exact palette
+// around it); returns the block's squared error. Indices are 4 bits a texel, texel 0 lowest.
+float Bc7AssignIndices(in vec4 px[16], uvec4 c0, uvec4 c1, out uvec2 indices) {
+    const vec4 f0 = vec4(c0);
+    const vec4 d = vec4(c1) - f0;
+    const float dd = dot(d, d);
+    float error = 0.0;
+    indices = uvec2(0u);
+    for (uint i = 0u; i < 16u; ++i) {
+        int guess = 0;
+        if (dd > 0.0) {
+            guess = clamp(int(round(dot(px[i] - f0, d) / dd * 15.0)), 0, 15);
+        }
+        uint best = uint(guess);
+        float best_error = 3.4e38;
+        for (int c = max(guess - 1, 0); c <= min(guess + 1, 15); ++c) {
+            const vec4 diff = Bc7Interpolate(c0, c1, uint(c)) - px[i];
+            const float e = dot(diff, diff);
+            if (e < best_error) {
+                best_error = e;
+                best = uint(c);
+            }
+        }
+        error += best_error;
+        indices[i >> 3u] |= best << (4u * (i & 7u));
+    }
+    return error;
+}
+
+// Endpoints minimizing the squared error for the given indices (unquantized). False when every
+// texel has the same weight.
+bool Bc7LeastSquares(in vec4 px[16], uvec2 indices, out vec4 e0, out vec4 e1) {
+    float a00 = 0.0;
+    float a01 = 0.0;
+    float a11 = 0.0;
+    vec4 b0 = vec4(0.0);
+    vec4 b1 = vec4(0.0);
+    for (uint i = 0u; i < 16u; ++i) {
+        const uint index = (indices[i >> 3u] >> (4u * (i & 7u))) & 15u;
+        const float a = float(BC7_WEIGHTS4[index]) / 64.0;
+        const float b = 1.0 - a;
+        a00 += b * b;
+        a01 += a * b;
+        a11 += a * a;
+        b0 += b * px[i];
+        b1 += a * px[i];
+    }
+    const float det = a00 * a11 - a01 * a01;
+    e0 = vec4(0.0);
+    e1 = vec4(0.0);
+    if (abs(det) < 1e-4) {
+        return false;
+    }
+    e0 = (a11 * b0 - a01 * b1) / det;
+    e1 = (a00 * b1 - a01 * b0) / det;
+    return true;
+}
+
+void Bc7Put(inout uvec4 words, inout uint pos, uint value, uint count) {
+    const uint word = pos >> 5u;
+    const uint bit = pos & 31u;
+    words[word] |= value << bit;
+    if (bit + count > 32u) {
+        words[word + 1u] |= value >> (32u - bit);
+    }
+    pos += count;
+}
+
+uvec4 EncodeBc7(in vec4 texels[16]) {
+    vec4 px[16];
+    vec4 mean = vec4(0.0);
+    bool opaque = true;
+    for (int i = 0; i < 16; ++i) {
+        px[i] = round(clamp(texels[i], 0.0, 1.0) * 255.0);
+        opaque = opaque && px[i].a == 255.0;
+        mean += px[i];
+    }
+    mean /= 16.0;
+    mat4 covariance = mat4(0.0);
+    for (int i = 0; i < 16; ++i) {
+        const vec4 d = px[i] - mean;
+        covariance += outerProduct(d, d);
+    }
+    // Principal axis by power iteration, from the column of the largest variance.
+    int major = 0;
+    for (int c = 1; c < 4; ++c) {
+        if (covariance[c][c] > covariance[major][major]) {
+            major = c;
+        }
+    }
+    vec4 axis = covariance[major];
+    vec4 e0 = mean;
+    vec4 e1 = mean;
+    if (covariance[major][major] > 1e-3) {
+        for (int iteration = 0; iteration < 8; ++iteration) {
+            const vec4 next = covariance * axis;
+            const float length2 = dot(next, next);
+            if (length2 <= 1e-12) {
+                break;
+            }
+            axis = next * inversesqrt(length2);
+        }
+        axis = normalize(axis);
+        float t_min = 3.4e38;
+        float t_max = -3.4e38;
+        for (int i = 0; i < 16; ++i) {
+            const float t = dot(px[i] - mean, axis);
+            t_min = min(t_min, t);
+            t_max = max(t_max, t);
+        }
+        e0 = mean + axis * t_min;
+        e1 = mean + axis * t_max;
+    }
+
+    uvec4 best_q0 = uvec4(0u);
+    uvec4 best_q1 = uvec4(0u);
+    uint best_p0 = 0u;
+    uint best_p1 = 0u;
+    uvec2 best_indices = uvec2(0u);
+    float best_error = 3.4e38;
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        uvec4 q0;
+        uvec4 q1;
+        uint p0;
+        uint p1;
+        Bc7QuantizeEndpoint(e0, opaque, q0, p0);
+        Bc7QuantizeEndpoint(e1, opaque, q1, p1);
+        uvec2 indices;
+        const float error = Bc7AssignIndices(px, (q0 << 1u) | p0, (q1 << 1u) | p1, indices);
+        if (error < best_error) {
+            best_error = error;
+            best_q0 = q0;
+            best_q1 = q1;
+            best_p0 = p0;
+            best_p1 = p1;
+            best_indices = indices;
+        }
+        if (error == 0.0 || iteration == 2 || !Bc7LeastSquares(px, indices, e0, e1)) {
+            break;
+        }
+    }
+    // The anchor (texel 0) index is stored without its top bit, which must be 0: swap the
+    // endpoints and mirror the indices (15 - i; the weights are symmetric) when it is set.
+    if ((best_indices.x & 8u) != 0u) {
+        const uvec4 tq = best_q0;
+        best_q0 = best_q1;
+        best_q1 = tq;
+        const uint tp = best_p0;
+        best_p0 = best_p1;
+        best_p1 = tp;
+        best_indices = ~best_indices;
+    }
+    uvec4 words = uvec4(0u);
+    uint pos = 0u;
+    Bc7Put(words, pos, 1u << 6u, 7u); // mode 6
+    for (int c = 0; c < 4; ++c) {
+        Bc7Put(words, pos, best_q0[c], 7u);
+        Bc7Put(words, pos, best_q1[c], 7u);
+    }
+    Bc7Put(words, pos, best_p0, 1u);
+    Bc7Put(words, pos, best_p1, 1u);
+    Bc7Put(words, pos, best_indices.x & 7u, 3u);
+    for (uint i = 1u; i < 16u; ++i) {
+        Bc7Put(words, pos, (best_indices[i >> 3u] >> (4u * (i & 7u))) & 15u, 4u);
+    }
+    return words;
+}
+
 void main() {
     const uvec3 id = gl_GlobalInvocationID;
     if (id.x >= blocks_x || id.y >= blocks_y) {
@@ -174,7 +377,11 @@ void main() {
         }
     }
     const uint block = (id.z * blocks_y + id.y) * blocks_x + id.x;
-    if (bc3 != 0u) {
+    if (mode == 2u) {
+        const uvec4 words = EncodeBc7(texels);
+        blocks[out_offset + block * 2u] = words.xy;
+        blocks[out_offset + block * 2u + 1u] = words.zw;
+    } else if (mode != 0u) {
         blocks[out_offset + block * 2u] = EncodeAlpha(texels);
         blocks[out_offset + block * 2u + 1u] = EncodeColor(texels, false);
     } else {

@@ -262,6 +262,29 @@ public:
     void EncodeTranscoded(Image& image, const VideoCommon::ImageInfo& info, u32 width, u32 height, u32 levels,
                           u32 layers, const std::vector<vk::ImageView>& views);
 
+    /// Batch 7 T1: BC format an ASTC image is transcoded to: 0 = BC1, 1 = BC3, 2 = BC7.
+    [[nodiscard]] u32 TranscodeBcMode(const VideoCommon::ImageInfo& info) const;
+
+    // ---- Batch 7 T2 (disk cache of transcoded ASTC) begins: owned by T2 ----
+    /// On a disk cache hit uploads the cached BC data into `image` and returns true.
+    bool TryTranscodeFromDiskCache(Image& image, const StagingBufferRef& map,
+                                   std::span<const VideoCommon::SwizzleParameters> swizzles,
+                                   u32 mode);
+    /// Called after the BC encode of `image` was recorded into `buffer` (copies = per-level
+    /// layout, `total` bytes), before the copy into the image.
+    void OnTranscodeEncoded(Image& image, const VideoCommon::ImageInfo& info, VkBuffer buffer,
+                            VkDeviceSize offset, u64 total,
+                            std::span<const VideoCommon::BufferImageCopy> copies, u32 mode);
+    /// Hands finished readbacks to the disk cache's writer; `new_frame` resets the per-frame
+    /// readback budget (called from TickFrame).
+    void PollAstcDiskCache(bool new_frame = false);
+    /// Disk cache, readback buffers and the key of the transcode in progress (defined in the
+    /// .cpp; shared_ptr so this header needs no complete type). Lazily created on the first
+    /// transcode once the title id is known.
+    struct AstcDiskCacheState;
+    std::shared_ptr<AstcDiskCacheState> astc_disk_cache;
+    // ---- Batch 7 T2 ends ----
+
     /// Temporary decode images, reusable once the GPU is past `tick`.
     struct PendingTranscode {
         u64 tick;

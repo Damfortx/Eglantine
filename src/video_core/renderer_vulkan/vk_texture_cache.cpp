@@ -24,6 +24,7 @@
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
+#include "video_core/mt/astc_bc7.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
 #include "video_core/engines/fermi_2d.h"
@@ -34,6 +35,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/surface.h"
+#include "common/fs/path_util.h"
+#include "video_core/texture_cache/astc_disk_cache.h" // Batch 7 T2
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
@@ -303,14 +306,6 @@ constexpr std::array<VkFormat, 2> HugeAstcViewFormats{VK_FORMAT_A8B8G8R8_UNORM_P
 constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
                                                          VK_FORMAT_BC1_RGBA_SRGB_BLOCK};
 
-[[nodiscard]] std::optional<VkFormat> AstcHostFormat(const Device& device, const ImageInfo& info) {
-    if (IsOpaqueBc1Astc(device, info)) {
-        return VideoCore::Surface::IsPixelFormatSRGB(info.format) ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
-                                                                  : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-    }
-    return HugeAstcHostFormat(device, info);
-}
-
 // ASTC that the GPU decodes and re-compresses to BC1/BC3 itself (TranscodeAstcToBcn): no CPU
 // decode, so streamed textures are ready the frame they are first used instead of seconds later.
 [[nodiscard]] bool WillUseGpuBcnTranscode(const Device& device, const ImageInfo& info) {
@@ -320,6 +315,45 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     }
     return Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu &&
            Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed;
+}
+
+// Batch 7 T1: EDEN_NX2_ASTC_BC7=1 re-compresses to BC7 where BC3 was used (same 16 bytes per
+// block, so every size computation stays valid), on devices that sample BC7.
+[[nodiscard]] bool AstcBc7Enabled(const Device& device) {
+    if (!VideoCommon::MT::AstcBc7Requested() || device.IsOptimalAstcSupported() ||
+        !device.IsOptimalBcnSupported() ||
+        Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc3) {
+        return false;
+    }
+    static const bool supported = [&device] {
+        constexpr VkFormatFeatureFlags Features =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        return device.IsFormatSupported(VK_FORMAT_BC7_UNORM_BLOCK, Features, FormatType::Optimal) &&
+               device.IsFormatSupported(VK_FORMAT_BC7_SRGB_BLOCK, Features, FormatType::Optimal);
+    }();
+    return supported;
+}
+
+// An ASTC image the GPU transcode encodes to BC7 (TranscodeBcMode 2). Everything else (CPU path,
+// huge arrays, 3D, opaque BC1 under EDEN_NX2_ASTC_BC7_OPAQUE_BC1) keeps its BC1/BC3 format.
+[[nodiscard]] bool IsBc7Astc(const Device& device, const ImageInfo& info) {
+    return AstcBc7Enabled(device) && WillUseGpuBcnTranscode(device, info) &&
+           !IsOpaqueBc1Astc(device, info);
+}
+
+constexpr std::array<VkFormat, 2> Bc7AstcViewFormats{VK_FORMAT_BC7_UNORM_BLOCK,
+                                                     VK_FORMAT_BC7_SRGB_BLOCK};
+
+[[nodiscard]] std::optional<VkFormat> AstcHostFormat(const Device& device, const ImageInfo& info) {
+    if (IsOpaqueBc1Astc(device, info)) {
+        return VideoCore::Surface::IsPixelFormatSRGB(info.format) ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
+                                                                  : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    }
+    if (IsBc7Astc(device, info)) {
+        return VideoCore::Surface::IsPixelFormatSRGB(info.format) ? VK_FORMAT_BC7_SRGB_BLOCK
+                                                                  : VK_FORMAT_BC7_UNORM_BLOCK;
+    }
+    return HugeAstcHostFormat(device, info);
 }
 
 [[nodiscard]] bool WillUseAcceleratedAstcDecode(const Device& device, const ImageInfo& info) {
@@ -1223,6 +1257,11 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
         if (Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed) {
             bc_encoder_pass.emplace(device, scheduler, descriptor_pool,
                                     compute_pass_descriptor_queue);
+            if (AstcBc7Enabled(device) &&
+                Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu) {
+                LOG_INFO(Render_Vulkan, "ASTC recompression: BC7 (GPU encoder), opaque BC1 {}",
+                         VideoCommon::MT::AstcBc7OpaqueBc1() ? "on" : "off");
+            }
         }
     }
     if (!device.IsKhrImageFormatListSupported()) {
@@ -2549,6 +2588,10 @@ bool TextureCacheRuntime::UseOpaqueAstcFormat() const {
         const char* value = std::getenv("EDEN_NX2_ASTC_BC1");
         return value == nullptr || value[0] != '0';
     }();
+    // Under BC7 (Batch 7 T1) opaque ASTC goes to BC7 too unless EDEN_NX2_ASTC_BC7_OPAQUE_BC1=1.
+    if (AstcBc7Enabled(device) && !VideoCommon::MT::AstcBc7OpaqueBc1()) {
+        return false;
+    }
     return enabled && !device.IsOptimalAstcSupported() &&
            Settings::GetAstcRecompression() == Settings::AstcRecompression::Bc3;
 }
@@ -2612,6 +2655,7 @@ void TextureCacheRuntime::TickFrame() {
     for (const PendingTranscode& t : free_transcodes) {
         free_bytes += decode_bytes(t);
     }
+    PollAstcDiskCache(true); // Batch 7 T2: finished readbacks -> disk cache writer
     while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
         PendingTranscode& done = pending_transcodes.front();
         const u64 bytes = decode_bytes(done);
@@ -2647,6 +2691,8 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    ? std::span<const VkFormat>{HugeAstcViewFormats}
                                : IsOpaqueBc1Astc(runtime_.device, info)
                                    ? std::span<const VkFormat>{OpaqueAstcViewFormats}
+                               : IsBc7Astc(runtime_.device, info)
+                                   ? std::span<const VkFormat>{Bc7AstcViewFormats}
                                    : runtime->ViewFormats(info.format),
                                AstcHostFormat(runtime_.device, info),
                                UsesSparseLayers(runtime_.device, info, gpu_addr_) ||
@@ -3952,6 +3998,10 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         format_info.format = VideoCore::Surface::IsPixelFormatSRGB(format)
                                  ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
                                  : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    } else if (IsPixelFormatASTC(format) && IsBc7Astc(*device, image.info)) {
+        format_info.format = VideoCore::Surface::IsPixelFormatSRGB(format)
+                                 ? VK_FORMAT_BC7_SRGB_BLOCK
+                                 : VK_FORMAT_BC7_UNORM_BLOCK;
     }
     if (device->ApiVersion() >= VK_API_VERSION_1_3) {
         const VkFormatProperties3 properties3 =
@@ -4641,8 +4691,8 @@ void TextureCacheRuntime::EncodeTranscoded(Image& image, const ImageInfo& info, 
                                            u32 height, u32 levels, u32 layers,
                                            const std::vector<vk::ImageView>& views) {
     // Encode every level into one buffer, then copy it into the image.
-    const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
-                     Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
+    const u32 mode = TranscodeBcMode(info);
+    const bool bc3 = mode != 0;
     const u64 block_bytes = bc3 ? 16 : 8;
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
     u64 total = 0;
@@ -4670,7 +4720,7 @@ void TextureCacheRuntime::EncodeTranscoded(Image& image, const ImageInfo& info, 
     const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
     for (u32 level = 0; level < levels; ++level) {
         bc_encoder_pass->Encode(*views[level], copies[level].image_extent.width,
-                                copies[level].image_extent.height, layers, bc3, output.buffer,
+                                copies[level].image_extent.height, layers, mode, output.buffer,
                                 output.offset, total, copies[level].buffer_offset);
     }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
@@ -4683,8 +4733,300 @@ void TextureCacheRuntime::EncodeTranscoded(Image& image, const ImageInfo& info, 
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                0, barrier);
     });
+    OnTranscodeEncoded(image, info, output.buffer, output.offset, total, copies, mode);
     image.UploadMemory(output.buffer, output.offset, copies);
 }
+
+u32 TextureCacheRuntime::TranscodeBcMode(const ImageInfo& info) const {
+    if (IsBc7Astc(device, info)) {
+        return 2U;
+    }
+    const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
+                     Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
+    return bc3 ? 1U : 0U;
+}
+
+// ---- Batch 7 T2 (disk cache of transcoded ASTC) begins: owned by T2 ----
+// EDEN_NX2_ASTC_DISKCACHE=1 (default off): GPU-transcoded ASTC (TranscodeAstcToBcn) is looked up
+// in a per-title disk cache (<shader dir>/<title id>/astc_bc, astc_disk_cache.h) before the
+// decode; a hit uploads the cached BC data instead of decoding and encoding. A miss copies the
+// encoded buffer into a host-visible readback buffer; once its tick is done the bytes go to the
+// cache's writer thread. EDEN_NX2_ASTC_DISKCACHE_MIB (2048): size cap (LRU eviction).
+// EDEN_NX2_ASTC_DISKCACHE_RB_MIB (64): readback bytes recorded per frame (more is skipped).
+struct TextureCacheRuntime::AstcDiskCacheState {
+    struct Readback {
+        VideoCommon::AstcDiskCacheKey key;
+        vk::Buffer buffer;
+        u64 capacity;
+        u64 size;
+        u64 tick;
+    };
+    struct FreeBuffer {
+        vk::Buffer buffer;
+        u64 capacity;
+    };
+    static constexpr size_t MaxFreeBuffers = 4;
+    static constexpr u64 MaxKeptCapacity = u64{16} << 20;
+    static constexpr u64 MinCapacity = u64{64} << 10;
+
+    std::unique_ptr<VideoCommon::AstcDiskCache> cache;
+    /// Readbacks recorded on misses, in tick order (GPU thread only).
+    std::deque<Readback> readbacks;
+    std::vector<FreeBuffer> free_buffers;
+    u64 outstanding_bytes = 0;
+    u64 frame_bytes = 0;
+    u64 frame_budget = 0;
+    /// Key of the transcode TryTranscodeFromDiskCache missed, for the OnTranscodeEncoded call
+    /// that follows (so the guest bytes are hashed once).
+    std::optional<VideoCommon::AstcDiskCacheKey> pending_key;
+    const Image* pending_image = nullptr;
+    /// Reused for the cached copy of the guest bytes (hashing) and for file reads.
+    std::vector<u8> scratch;
+};
+
+namespace {
+u64 AstcDiskCacheEnvMiB(const char* name, u64 default_mib) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return default_mib;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return end == value ? default_mib : static_cast<u64>(parsed);
+}
+
+/// The per-level layout EncodeTranscoded writes (must stay identical to it): all levels back
+/// to back, each level all layers, 8 bytes per 4x4 block for BC1 and 16 for BC3/BC7.
+u64 AstcDiskCacheLayout(u32 width, u32 height, u32 levels, u32 layers, u32 mode,
+                        boost::container::small_vector<VideoCommon::BufferImageCopy, 16>& copies) {
+    const u64 block_bytes = mode != 0 ? 16 : 8;
+    u64 total = 0;
+    for (u32 level = 0; level < levels; ++level) {
+        const u32 level_width = (std::max)(width >> level, 1U);
+        const u32 level_height = (std::max)(height >> level, 1U);
+        const u32 blocks_x = Common::DivCeil(level_width, 4U);
+        const u32 blocks_y = Common::DivCeil(level_height, 4U);
+        const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
+        copies.push_back({
+            .buffer_offset = total,
+            .buffer_size = size,
+            .buffer_row_length = blocks_x * 4,
+            .buffer_image_height = blocks_y * 4,
+            .image_subresource{
+                .base_level = static_cast<s32>(level),
+                .base_layer = 0,
+                .num_layers = static_cast<s32>(layers),
+            },
+            .image_offset{0, 0, 0},
+            .image_extent{level_width, level_height, 1},
+        });
+        total += size;
+    }
+    return total;
+}
+} // Anonymous namespace
+
+bool TextureCacheRuntime::TryTranscodeFromDiskCache(
+    Image& image, const StagingBufferRef& map,
+    std::span<const VideoCommon::SwizzleParameters> swizzles, u32 mode) {
+    static const char cache_mode = Tegra::Nx2EnvMode("EDEN_NX2_ASTC_DISKCACHE");
+    if (!Tegra::Nx2Switch(cache_mode, false)) {
+        return false;
+    }
+    if (!astc_disk_cache) {
+        const u64 program_id = Settings::GetCurrentProgramID();
+        if (program_id == 0) {
+            return false;
+        }
+        auto state = std::make_shared<AstcDiskCacheState>();
+        state->frame_budget = AstcDiskCacheEnvMiB("EDEN_NX2_ASTC_DISKCACHE_RB_MIB", 64) << 20;
+        const u64 cap = AstcDiskCacheEnvMiB("EDEN_NX2_ASTC_DISKCACHE_MIB", 2048) << 20;
+        auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
+                   fmt::format("{:016x}", program_id) / "astc_bc";
+        state->cache =
+            std::make_unique<VideoCommon::AstcDiskCache>(std::move(dir), cap, u64{256} << 20);
+        astc_disk_cache = std::move(state);
+    }
+    AstcDiskCacheState& state = *astc_disk_cache;
+    PollAstcDiskCache();
+    state.pending_key.reset();
+    state.pending_image = nullptr;
+
+    const ImageInfo& info = image.info;
+    // The transcode reads [map.offset, map.offset + guest_size_bytes) (AssembleInto, skip 0).
+    const size_t guest_size = image.guest_size_bytes;
+    if (image.host_level_offset != 0 || guest_size == 0 || swizzles.empty() ||
+        map.mapped_span.size() < guest_size) {
+        return false;
+    }
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    const u32 levels = static_cast<u32>(info.resources.levels);
+    const u32 layers = static_cast<u32>(info.resources.layers);
+
+    using Clock = std::chrono::steady_clock;
+    const auto hash_start = Clock::now();
+    // The staging memory is usually write-combined: copy it out with streaming loads, then hash.
+    state.scratch.resize(guest_size);
+    VideoCommon::AstcDiskCacheCopyFromUncached(state.scratch.data(), map.mapped_span.data(),
+                                               guest_size);
+    VideoCommon::AstcDiskCacheParams params{};
+    params.format = static_cast<u32>(info.format);
+    params.type = static_cast<u32>(info.type);
+    params.width = width;
+    params.height = height;
+    params.depth = info.size.depth;
+    params.levels = levels;
+    params.layers = layers;
+    params.block_width = info.block.width;
+    params.block_height = info.block.height;
+    params.block_depth = info.block.depth;
+    params.tile_width_spacing = info.tile_width_spacing;
+    params.layer_stride = info.layer_stride;
+    params.num_samples = info.num_samples;
+    params.astc_opaque = info.astc_opaque ? 1 : 0;
+    params.bc_mode = mode;
+    params.encoder_version = VideoCommon::AstcDiskCache::kEncoderVersion;
+    params.guest_size = guest_size;
+    const VideoCommon::AstcDiskCacheKey key = VideoCommon::AstcDiskCache::MakeKey(
+        std::span<const u8>(state.scratch.data(), guest_size), params);
+    const auto elapsed_ns = [](Clock::time_point start) {
+        return static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+    };
+    state.cache->NoteHash(guest_size, elapsed_ns(hash_start));
+
+    if (const std::optional<u64> cached_size = state.cache->Lookup(key)) {
+        boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+        const u64 total = AstcDiskCacheLayout(width, height, levels, layers, mode, copies);
+        const auto read_start = Clock::now();
+        if (*cached_size == total && state.cache->Read(key, total, state.scratch)) {
+            const auto staging = staging_buffer_pool.Request(total, MemoryUsage::Upload);
+            std::memcpy(staging.mapped_span.data(), state.scratch.data(), total);
+            // UploadMemory records the layout transition and the buffer -> image copy.
+            image.UploadMemory(staging.buffer, staging.offset, copies);
+            state.cache->NoteHit(total, elapsed_ns(read_start));
+            return true;
+        }
+    }
+    state.cache->NoteMiss();
+    state.pending_key = key;
+    state.pending_image = &image;
+    return false;
+}
+
+void TextureCacheRuntime::OnTranscodeEncoded(Image& image, const ImageInfo& info, VkBuffer buffer,
+                                             VkDeviceSize offset, u64 total,
+                                             std::span<const VideoCommon::BufferImageCopy> copies,
+                                             u32 mode) {
+    if (!astc_disk_cache) {
+        return;
+    }
+    AstcDiskCacheState& state = *astc_disk_cache;
+    const std::optional<VideoCommon::AstcDiskCacheKey> key = state.pending_key;
+    const bool same_image = state.pending_image == &image;
+    state.pending_key.reset();
+    state.pending_image = nullptr;
+    PollAstcDiskCache();
+    if (!key || !same_image || total == 0) {
+        return;
+    }
+    // Only when cheap: a per-frame budget and a bound on what is still in flight.
+    if (state.frame_bytes + total > state.frame_budget ||
+        state.outstanding_bytes + total > state.frame_budget * 4) {
+        state.cache->NoteSkippedReadback();
+        return;
+    }
+    if (!state.cache->BeginInsert(*key)) {
+        return;
+    }
+    vk::Buffer readback;
+    u64 capacity = 0;
+    const auto fit = std::ranges::min_element(
+        state.free_buffers, {}, [total](const AstcDiskCacheState::FreeBuffer& entry) {
+            return entry.capacity >= total ? entry.capacity : (std::numeric_limits<u64>::max)();
+        });
+    if (fit != state.free_buffers.end() && fit->capacity >= total) {
+        readback = std::move(fit->buffer);
+        capacity = fit->capacity;
+        state.free_buffers.erase(fit);
+    } else {
+        capacity = (std::max)(std::bit_ceil(total), AstcDiskCacheState::MinCapacity);
+        try {
+            readback = memory_allocator.CreateBuffer(
+                VkBufferCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .size = capacity,
+                    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .queueFamilyIndexCount = 0,
+                    .pQueueFamilyIndices = nullptr,
+                },
+                MemoryUsage::Download);
+        } catch (...) {
+            readback = vk::Buffer{};
+        }
+    }
+    if (!readback || readback.Mapped().size() < total) {
+        state.cache->CancelInsert(*key);
+        state.cache->NoteSkippedReadback();
+        return;
+    }
+    // EncodeTranscoded already recorded the compute -> transfer barrier for `buffer`.
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([src = buffer, src_offset = offset, dst = *readback,
+                      size = total](vk::CommandBuffer cmdbuf) {
+        const VkBufferCopy copy{
+            .srcOffset = src_offset,
+            .dstOffset = 0,
+            .size = size,
+        };
+        cmdbuf.CopyBuffer(src, dst, copy);
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               barrier);
+    });
+    state.frame_bytes += total;
+    state.outstanding_bytes += total;
+    state.readbacks.push_back(AstcDiskCacheState::Readback{
+        .key = *key,
+        .buffer = std::move(readback),
+        .capacity = capacity,
+        .size = total,
+        .tick = scheduler.CurrentTick(),
+    });
+}
+
+void TextureCacheRuntime::PollAstcDiskCache(bool new_frame) {
+    if (!astc_disk_cache) {
+        return;
+    }
+    AstcDiskCacheState& state = *astc_disk_cache;
+    if (new_frame) {
+        state.frame_bytes = 0;
+    }
+    while (!state.readbacks.empty() && scheduler.IsFree(state.readbacks.front().tick)) {
+        AstcDiskCacheState::Readback& done = state.readbacks.front();
+        done.buffer.Invalidate();
+        const std::span<const u8> mapped = done.buffer.Mapped();
+        std::vector<u8> payload(mapped.begin(), mapped.begin() + done.size);
+        state.cache->Submit(done.key, std::move(payload));
+        state.outstanding_bytes -= done.size;
+        if (state.free_buffers.size() < AstcDiskCacheState::MaxFreeBuffers &&
+            done.capacity <= AstcDiskCacheState::MaxKeptCapacity) {
+            state.free_buffers.push_back({std::move(done.buffer), done.capacity});
+        }
+        state.readbacks.pop_front();
+    }
+}
+// ---- Batch 7 T2 ends ----
 
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
@@ -4695,6 +5037,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 levels = static_cast<u32>(info.resources.levels);
     const u32 layers = static_cast<u32>(info.resources.layers);
     constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    if (TryTranscodeFromDiskCache(image, map, swizzles, TranscodeBcMode(info))) {
+        return;
+    }
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
