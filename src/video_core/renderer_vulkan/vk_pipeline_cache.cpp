@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/mt/gpuparam3.h"
 #include "video_core/mt/role.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -403,6 +404,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
+    // GPU params multi-draw calls (mt/gpuparam3.h): vkCmdDrawIndexedIndirectCount (Vulkan 1.2
+    // or VK_KHR_draw_indirect_count) must be there.
+    VideoCommon::MT::GpuParam::g_count_draw_support.store(
+        device.GetDispatchLoader().vkCmdDrawIndexedIndirectCount != nullptr ? 1 : 2,
+        std::memory_order_relaxed);
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -746,10 +752,23 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         if (next) {
             current_pipeline = next;
             current_pipeline->MarkUsed(frame_count);
+            // GPU params R1 (a) (mt/gpuparam3.h): a built-in draw refuses a pipeline whose
+            // stages read the draw parameter words from memory (the back redraws with copies).
+            if (VideoCommon::MT::GpuParam::RefuseBuiltinPipeline(next->DrawParamWordReads()))
+                [[unlikely]] {
+                return nullptr;
+            }
             return BuiltPipeline(current_pipeline);
         }
     }
-    return CurrentGraphicsPipelineSlowPath();
+    GraphicsPipeline* const slow{CurrentGraphicsPipelineSlowPath()};
+    // (current_pipeline is the looked-up one whenever the slow path returns a pipeline.)
+    if (slow != nullptr &&
+        VideoCommon::MT::GpuParam::RefuseBuiltinPipeline(slow->DrawParamWordReads()))
+        [[unlikely]] {
+        return nullptr; // R1 (a), as above
+    }
+    return slow;
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
@@ -899,6 +918,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (key.state.app_stage == Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw) {
             for (FileEnvironment& env : envs) {
                 env.SetGpuParamDrawBank(key.state.gpuparam_bank.Value());
+                // R1 (b): two-word reads replaced when both words are recorded replacements.
+                env.SetGpuParamTwoWordReplace(VideoCommon::MT::GpuParam::Ldc64On());
             }
         }
 
@@ -1328,8 +1349,25 @@ namespace {
 // (fragment/geometry/tessellation, sub-word or two-word reads) or reads that bank at a dynamic
 // offset sees 0 there: logged once per pipeline (first 64), and a count with the first hashes.
 // Runs on the committer, the build threads at boot and the background prebuild threads.
-void ReportGpuParamPipeline(const GraphicsPipelineCacheKey& key,
-                            std::span<Shader::Environment* const> envs) {
+// Returns the pipeline's GraphicsPipeline::DrawParamWordReads bits (R1 (a): the back draws such
+// pipelines' calls with v1's copies instead) and counts R1 (b)'s two-word replacements.
+u8 ReportGpuParamPipeline(const GraphicsPipelineCacheKey& key,
+                          std::span<Shader::Environment* const> envs) {
+    namespace GP = VideoCommon::MT::GpuParam;
+    u8 bits = 0;
+    u32 two_word = 0;
+    for (const Shader::Environment* const env : envs) {
+        bits |= env->GpuParamMemoryReads() != 0 ? GP::DrawParamReadsFixed : u8{0};
+        bits |= env->GpuParamDynamicReads() != 0 ? GP::DrawParamReadsDynamic : u8{0};
+        two_word += env->GpuParamTwoWordReplaced();
+    }
+    if (two_word != 0) {
+        GP::g_r1_ldc64_reads.fetch_add(two_word, std::memory_order_relaxed);
+        GP::g_r1_ldc64_pipelines.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (bits != 0) {
+        GP::g_r1_flagged_pipelines.fetch_add(1, std::memory_order_relaxed);
+    }
     static std::mutex mutex;
     static u32 built{};
     static u32 with_memory_reads{};
@@ -1365,6 +1403,7 @@ void ReportGpuParamPipeline(const GraphicsPipelineCacheKey& key,
                  "such pipelines, {} with stages reading the words from memory; first:{}",
                  hash, key.state.gpuparam_bank.Value(), built, with_memory_reads, first_hashes);
     }
+    return bits;
 }
 } // Anonymous namespace
 
@@ -1489,14 +1528,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    u8 draw_param_reads = 0;
     if (key.state.app_stage == Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw) {
-        ReportGpuParamPipeline(key, envs);
+        draw_param_reads = ReportGpuParamPipeline(key, envs);
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
-    return std::make_unique<GraphicsPipeline>(
+    auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos);
+    // R1 (a): before anyone else sees the pipeline.
+    pipeline->SetDrawParamWordReads(draw_param_reads);
+    return pipeline;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -1563,6 +1606,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         const u32 bank = gpuparam ? graphics_key.state.gpuparam_bank.Value() : ~0U;
         for (Shader::Environment* const env : environments.Span()) {
             env->SetGpuParamDrawBank(bank);
+            env->SetGpuParamTwoWordReplace(gpuparam && VideoCommon::MT::GpuParam::Ldc64On());
         }
     }
 

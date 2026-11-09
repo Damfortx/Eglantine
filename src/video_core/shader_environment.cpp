@@ -35,6 +35,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
 #include "video_core/mkw_wave_workaround.h"
+#include "video_core/mt/gpuparam3.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -714,6 +715,7 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     // the draw, the key on the back/sequencer, this while the sequencer waits for the build).
     if (maxwell3d->engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw) {
         gpuparam_draw_bank = maxwell3d->gpuparam_cb_bank;
+        gpuparam_two_word = VideoCommon::MT::GpuParam::Ldc64On(); // R1 (b)
     }
 }
 

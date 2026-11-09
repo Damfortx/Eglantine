@@ -1880,6 +1880,9 @@ struct Maxwell3D::GpuParamState {
     /// A joining call's zero-word call runs with the hold installed: its constant buffer
     /// writes (and const_buffer.offset) pass, anything else sends the group first.
     bool tolerant{};
+    /// R1: shapes (macro, CPU parameters, GPU words) of calls kept waiting for their CPU
+    /// parameters, logged once each (first 8): how to learn macro 44's multi-draw form.
+    std::vector<u64> cpu_param_shapes;
 
     ~GpuParamState() {
         auto& split = VideoCommon::GpuSplit::Get();
@@ -1931,6 +1934,25 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
     // The layout: p0 from the CPU, then 5 words, or a draw count and N records of 5 words (in
     // one entry, or a 1-word entry and an entry of records).
     if (cpu.size() != 1) {
+        if (GP::StatsOn() && gs.cpu_param_shapes.size() < 8) {
+            u64 gpu_words = 0;
+            for (size_t i = 0; i < segment_count; ++i) {
+                gpu_words += segments[i].words;
+            }
+            const u64 shape = (u64{macro_method} << 48) ^ (u64{cpu.size() & 0xffff} << 32) ^
+                              (u64{segment_count} << 28) ^ gpu_words;
+            if (std::find(gs.cpu_param_shapes.begin(), gs.cpu_param_shapes.end(), shape) ==
+                gs.cpu_param_shapes.end()) {
+                gs.cpu_param_shapes.push_back(shape);
+                LOG_INFO(HW_GPU,
+                         "GPU params: macro {} kept waiting for CPU parameters: {} CPU words "
+                         "({:x}), {} GPU words in {} entries",
+                         (macro_method - MacroRegistersStart) >> 1, cpu.size(),
+                         fmt::join(std::span<const u32>{cpu}.first(std::min<size_t>(cpu.size(), 8)),
+                                   ","),
+                         gpu_words, segment_count);
+            }
+        }
         return keep_waiting(GP::Reason::CpuParams);
     }
     u64 words = 0;
@@ -1994,10 +2016,31 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
     // GPU params v2 (mt/gpuparam2.h): single calls whose constant buffer words are exactly the
     // base vertex/instance draw with the built-ins, without copies; the rest as v1.
     const bool mt = front_path && split.MtActive();
-    if (GP::V2On(mt)) {
+    const bool v2 = GP::V2On(mt);
+    if (call.kind == GP::Kind::IndexedMulti) {
+        // Multi-draw calls draw with vkCmdDrawIndexedIndirectCount (count in GPU memory).
+        // R1 (c): a per-draw plan (each record's base vertex / instance in the constant buffer
+        // before its draws) is only drawable with v2's built-ins: no copy can give each draw
+        // of one count draw its own words.
+        if (!GP::CountDrawSupported()) {
+            ++gs.v2.multi_no_count;
+            return keep_waiting(GP::Reason::NoCountDraw);
+        }
+        if (call.cb.per_draw && (!v2 || !GP::MultiOn() || !GP::BuiltinPlan(call.cb))) {
+            ++gs.v2.multi_per_draw_waiting;
+            return keep_waiting(GP::Reason::PerDrawMulti);
+        }
+    }
+    if (v2) {
         ++gs.v2.calls;
         if (call.kind != GP::Kind::IndexedSingle) {
-            ++gs.v2.fallbacks[static_cast<size_t>(GP::V2Fallback::Kind)];
+            if (call.cb.per_draw) {
+                call.builtins = true;
+                ++gs.v2.copy_free;
+                ++gs.v2.multi_copy_free;
+            } else {
+                ++gs.v2.fallbacks[static_cast<size_t>(GP::V2Fallback::Kind)];
+            }
         } else if (!GP::BuiltinPlan(call.cb)) {
             ++gs.v2.fallbacks[static_cast<size_t>(GP::V2Fallback::Plan)];
         } else {
@@ -2029,7 +2072,11 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
                                                     gs.expected, error, cb_same);
             ++gs.stats.check_compared;
             gs.stats.check_draws += gs.expected.size();
-            if (call.builtins) {
+            if (call.builtins && call.kind != GP::Kind::IndexedSingle) {
+                // R1 (c): Compare checked every draw's words against its record (cb_same).
+                ++gs.v2.check_compared;
+                gs.v2.check_mismatch += cb_same ? 0 : 1;
+            } else if (call.builtins) {
                 // v2: what the built-ins give (record words 3/4) against the constant buffer
                 // words the macro writes before its draws for the real words.
                 ++gs.v2.check_compared;
@@ -2088,7 +2135,8 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
         // zero-word call runs with the hold installed (GpuParamHoldRelease lets its constant
         // buffer writes pass: with the built-ins the held draws don't read those words, and
         // the call writes the same values each time).
-        const bool group = mt && call.builtins && GP::GroupCap() > 1;
+        const bool group = mt && call.builtins && call.kind == GP::Kind::IndexedSingle &&
+                           GP::GroupCap() > 1;
         bool join = false;
         if (void* const held = split.FrontHoldContext(); held != nullptr) {
             GP::NoJoin no_join = GP::NoJoin::Other;
@@ -2177,6 +2225,12 @@ void Maxwell3D::GpuParamDraw(Core::System& system, const GP::Call& call) {
             builtins = true;
             GP::g_v2_builtin_draws.fetch_add(1, std::memory_order_relaxed);
             GP::g_v2_builtin_records.fetch_add(call.max_draws, std::memory_order_relaxed);
+        } else if (call.cb.per_draw) {
+            // R1 (c): no copy gives each draw of the count draw its own words: drawn with the
+            // words the zero-word call left (counted).
+            (bank < 0 ? GP::g_v2_fallback_no_bank : GP::g_v2_fallback_bank)
+                .fetch_add(1, std::memory_order_relaxed);
+            GP::g_r1_multi_unfixable.fetch_add(1, std::memory_order_relaxed);
         } else {
             (bank < 0 ? GP::g_v2_fallback_no_bank : GP::g_v2_fallback_bank)
                 .fetch_add(1, std::memory_order_relaxed);
@@ -2191,7 +2245,8 @@ void Maxwell3D::GpuParamDraw(Core::System& system, const GP::Call& call) {
             return;
         }
     }
-    const bool has_cb = !builtins && (call.cb.pre_count != 0 || call.cb.post_count != 0);
+    const bool has_cb = !builtins && !call.cb.per_draw &&
+                        (call.cb.pre_count != 0 || call.cb.post_count != 0);
     if (has_cb) {
         // The zero-word call's cached constant buffer writes reach the buffer cache first, so
         // the copy's destination sync uploads them before the copy, never after it.
@@ -2210,21 +2265,57 @@ void Maxwell3D::GpuParamDraw(Core::System& system, const GP::Call& call) {
     // (multiDrawIndirect is a required device feature).
     params.stride = call.kind == GP::Kind::IndexedSingle && call.max_draws <= 1 ? 0
                                                                                  : 5 * sizeof(u32);
+    if (params.include_count) {
+        GP::g_r1_count_draws.fetch_add(1, std::memory_order_relaxed);
+        GP::g_r1_count_max_records.fetch_add(call.max_draws, std::memory_order_relaxed);
+    }
     const u32 estimate = static_cast<u32>(EstimateIndexBufferSize());
     dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
-    if (builtins) {
-        engine_state = EngineHint::OnGpuParamDraw;
-        gpuparam_cb_bank = 0;
+    // R1 (a): the pipeline lookup of a built-in draw refuses pipelines whose stages still read
+    // the words from memory (GP::RefuseBuiltinPipeline): nothing is recorded, and the call is
+    // drawn again below through v1's copies.
+    const u8 refuse_mask = builtins ? GP::FallbackMask() : u8{0};
+    const auto indirect_draw = [&](u8 mask) {
+        if (builtins) {
+            engine_state = EngineHint::OnGpuParamDraw;
+            gpuparam_cb_bank = 0;
+        }
+        GP::g_builtin_pending.store(mask, std::memory_order_relaxed);
+        draw_manager.DrawIndexedIndirect(
+            *this, static_cast<Regs::PrimitiveTopology>(call.begin & 0xffff), 0, estimate);
+        GP::g_builtin_pending.store(0, std::memory_order_relaxed);
+        if (builtins) {
+            engine_state = EngineHint::None;
+            gpuparam_cb_bank = 0;
+        }
+        dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        // A drawing call leaves no indexed draw pending (DrawEnd clears it).
+        draw_manager.draw_state.draw_indexed = false;
+    };
+    GP::g_builtin_skipped.store(false, std::memory_order_relaxed);
+    indirect_draw(refuse_mask);
+    if (refuse_mask != 0 && GP::g_builtin_skipped.exchange(false, std::memory_order_relaxed)) {
+        GP::g_builtin_report_suppress.store(false, std::memory_order_relaxed);
+        GP::g_r1_fallback_draws.fetch_add(1, std::memory_order_relaxed);
+        if (call.cb.per_draw) {
+            // A count draw: the draws past the count are unknown here, so no per-record copies;
+            // drawn as before R1 (the words the zero-word call left in memory).
+            GP::g_r1_multi_unfixable.fetch_add(1, std::memory_order_relaxed);
+            indirect_draw(0);
+            return;
+        }
+        // v1's copies, one record at a time (a group's records are still where the GPU wrote
+        // them: the copies read them in queue order like the indirect draw would have).
+        GP::g_r1_fallback_records.fetch_add(call.max_draws, std::memory_order_relaxed);
+        for (u32 i = 0; i < call.max_draws; ++i) {
+            GP::Call single = call;
+            single.builtins = false;
+            single.max_draws = 1;
+            single.records_addr = call.records_addr + u64{i} * GP::RecordBytes;
+            GpuParamDraw(system, single);
+        }
+        return;
     }
-    draw_manager.DrawIndexedIndirect(*this, static_cast<Regs::PrimitiveTopology>(call.begin & 0xffff),
-                                     0, estimate);
-    if (builtins) {
-        engine_state = EngineHint::None;
-        gpuparam_cb_bank = 0;
-    }
-    dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
-    // A drawing call leaves no indexed draw pending (DrawEnd clears it).
-    draw_manager.draw_state.draw_indexed = false;
     if (has_cb) {
         GpuParamConstantWords(std::span{call.cb.post.data(), call.cb.post_count}, call);
     }

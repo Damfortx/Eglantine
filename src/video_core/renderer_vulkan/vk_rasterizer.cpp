@@ -59,6 +59,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/mt/gpuparam3.h"
 #include "video_core/mt/mirror_3d.h"
 #include "video_core/renderer_vulkan/vk_mt_pipeline.h"
 #include "video_core/renderer_vulkan/vk_mt_seq.h"
@@ -485,6 +486,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 }
 
 void RasterizerVulkan::ReportDrawFailure(std::string_view reason) {
+    // GPU params R1 (a): the lookup refused the pipeline of a built-in draw on purpose (it is
+    // drawn again with constant buffer copies): not a failure.
+    if (VideoCommon::MT::GpuParam::g_builtin_report_suppress.exchange(
+            false, std::memory_order_relaxed)) [[unlikely]] {
+        return;
+    }
     // The multithreaded back reports from the sequencer and the committer.
     static std::mutex seen_mutex;
     std::scoped_lock seen_lock{seen_mutex};

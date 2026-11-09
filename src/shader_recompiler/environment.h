@@ -131,6 +131,21 @@ public:
     [[nodiscard]] u32 GpuParamDynamicReads() const noexcept {
         return gpuparam_dynamic_reads;
     }
+    /// GPU params R1 (b) (video_core/mt/gpuparam3.h, EDEN_NX2_GPUPARAM2_LDC64): under that hint,
+    /// a two-word read cb[bank][0x640] becomes (BaseVertex, BaseInstance) when both words have
+    /// a replacement. Set with the bank by whoever makes the environment.
+    [[nodiscard]] bool GpuParamTwoWordReplace() const noexcept {
+        return gpuparam_two_word;
+    }
+    void SetGpuParamTwoWordReplace(bool on) noexcept {
+        gpuparam_two_word = on;
+    }
+    void NoteGpuParamTwoWordReplaced() noexcept {
+        ++gpuparam_two_word_replaced;
+    }
+    [[nodiscard]] u32 GpuParamTwoWordReplaced() const noexcept {
+        return gpuparam_two_word_replaced;
+    }
 
     [[nodiscard]] const ProgramHeader& SPH() const noexcept {
         return sph;
@@ -174,6 +189,8 @@ protected:
     u32 gpuparam_draw_bank = ~0U;
     u32 gpuparam_memory_reads{};
     u32 gpuparam_dynamic_reads{};
+    bool gpuparam_two_word{};
+    u32 gpuparam_two_word_replaced{};
 public:
     ::Common::unordered_map<CbufWordKey, u32, CbufWordKeyHash> cbuf_word_cache;
     ::Common::unordered_map<HandleKey,  u32, HandleKeyHash> handle_cache;

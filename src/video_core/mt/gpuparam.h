@@ -159,6 +159,10 @@ struct CbPlan {
     std::array<CbWord, MaxCbWords> post{};
     u8 pre_count{};
     u8 post_count{};
+    /// R1 (c), multi-draw calls only: every draw sees the words of its own record (`pre`'s GPU
+    /// words index into the record: 3 = vertex offset, 4 = first instance), `post` the
+    /// constants the call leaves. Only drawable with the built-ins (no copies can do it).
+    bool per_draw{};
 };
 
 /// Constant buffer words the back could not copy on the GPU (BufferCopy false: copied from
@@ -195,7 +199,7 @@ struct Call {
     const auto same = [](const CbWord& x, const CbWord& y) {
         return x.offset == y.offset && x.value == y.value && x.gpu_word == y.gpu_word;
     };
-    if (a.pre_count != b.pre_count || a.post_count != b.post_count) {
+    if (a.pre_count != b.pre_count || a.post_count != b.post_count || a.per_draw != b.per_draw) {
         return false;
     }
     for (u8 i = 0; i < a.pre_count; ++i) {
@@ -252,11 +256,14 @@ enum class Reason : u8 {
     IndexU8,       ///< 8-bit indices
     NoCode,        ///< not a native Turing macro / code missing
     Rejected,      ///< the macro's code does not match the reference model
+    PerDrawMulti,  ///< R1 (c): per-draw multi plan without v2's built-ins (no copy does it)
+    NoCountDraw,   ///< multi-draw call, the device has no vkCmdDrawIndexedIndirectCount
     Count,
 };
 inline constexpr std::array<std::string_view, static_cast<size_t>(Reason::Count)> ReasonNames{
     "deferred", "cpu params", "layout", "instance bits", "topology",
-    "shadow replay", "mesh", "u8 indices", "no code", "rejected"};
+    "shadow replay", "mesh", "u8 indices", "no code", "rejected", "per-draw multi",
+    "no count draw"};
 
 /// Why the Classifier rejected a macro.
 enum class Reject : u8 {
@@ -349,6 +356,48 @@ struct Trace {
 };
 
 using DataRam = Tegra::TuringMacroInterpreter::DataRam;
+
+/// R1 (c): the run's constant buffer writes are only to the driver constants 0x640/0x644, every
+/// draw saw its own base vertex / base instance there (the latest write of each before it), and
+/// the run leaves both words (`last`: their final values).
+[[nodiscard]] inline bool PerDrawWords(std::span<const Trace::CbWrite> writes,
+                                       std::span<const DrawRecord> draws, std::array<u32, 2>& last) {
+    std::array<u32, 2> current{};
+    std::array<bool, 2> known{};
+    size_t w = 0;
+    const auto take = [&](const Trace::CbWrite& write) {
+        const int slot = write.offset == BuiltinBaseVertexOffset     ? 0
+                         : write.offset == BuiltinBaseInstanceOffset ? 1
+                                                                     : -1;
+        if (slot < 0) {
+            return false;
+        }
+        current[slot] = write.value;
+        known[slot] = true;
+        return true;
+    };
+    for (size_t i = 0; i < draws.size(); ++i) {
+        for (; w < writes.size() && writes[w].draws_before <= i; ++w) {
+            if (!take(writes[w])) {
+                return false;
+            }
+        }
+        if (!known[0] || !known[1] || current[0] != draws[i].base_vertex ||
+            current[1] != draws[i].base_instance) {
+            return false;
+        }
+    }
+    for (; w < writes.size(); ++w) {
+        if (!take(writes[w])) {
+            return false;
+        }
+    }
+    if (!known[0] || !known[1]) {
+        return false;
+    }
+    last = current;
+    return true;
+}
 
 /// Runs native macro code (`code`: the whole instruction RAM, `start`: the macro's first
 /// instruction) on `params` in a scratch interpreter: `regs` is the register file the macro's
@@ -525,6 +574,11 @@ public:
             if (!ok && !last_error.empty()) {
                 LOG_INFO(HW_GPU, "GPU params: macro {} run error: {}", index, last_error);
             }
+            if (!ok && kind == Kind::IndexedMulti && per_draw_reject != Reject::None &&
+                reject >= Reject::CbLayout) {
+                LOG_INFO(HW_GPU, "GPU params: macro {} per-draw plan (R1): rejected ({})", index,
+                         RejectNames[static_cast<size_t>(per_draw_reject)]);
+            }
             if (ok && (cb.pre_count != 0 || cb.post_count != 0)) {
                 std::string text;
                 const auto add = [&text](const char* phase, const CbWord& w) {
@@ -538,7 +592,8 @@ public:
                 for (u8 i = 0; i < cb.post_count; ++i) {
                     add("post", cb.post[i]);
                 }
-                LOG_INFO(HW_GPU, "GPU params: macro {} constant buffer words:{}", index, text);
+                LOG_INFO(HW_GPU, "GPU params: macro {} constant buffer words:{}{}", index,
+                         cb.per_draw ? " per draw (record words)" : "", text);
             }
         }
         return {ok, reject, false, cb, group_safe};
@@ -583,7 +638,12 @@ public:
         ReferenceDraws(kind, begin, words, max_draws, expected, 1U << 20);
         // The constant buffer words the draws saw and the call left, against the plan's.
         cb_same = true;
-        if (!trace.draws.empty()) {
+        if (cb.per_draw) {
+            // R1 (c): each draw saw its own record's words, the call left the plan's constants.
+            std::array<u32, 2> last{};
+            cb_same = PerDrawWords(trace.cb_writes, trace.draws, last) && cb.post_count == 2 &&
+                      last[0] == cb.post[0].value && last[1] == cb.post[1].value;
+        } else if (!trace.draws.empty()) {
             const auto resolve = [&words](const CbWord& w) {
                 return w.gpu_word == NoGpuWord ? w.value
                        : w.gpu_word < words.size() ? words[w.gpu_word]
@@ -684,6 +744,7 @@ private:
                                 u32 max_draws, std::span<const u32> regs, const DataRam& dram,
                                 Executable& executable, CbPlan& cb, bool& zero_groupable) {
         last_error = {};
+        per_draw_reject = Reject::None;
         zero_groupable = false;
         bool stateful = false;
         std::vector<std::pair<u32, u32>> base_writes;
@@ -691,6 +752,7 @@ private:
         std::array<std::vector<Trace::CbWrite>, 7> cb_runs;
         std::array<std::array<u32, 5>, 7> single_words{};
         std::array<size_t, 7> draw_counts{};
+        std::array<std::vector<DrawRecord>, 7> draw_runs; // multi: R1 (c) per-draw plan
         for (u32 v = 0; v < 7; ++v) {
             TestWords(kind, max_draws, v, words);
             params.assign(1, begin);
@@ -740,9 +802,51 @@ private:
             draw_counts[v] = trace.draws.size();
             if (kind == Kind::IndexedSingle) {
                 std::copy_n(words.begin(), 5, single_words[v].begin());
+            } else {
+                draw_runs[v] = trace.draws;
             }
         }
-        return {PlanConstantBuffer(kind, cb_runs, single_words, draw_counts, cb), stateful};
+        Reject reject = PlanConstantBuffer(kind, cb_runs, single_words, draw_counts, cb);
+        per_draw_reject = Reject::None;
+        if (reject != Reject::None && kind == Kind::IndexedMulti) {
+            // R1 (c): GPU words to the constant buffer per record (the record's base vertex /
+            // instance before its draws): one count draw gives each draw its own with the
+            // built-ins. Otherwise the regular plan's reason stands.
+            CbPlan per_draw{};
+            per_draw_reject = PlanPerDraw(cb_runs, draw_runs, per_draw);
+            if (per_draw_reject == Reject::None) {
+                cb = per_draw;
+                reject = Reject::None;
+            }
+        }
+        return {reject, stateful};
+    }
+
+    /// R1 (c): every run's draws see their own record's base vertex / instance at 0x640/0x644
+    /// (PerDrawWords), and every run (the zero-word one too) leaves the same constants there.
+    static Reject PlanPerDraw(const std::array<std::vector<Trace::CbWrite>, 7>& runs,
+                              const std::array<std::vector<DrawRecord>, 7>& draws, CbPlan& cb) {
+        cb = CbPlan{};
+        std::array<u32, 2> final_values{};
+        for (size_t v = 0; v < runs.size(); ++v) {
+            std::array<u32, 2> last{};
+            if (!PerDrawWords(runs[v], draws[v], last)) {
+                return runs[v].empty() ? Reject::CbPostOnly : Reject::CbValue;
+            }
+            if (v == 0) {
+                final_values = last;
+            } else if (last != final_values) {
+                return Reject::CbBetweenDraws; // what the call leaves depends on the words
+            }
+        }
+        cb.per_draw = true;
+        cb.pre_count = 2;
+        cb.pre[0] = {BuiltinBaseVertexOffset, 0, 3};
+        cb.pre[1] = {BuiltinBaseInstanceOffset, 0, 4};
+        cb.post_count = 2;
+        cb.post[0] = {BuiltinBaseVertexOffset, final_values[0], NoGpuWord};
+        cb.post[1] = {BuiltinBaseInstanceOffset, final_values[1], NoGpuWord};
+        return Reject::None;
     }
 
     /// The constant buffer words of the runs as a plan: the same offsets in every run, each value
@@ -844,6 +948,7 @@ private:
     std::vector<u32> words;
     std::vector<DrawRecord> expected;
     std::string_view last_error;
+    Reject per_draw_reject{}; ///< R1 (c): why the last multi run had no per-draw plan
 };
 
 // ------------------------------------------------------------------------------- statistics

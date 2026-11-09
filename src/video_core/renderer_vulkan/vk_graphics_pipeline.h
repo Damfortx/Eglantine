@@ -117,6 +117,16 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+
+    /// GPU params (mt/gpuparam3.h, R1 (a)): built for the hint OnGpuParamDraw and some stage
+    /// still reads the draw parameter words from memory (GP::DrawParamReads* bits). Set by the
+    /// pipeline cache before the pipeline is published; 0 for every other pipeline.
+    [[nodiscard]] u8 DrawParamWordReads() const noexcept {
+        return draw_param_word_reads;
+    }
+    void SetDrawParamWordReads(u8 bits) noexcept {
+        draw_param_word_reads = bits;
+    }
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
 
@@ -359,6 +369,7 @@ private:
     std::atomic_bool is_built{false};
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
+    u8 draw_param_word_reads{}; ///< R1 (a): DrawParamWordReads()
 };
 
 } // namespace Vulkan

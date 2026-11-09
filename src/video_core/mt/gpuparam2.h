@@ -17,6 +17,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/mt/gpuparam3.h"
 #include "video_core/mt/mt_switches.h"
 #include "video_core/nx2.h"
 
@@ -114,6 +115,10 @@ struct V2Stats {
     u64 zero_call_breaks{}; ///< a joining call's zero call emitted something else
     u64 check_compared{};
     u64 check_mismatch{};   ///< macro's cb words != record words 3/4
+    // R1 (mt/gpuparam3.h) (c): multi-draw calls with the per-draw plan.
+    u64 multi_copy_free{};        ///< drawn with the built-ins and the GPU count
+    u64 multi_per_draw_waiting{}; ///< kept waiting (EDEN_NX2_GPUPARAM2_MULTI off / v2 off)
+    u64 multi_no_count{};         ///< kept waiting: no vkCmdDrawIndexedIndirectCount
 
     void NoteGroup(u32 size, u32 why) {
         ++groups;
@@ -168,7 +173,8 @@ struct V2Stats {
             release_text.empty() ? " none" : release_text,
             method_text.empty() ? " none" : method_text,
             no_join_text.empty() ? " none" : no_join_text, zero_call_breaks, check_compared,
-            check_mismatch);
+            check_mismatch) +
+               FormatR1(multi_copy_free, multi_per_draw_waiting, multi_no_count);
     }
 };
 

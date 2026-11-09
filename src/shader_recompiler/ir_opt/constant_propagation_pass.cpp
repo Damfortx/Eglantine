@@ -930,6 +930,35 @@ void FoldConstBuffer(Environment& env, IR::Block& block, IR::Inst& inst) {
     }
 }
 
+// GPU params R1 (b) (Environment::GpuParamTwoWordReplace): a two-word read (LDC.64) of
+// cbuf[hint bank][0x640] under the GPU params hint is (BaseVertex, BaseInstance) when the
+// environment replaces both words (vertex stages): the same built-ins the one-word reads get.
+void FoldGpuParamTwoWords(Environment& env, IR::Block& block, IR::Inst& inst) {
+    const u32 hint_bank = env.GpuParamDrawBank();
+    if (hint_bank == ~0U || !env.GpuParamTwoWordReplace()) {
+        return;
+    }
+    const IR::Value bank{inst.Arg(0)};
+    const IR::Value offset{inst.Arg(1)};
+    if (!bank.IsImmediate() || !offset.IsImmediate() || bank.U32() != hint_bank ||
+        offset.U32() != 0x640) {
+        return;
+    }
+    const auto low = env.GetReplaceConstBuffer(hint_bank, 0x640);
+    if (!low || *low != ReplaceConstant::BaseVertex) {
+        return;
+    }
+    const auto high = env.GetReplaceConstBuffer(hint_bank, 0x644);
+    if (!high || *high != ReplaceConstant::BaseInstance) {
+        return;
+    }
+    IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+    const IR::Value pair{ir.CompositeConstruct(ir.GetAttributeU32(IR::Attribute::BaseVertex),
+                                               ir.GetAttributeU32(IR::Attribute::BaseInstance))};
+    inst.ReplaceUsesWith(pair);
+    env.NoteGpuParamTwoWordReplaced();
+}
+
 // GPU params v2 (Environment::GpuParamDrawBank): the draw's memory holds 0 in the draw parameter
 // words cbuf[bank][0x640..0x648); a read of them the translation keeps (FoldConstBuffer replaced
 // none: a stage without draw parameter built-ins, a sub-word or two-word read) or a read of that
@@ -1194,11 +1223,14 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
             FoldDriverConstBuffer(env, block, inst, 1);
         }
         break;
+    case IR::Opcode::GetCbufU32x2:
+        FoldGpuParamTwoWords(env, block, inst);
+        NoteGpuParamConstBuffer(env, inst);
+        break;
     case IR::Opcode::GetCbufU8:
     case IR::Opcode::GetCbufS8:
     case IR::Opcode::GetCbufU16:
     case IR::Opcode::GetCbufS16:
-    case IR::Opcode::GetCbufU32x2:
         NoteGpuParamConstBuffer(env, inst);
         break;
     case IR::Opcode::BindlessImageSampleImplicitLod:
