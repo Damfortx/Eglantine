@@ -123,3 +123,29 @@ s6-compact0); FLUSHCMD's texture skip relies on texture page bits plus "no draw/
 (stale CPU reads of render targets would show as wrong pictures in readbacks: s6-flushcmd0);
 REPLAY elides repeated state inside a segment (state bugs: s6-replay0); RREFRESH uploads CPU-
 modified images at commit (stale textures: s6-rrefresh0).
+
+## Throughput pieces (branch mkw-mt-perf, docs/mt-perf-plan.md): one test round
+Switches (src/video_core/mt/perf_switches.h), all inert with EDEN_NX2_MT unset and ON by default
+under EDEN_NX2_MT=1; `=0` restores the previous behaviour ("alt" = also accepts `a` for the
+EDEN_NX2_ALT_SECONDS A/B windows):
+| switch | piece | =0 restores |
+|---|---|---|
+| EDEN_NX2_MT_LAZY_WAKE | P1 | every SpmcStream::Commit checks for sleeping consumers and futex-wakes them |
+| EDEN_NX2_MT_UBIND_FOLD | P2 | one "uniform" Command per constant buffer bind |
+| EDEN_NX2_MT_CMD_IN_BATCH (alt) | P3 | query/fence/barrier/clear/cond-render Commands end the open batch |
+| EDEN_NX2_MT_BATCH_MIN=N (default 4) | P4 | =1: the adaptive close fires after any draw |
+| EDEN_NX2_MT_CONT_MEMO (alt) | P5 | IsContinuousRange per storage buffer per draw |
+| EDEN_NX2_MT_INVAL_TEXFILTER (alt) | P6 | texture mutex for every sequencer FlushCaching with ranges |
+| EDEN_NX2_MT_INVAL_ONELOCK (alt) | P7 | tracker lock twice per invalidated range |
+| EDEN_NX2_MT_EBR_LAZY (alt) | P8 | epoch collection takes both cache mutexes every batch / 16 draws |
+| EDEN_NX2_MT_RALIAS (alt) | P9 | views of aliased images are view-not-clean (committer slow path) |
+| EDEN_NX2_MT_DMA_CONSUMED (alt) | P10 | MME DMA reads (WaitForWriters, the non-GPU-written Drain) wait for `settled` of everything sent |
+BIN=<mkw-mt build>/build/pgo/bin/eden-cli, from /home/appo/src/eglantine-buildenv/tools.
+0. Standalone (no emulator): `docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v /home/appo/src:/home/appo/src -w <tree> eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all` -> ALL PASS, sanitizer_reports=0 (new t11_lazy_wake).
+1. fps, defaults: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_STATS=1 ./demo.sh $BIN 120 perf-free` + portal screenshot. Compare with the 35 fps baseline and MT unset (47.9-51.1).
+   With EDEN_NX2_GPU_PROFILE=1 once (costs fps): "GPU split drains per second" dma read / writers (dma read) wait ms should drop sharply (P10).
+   In the stats: "MT stats/s ... commands: uniform" ~0 (P2); "MT resolvers/s ... N per batch" >= 4 and "batches" well under draws/2 (P3/P4); "MT stages ms/s: sequencer draws" per draw packet (target <= ~5 us); "view-not-clean N (aliases A, buffer B, cpu C, sparse D, dead E, rescaled F, cpu+alias G)" tells what still takes the committer's slow path; committer idle.
+2. Correctness, all on: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_VERIFY=1 EDEN_NX2_MT_STATS=1 ./demo.sh $BIN 120 perf-verify` (0 new mismatches) and `EDEN_NX2_MT_SHADOW=1` (tag perf-shadow; 0 "MT shadow:" lines; with RALIAS the alias views are resolved, so shadow compares them too).
+3. Hangs: 1 with `EDEN_NX2_MT_WATCHDOG=1` must log no "MT wait > 2 s"; if anything hangs, first `EDEN_NX2_MT_LAZY_WAKE=0` (a missed flush point leaves a consumer asleep with entries pending; the 32 KiB auto-flush bounds it, so a hang means a wait without Flush).
+4. Bisect only if 1-3 show a loss or a problem, one switch at 0 per run (tags perf-lazy0, perf-fold0, perf-cmdb0, perf-bmin1 (EDEN_NX2_MT_BATCH_MIN=1), perf-cont0, perf-texf0, perf-onelock0, perf-ebr0, perf-ralias0, perf-dmac0). Wrong uniforms/geometry: UBIND_FOLD first; stale or flickering textures on aliased render targets: RALIAS; missed texture updates after CPU writes: INVAL_TEXFILTER; wrong indirect draw counts / culling after MME DMA reads: DMA_CONSUMED (also run 1 once with EDEN_NX2_DMA_READ_CHECK=1: "0 stale" expected).
+5. A/B of the "alt" ones in one run: e.g. `EDEN_NX2_ALT_RANDOM=1 EDEN_NX2_ALT_SECONDS=2 EDEN_NX2_MT_RALIAS=a` (3 runs, tools/alt.py).

@@ -58,6 +58,10 @@ No usable profile (empty capture); the other agent's numbers show it far from sa
 | P7 | EDEN_NX2_MT_INVAL_ONELOCK | one tracker lock scope over SeqInvalidateBuffers' loop | -2 % |
 | P8 | EDEN_NX2_MT_EBR_LAZY | CollectEpochs skips both cache mutexes when nothing is retired (atomic pending count) | committer -1-2 %, fewer lock collisions with the sequencer |
 | P9 | EDEN_NX2_MT_RALIAS | resolver accepts views whose image only HasAliases (not CPU-modified, no other unclean flag); committer runs SynchronizeAliases for them under the texture mutex before Validate (a rescale bumps the version -> slow path); breakdown of view-not-clean by flag in "MT resolvers/s" | committer slow path 45 % -> (the alias share) |
+| P10 | EDEN_NX2_MT_DMA_CONSUMED | front (from the other agent's GPU profile: 61 % in WaitConsumed, 29 % Drain + 25 % WaitForWriters from Maxwell3D::FrontDmaRead, ~300 waits/s, each waiting for `settled`): MME DMA reads of pages the GPU has not written wait for `consumed` and for `settled` only up to the last entry that queued a committer-side guest write (GpuSplit::NoteCommitterWrite from Nx2DrawPipeline::Command for all kinds but uniform/barrier/clear/cond-render/invalidate); GPU-written pages still Drain (downloads) | the biggest lever: most read waits stop paying the resolver+committer latency |
+Also fixed on the way: the sequencer's TIC-valid memo now also keys on the memory manager
+(channels have their own layout generations).
+
 Not planned: value-dedup of deltas (#3712 made redundant writes set dirty flags, the mirrors must
 see them); a smaller stream ring (16 MiB matches the 4096-slot resolved ring at 3.7 KB/packet);
 the uploads themselves (same bytes the old path uploads).
@@ -71,5 +75,5 @@ Phase 1, in parallel:
   src/video_core/renderer_vulkan/vk_mt_resolve.h, vk_mt_resolve_types.h (P9).
 - Integrator: vk_mt_pipeline.h, vk_rasterizer.cpp, mt/epoch.h (P1 flush points, P2-P8, the P9 call
   site).
-Phase 2: integrate, build, standalone sanitizer tests, commit per piece, append the test round to
+Phase 2 (integrator): P10 (gpu_split.*, maxwell_3d.cpp), merge of mkw-mt 2d8e40d; integrate, build, standalone sanitizer tests, commit per piece, append the test round to
 docs/mt-pending-runtime-checks.md.
