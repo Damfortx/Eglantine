@@ -64,9 +64,30 @@ struct ViewRef {
     u8 written;
     u8 blacklist;
     u8 null;
-    u8 refresh; ///< EDEN_NX2_MT_RREFRESH: CPU-modified, the committer refreshes it
+    u8 prep; ///< ViewPrep* bits: what the committer does to the image besides the LRU touch
 };
 static_assert(sizeof(ViewRef) == 24);
+
+/// ViewRef::prep bits.
+enum ViewPrep : u8 {
+    ViewPrepRefresh = 1 << 0, ///< EDEN_NX2_MT_RREFRESH: CPU-modified, the committer refreshes it
+    ViewPrepAliases = 1 << 1, ///< EDEN_NX2_MT_RALIAS: has aliases, the committer synchronizes
+                              ///< them before validating (SyncResolvedAliases)
+};
+
+/// Why views were not clean (TextureCache::MtUnclean bit order), counted per view-not-clean.
+enum NotCleanReason : u8 {
+    NotCleanBuffer,
+    NotCleanAliases,
+    NotCleanCpu,
+    NotCleanSparse,
+    NotCleanDead,
+    NotCleanRescaled,
+    NotCleanCpuAlias,
+    NotCleanCount,
+};
+inline constexpr std::array<const char*, NotCleanCount> NotCleanNames{
+    "buffer", "aliases", "cpu", "sparse", "dead", "rescaled", "cpu+alias"};
 
 struct SamplerRef {
     u32 sampler;
@@ -142,6 +163,10 @@ struct ResolverCounters {
     std::atomic<u64> wait_ns{};
     std::atomic<u64> sampler_creations{};
     std::array<std::atomic<u64>, SlowReasonCount> slow{};
+    /// view-not-clean breakdown (a view may count under several reasons).
+    std::array<std::atomic<u64>, NotCleanCount> not_clean{};
+    /// EDEN_NX2_MT_RALIAS: views resolved with aliases to synchronize at commit.
+    std::atomic<u64> alias_views{};
     // EDEN_NX2_MT_RBUF.
     std::array<std::atomic<u64>, BufFailCount> buffer_fail{};
     std::atomic<u64> ring_bytes{};

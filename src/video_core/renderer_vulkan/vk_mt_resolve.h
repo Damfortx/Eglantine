@@ -24,6 +24,7 @@
 #include "video_core/mt/capture.h"
 #include "video_core/mt/engine_ptr.h"
 #include "video_core/mt/epoch.h"
+#include "video_core/mt/perf_switches.h"
 #include "video_core/mt/resolve_packet.h"
 #include "video_core/mt/resolve_sync.h"
 #include "video_core/mt/role.h"
@@ -562,6 +563,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     const u32 tsc_limit = via_header_index ? tic_limit : regs.tex_sampler.limit;
     const bool native_tiling = r.gpu_memory->UsesNativeTiling();
     const bool allow_refresh = VideoCommon::MT::ResolverRefresh();
+    const bool allow_aliases = VideoCommon::MT::ResolverAliases();
     u32 view_cursor = 0;
     u32 sampler_cursor = 0;
     u32 buffer_cursor = 0;
@@ -585,7 +587,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
                            ((packet.tic_valid[bit / 64] >> (bit % 64)) & 1) != 0;
         TextureCache::MtResolvedView resolved;
         switch (texture_cache.TryResolveViewCaptured(channel, entry, valid, blacklist, resolved,
-                                                     allow_refresh)) {
+                                                     allow_refresh, allow_aliases)) {
         case TextureCache::MtViewResolve::Ok:
             view_objects[bit] = resolved.object;
             view_rescaled[bit] = texture_cache.IsRescalingResolved(resolved) ? 1 : 0;
@@ -595,7 +597,11 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             ref.image_gen = resolved.image_gen;
             ref.image_version = resolved.image_version;
             ref.null = 0;
-            ref.refresh = resolved.refresh ? 1 : 0;
+            ref.prep = static_cast<u8>((resolved.refresh ? ViewPrepRefresh : 0) |
+                                       (resolved.aliases ? ViewPrepAliases : 0));
+            if (resolved.aliases) {
+                counters.alias_views.fetch_add(1, std::memory_order_relaxed);
+            }
             return true;
         case TextureCache::MtViewResolve::Null:
             return true;
@@ -604,6 +610,11 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             return false;
         case TextureCache::MtViewResolve::NotClean:
             out.reason = ViewNotClean;
+            for (u32 reason = 0; reason < NotCleanCount; ++reason) {
+                if (((resolved.unclean >> reason) & 1) != 0) {
+                    counters.not_clean[reason].fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             return false;
         }
         return false;
@@ -1107,7 +1118,7 @@ inline void Nx2DrawPipeline::PrepareResolvedTextures(const MT::ResolvedDraw& res
                 .object = &texture_cache.NullImageViewObject(),
             };
             texture_cache.MtApplyViewIntent(resolved, ref.written != 0, ref.blacklist != 0,
-                                            ref.refresh != 0);
+                                            (ref.prep & MT::ViewPrepRefresh) != 0);
         }
     }
     commit_samplers.clear();
@@ -1120,6 +1131,28 @@ inline void Nx2DrawPipeline::PrepareResolvedTextures(const MT::ResolvedDraw& res
     out.stage_begin = res.stage_begin;
     out.stage_count = res.stage_count;
     out.rescaling = res.rescaling;
+}
+
+inline void Nx2DrawPipeline::SyncResolvedAliases(const MT::ResolvedDraw& res) {
+    // EDEN_NX2_MT_RALIAS: PrepareImage's SynchronizeAliases for the views resolved with aliases,
+    // before Validate. Such images are never CPU-modified at resolve (that combo is not clean),
+    // so PrepareImage's RefreshContents-then-SynchronizeAliases order holds; a CPU write since
+    // the resolve bumped the version and MtSynchronizeAliases skips it (the draw fails validation
+    // and the slow path prepares it). A rescale in SynchronizeAliases bumps the versions of the
+    // rescaled images, so a draw using one of them fails validation too.
+    TextureCache& texture_cache = rasterizer.texture_cache;
+    std::unique_lock<decltype(texture_cache.mutex)> lock{texture_cache.mutex, std::defer_lock};
+    for (u32 i = 0; i < res.num_views; ++i) {
+        const MT::ViewRef& ref = res.views[i];
+        if (ref.null != 0 || (ref.prep & MT::ViewPrepAliases) == 0) {
+            continue;
+        }
+        if (!lock.owns_lock()) {
+            lock.lock();
+        }
+        texture_cache.MtSynchronizeAliases(VideoCommon::ImageId{ref.image}, ref.image_gen,
+                                           ref.image_version);
+    }
 }
 
 inline void Nx2DrawPipeline::ApplyResolvedBuffers(const MT::ResolvedDraw& res, bool is_indexed) {
@@ -1278,10 +1311,28 @@ inline void Nx2DrawPipeline::LogResolverStats(double seconds) {
             slow[i] += take(c.slow[i]);
         }
     }
+    std::array<u64, MT::NotCleanCount> not_clean{};
+    u64 alias_views = 0;
+    for (auto& resolver : resolvers) {
+        MT::ResolverCounters& c = resolver->counters;
+        for (size_t i = 0; i < not_clean.size(); ++i) {
+            not_clean[i] += take(c.not_clean[i]);
+        }
+        alias_views += take(c.alias_views);
+    }
     std::string slow_text;
     for (size_t i = 1; i < slow.size(); ++i) {
         if (slow[i] != 0) {
             slow_text += fmt::format(" {} {:.0f}", MT::SlowReasonNames[i], rate(slow[i]));
+            if (i == MT::ViewNotClean) {
+                // Why (a view may count under several reasons).
+                std::string why;
+                for (size_t j = 0; j < not_clean.size(); ++j) {
+                    why += fmt::format("{}{} {:.0f}", j == 0 ? "" : ", ", MT::NotCleanNames[j],
+                                       rate(not_clean[j]));
+                }
+                slow_text += fmt::format(" ({})", why);
+            }
         }
     }
     std::string fail_text;
@@ -1322,10 +1373,11 @@ inline void Nx2DrawPipeline::LogResolverStats(double seconds) {
                  counters.uniform_id_mismatches.load(std::memory_order_relaxed));
     }
     LOG_INFO(Render_Vulkan,
-             "MT resolvers/s:{} | ok {:.0f} (committed {:.0f}), slow {:.0f}:{}, missing {:.0f}, stolen {:.0f} | validation "
+             "MT resolvers/s:{} | ok {:.0f} (committed {:.0f}, alias views {:.0f}), slow {:.0f}:{}, missing {:.0f}, stolen {:.0f} | validation "
              "failures:{} | batches {:.0f}, commit wait {:.1f} ms, ring waits {:.0f}, barriers "
              "{:.0f} | shadow {:.0f} checks, {} mismatches, {:.0f} unvalidated | EBR pending {}",
              per_resolver, rate(take(counters.resolved_ok)), rate(take(counters.resolved_committed)),
+             rate(alias_views),
              rate(take(counters.resolved_slow)),
              slow_text, rate(take(counters.resolved_missing)),
              rate(take(counters.resolved_stolen)), fail_text,

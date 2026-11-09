@@ -422,21 +422,37 @@ public:
         u32 image_version{};
         const ImageView* object{}; ///< valid while the EpochGuard is held
         bool refresh{}; ///< CPU-modified: the committer uploads it at commit (allow_refresh)
+        bool aliases{}; ///< has aliases: the committer synchronizes them (allow_aliases)
+        u8 unclean{};   ///< NotClean only: why, MtUnclean* bits
     };
     enum class MtViewResolve : u8 { Ok, Null, Miss, NotClean };
+    /// Why a view was NotClean (MtResolvedView::unclean). Several may be set.
+    enum MtUnclean : u8 {
+        MtUncleanBuffer = 1 << 0,    ///< buffer view
+        MtUncleanAliases = 1 << 1,   ///< HasAliases, aliases not allowed
+        MtUncleanCpu = 1 << 2,       ///< CpuModified, refresh not allowed
+        MtUncleanSparse = 1 << 3,    ///< UnwrittenSparse, SparseTiles or SparseLayers
+        MtUncleanDead = 1 << 4,      ///< Dead
+        MtUncleanRescaled = 1 << 5,  ///< blacklisted view of a Rescaled image
+        MtUncleanCpuAlias = 1 << 6,  ///< CpuModified and HasAliases together
+    };
 
     /// VisitImageView + PrepareImageView for an image that needs no preparation besides the
     /// LRU touch: the view of `entry` (whose IsValidEntry the sequencer computed).
     /// `allow_refresh` (EDEN_NX2_MT_RREFRESH): an image that is only CPU-modified resolves too,
     /// with `out.refresh` set (MtApplyViewIntent uploads it).
+    /// `allow_aliases` (EDEN_NX2_MT_RALIAS): an image whose only unclean flag is HasAliases (not
+    /// together with CpuModified) resolves too, with `out.aliases` set (the committer calls
+    /// MtSynchronizeAliases before validating). NotClean sets `out.unclean` (MtUnclean bits).
     [[nodiscard]] MtViewResolve TryResolveViewCaptured(const TextureCacheChannelInfo& channel,
                                                        const TICEntry& entry, bool valid_entry,
                                                        bool blacklist, MtResolvedView& out,
-                                                       bool allow_refresh = false) const noexcept;
+                                                       bool allow_refresh = false,
+                                                       bool allow_aliases = false) const noexcept;
     /// The same from a view id found earlier (a resolver's L1 cache).
     [[nodiscard]] MtViewResolve TryResolveViewId(ImageViewId id, bool blacklist,
-                                                 MtResolvedView& out,
-                                                 bool allow_refresh = false) const noexcept;
+                                                 MtResolvedView& out, bool allow_refresh = false,
+                                                 bool allow_aliases = false) const noexcept;
     enum class MtSamplerResolve : u8 { Ok, Null, Miss };
     [[nodiscard]] MtSamplerResolve TryResolveSamplerCaptured(const TextureCacheChannelInfo& channel,
                                                              const TSCEntry& entry, SamplerId& out,
@@ -456,6 +472,12 @@ public:
     /// writes mark the image modified; `refresh`: RefreshContents of a CPU-modified image).
     void MtApplyViewIntent(const MtResolvedView& view, bool written, bool blacklist,
                            bool refresh = false);
+    /// Committer, texture mutex held, before validation (EDEN_NX2_MT_RALIAS): PrepareImage's
+    /// SynchronizeAliases for a resolved image, if the slot still holds the image the resolver saw
+    /// at that version and it still has aliases. A rescale it does bumps the versions of the
+    /// images it rescales (ScaleUp/ScaleDown), so validation fails for draws using them.
+    /// Returns whether SynchronizeAliases ran.
+    bool MtSynchronizeAliases(ImageId image_id, u32 image_gen, u32 image_version);
     [[nodiscard]] TextureCacheChannelInfo* MtChannelState() const noexcept {
         return channel_state;
     }
