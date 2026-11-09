@@ -201,3 +201,32 @@ under MT lite since iteration 3, unconditionally fixed): MT lite numbers may shi
     `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 ./splitscreen/splitscreen.sh $BIN 240 ss-lite`
     (alternate, >= 2 each): `cat runs/fps-<tag>.txt`; marker `grep "Key script: press key 69" runs/log-<tag>.txt`;
     screenshot during the race to confirm split screen.
+
+## Batch 7 (branch mkw-mt-lite, commits 4d3eb39..a04d1ed, docs/batch7-plan.md): one test round
+Compiled only (build/pgo rc=0); nothing below has run. BIN, demo.sh, L as in Round 6.
+1. BC7 picture: `env NOPROF=1 EDEN_NX2_ASTC_BC7=1 ./demo.sh $BIN 120 b7-bc7` (MT unset) + portal
+   screenshot vs a default run (b7-bc3): log "ASTC recompression: BC7 (GPU encoder), opaque BC1 off";
+   ground no longer darkened, no block garbage / wrong alpha (foliage, kart decals). Corrupt textures
+   => EDEN_NX2_ASTC_BC7=0 confirms; then try EDEN_NX2_ASTC_BC7_OPAQUE_BC1=1. Device loss / validation
+   errors on BC7 copies => note the texture (BC7<->BC3 copy risk). fps vs b7-bc3 (encoder ~3x ALU):
+   2 runs each, NOPROF=1 VSYNC 240. VRAM: same as BC3 except opaque textures (BC1 -> BC7 doubles them).
+2. Disk cache: `env EDEN_NX2_ASTC_DISKCACHE=1 ./demo.sh $BIN 120 b7-dc1` twice (b7-dc1, b7-dc2):
+   start line (dir under the shader cache /<title>/astc_bc, cap); run 1 "misses"/"written" > 0,
+   run 2 "hits" >> misses, read ms small, no corrupt/write errors; picture identical to b7-bc3
+   (screenshot). Also once with BC7 on (key includes the mode: the BC3 entries must not be hit).
+   Check hitches: "hash X ms" per 10 s on misses. `du -sh` the dir <= cap.
+3. GPUPARAM2 R1 (stats run, L + EDEN_NX2_GPU_PROFILE=1 EDEN_NX2_GPUPARAM_STATS=1, b7-gp-stats):
+   `grep "GPU params in 10 s"` -> "R1: memory-word fallbacks", "LDC.64 replaced", "count draws",
+   "per-draw multi waiting"; `grep "kept waiting for CPU parameters\|per-draw plan (R1)"` = macro
+   44's shape (copy into the next plan). No WARNING "reads the draw parameter words" without a
+   fallback count. Picture: portal screenshot; geometry wrong => EDEN_NX2_GPUPARAM2_MULTI=0, then
+   _LDC64=0, then _FALLBACK=0. CHECK: `L EDEN_NX2_GPUPARAM_CHECK=1` (b7-gpcheck): "v2 check N
+   compared, 0 mismatched" incl. multi calls.
+4. R2 capture: CHECK run `L EDEN_NX2_MT_LITE7_CAPTURE_CHECK=1 EDEN_NX2_MT_STATS=1` (b7-capcheck):
+   "MT lite 7 capture/s" check counts: desc mismatches 0, lockskip-not-held 0, overlay mismatches 0
+   (ubo bytes changed after unlock may be > 0, same race as SEQLOCK). In-run A/B 3 runs:
+   `L EDEN_NX2_ALT_RANDOM=1 EDEN_NX2_ALT_SECONDS=2 EDEN_NX2_MT_LITE7_LOCKSKIP=a` (b7-ab-lock-<i>),
+   same for DESCDEDUP. MT_STATS "sequencer draws ms/s" vs Round 6 (432 ms/s); VERIFY run
+   (`L EDEN_NX2_MT_VERIFY=1`, b7-verify): 0 mismatches. Bisect on picture problems: UBOLOCK,
+   DESCDEDUP, OVERLAY, LOCKSKIP (=0 each).
+5. fps pairs vs MT unset (>= 3 each, alternating) as Round 6 step 2 with tags b7-off<i> / b7-lite<i>.

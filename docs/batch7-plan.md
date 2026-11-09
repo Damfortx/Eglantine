@@ -44,3 +44,47 @@ vkCmdDrawIndexedIndirectCount with the count from GPU memory, when the classifie
 ## R2 cheaper sequencer capture (each behind a switch, on under MT_LITE)
 From the iteration-2 profile (~4.4 us/draw): memoization keyed on pipeline/plan + unchanged inputs,
 no redundant descriptor reads, shorter lock holds.
+
+---------------------------------------------------------------------------------------------
+# Implementation notes (batch 7, compiled build/pgo rc=0, NOT run)
+
+Commits: 4d3eb39 (T1+T2, they share vk_texture_cache.*), 464474b (R1), a04d1ed (R2).
+
+## T1 BC7
+bc_encoder.comp push constant `bc3` -> `mode` (layout unchanged; BC1/BC3 code untouched). Mode 6
+only: PCA endpoints (8 power iterations), 7-bit quantization with per-endpoint p-bit choice (opaque
+blocks force p=1 => alpha 255), index search (projection +-1), up to 2 least-squares refits, anchor
+fix by swapping endpoints and mirroring indices. Validated with glslangValidator; a C++ port
+round-trips through the repo's BC7 decoder. BC7 = AstcBc7Enabled (switch, no native ASTC, BC
+support, global setting BC3, BC7 UNORM/SRGB sampled+transfer-dst) && WillUseGpuBcnTranscode &&
+!IsOpaqueBc1Astc; one predicate (IsBc7Astc) drives AstcHostFormat, the image's view-format list,
+the ImageView format and TranscodeBcMode. maxwell_to_vk stays BC3 (CPU path, huge arrays, 3D).
+Risk: a raw copy between a BC7 image and an overlapping BC3 one (3D/huge) would misinterpret data
+(TextureCache::CopyImage has an astc_opaque guard only). Encoder ~3x BC3 ALU per block.
+
+## T2 disk cache
+texture_cache/astc_disk_cache.h. Key CityHash128WithSeed(guest bytes, seed = hash of format,
+shape, block, layer stride, astc_opaque, BC mode, kEncoderVersion=2, guest size); images with
+host_level_offset != 0 are not cached. Path <ShaderDir>/<program id>/astc_bc/<key>.bc (64-byte
+header with magic ACBC, checksums). Hit: synchronous file read on the GPU thread -> Upload staging
+-> image.UploadMemory. Miss: copy of the BC buffer into an own Download buffer (pool of 4 <= 16
+MiB), per-frame budget EDEN_NX2_ASTC_DISKCACHE_RB_MIB (64); PollAstcDiskCache(true) in TickFrame
+hands finished readbacks to the single writer thread (scan at start, tmp+rename, LRU eviction to
+EDEN_NX2_ASTC_DISKCACHE_MIB (2048)). Stats "ASTC disk cache in 10 s: ...". Bump kEncoderVersion
+whenever bc_encoder.comp output changes.
+
+## R1 GPUPARAM2 robustness (mt/gpuparam3.h)
+(a) FALLBACK: GraphicsPipeline::DrawParamWordReads set at build; CurrentGraphicsPipeline refuses
+it while GpuParamDraw has a built-in draw pending; GpuParamDraw redraws per record via v1 copies
+(groups too). FALLBACK_DYNAMIC covers dynamic-offset reads. (b) LDC64: FoldGpuParamTwoWords in
+constant propagation (vertex stages, both words replaced). (c) MULTI: "per-draw plan" classifier
+(every draw sees its record's words 3/4 at 0x640/0x644) -> one DrawIndexedIndirectCount with
+built-ins, never grouped; macro 44's shape is still unknown: new INFO "macro N kept waiting for
+CPU parameters" / "per-draw plan (R1): rejected (why)" lines to learn it.
+
+## R2 capture (mt/lite7_capture_switches.h)
+C1 DESCDEDUP, C2 UBOLOCK (SeqStageUniform split into Gen/Bytes in vk_mt_seq.h), C3 LOCKSKIP
+(thread-local held-mutex note in tracker_lock.h), C4 OVERLAY. Rejected: whole-capture memo (guest
+memory has no exact unchanged signal), cross-draw descriptor cache (no write invalidation),
+WriteBlockCached (already minimal), BackLoop self (idle spin), merging tracker holds (wider hold).
+Selftests: LOCKSKIP under TSan/ASan; C1+C4 200k random draws identical to the old path.
