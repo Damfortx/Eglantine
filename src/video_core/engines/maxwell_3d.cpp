@@ -1007,6 +1007,10 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
+    // EDEN_NX2_MT_LITE_REGDEDUP_CHECK: a write the dedup would have dropped must take the
+    // same-value return below.
+    const bool dedup_check = VideoCommon::MT::RegDedup::Check() &&
+                             regdedup_front.Drops(method, argument);
     // As ProcessShadowRam does on the back.
     u32 value = argument;
     bool shadow_kept = true;
@@ -1031,7 +1035,13 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             if (Profile::Enabled()) [[unlikely]] {
                 Profile::Add(Profile::Counter::SameValueWrites, 1);
             }
+            if (dedup_check) [[unlikely]] {
+                VideoCommon::MT::RegDedup::Checked(false, method, argument);
+            }
             return;
+        }
+        if (dedup_check) [[unlikely]] {
+            VideoCommon::MT::RegDedup::Checked(true, method, argument);
         }
         fs.regs[method] = value;
         // Instance loop methods keep their own entries: the back issues a deferred instanced
@@ -1113,6 +1123,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                                 u32 argument, bool is_last_call) {
     auto& fs = Front(system, split);
+    if (regdedup_front.latch == nullptr) [[unlikely]] {
+        RegDedupArm(); // EDEN_NX2_MT_LITE_REGDEDUP: DmaPusher filters before this call.
+    }
     if (method >= MacroRegistersStart) {
         if (fs.executing_macro == 0) {
             fs.executing_macro = method;
@@ -1129,9 +1142,24 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
 void Maxwell3D::FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* words, u32 count, bool ends_method) {
     auto& fs = Front(system, split);
+    namespace RD = VideoCommon::MT::RegDedup;
+    if (regdedup_front.latch == nullptr) [[unlikely]] {
+        RegDedupArm();
+    }
+    // EDEN_NX2_MT_LITE_REGDEDUP: same-value writes to latch-only registers go first, before any
+    // bookkeeping (FrontWrite would skip them with no effect).
+    const bool dedup = regdedup_front.Armed() && RD::Active();
+    u32 dropped = 0;
     if (!VideoCommon::MT::LiteFrontBatch()) {
         for (u32 i = 0; i < count; ++i) {
+            if (dedup && regdedup_front.Drops(method + i, words[i])) {
+                ++dropped;
+                continue;
+            }
             FrontWrite(split, fs, method + i, words[i], ends_method && i + 1 == count, false);
+        }
+        if (dropped != 0) {
+            RD::Dropped(RD::Site::Dma, dropped, true);
         }
         return;
     }
@@ -1140,14 +1168,21 @@ void Maxwell3D::FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split
     // fs.control, so the mode is read again for every word.
     namespace Profile = VideoCommon::Nx2Profile;
     const bool general = !fs.skip_same || FrontVerifyEnabled(); // Fixed for the FrontState.
+    const bool check = RD::Check() && regdedup_front.Armed();
     for (u32 i = 0; i < count; ++i) {
         const u32 m = method + i;
         const u32 arg = words[i];
+        if (dedup && regdedup_front.Drops(m, arg)) {
+            ++dropped;
+            continue;
+        }
         if (general || execution_mask[m] || !split.StateBlocks() ||
             fs.control == Regs::ShadowRamControl::Replay || DrawManager::IsInstanceLoopMethod(m)) {
             FrontWrite(split, fs, m, arg, ends_method && i + 1 == count, false);
             continue;
         }
+        // EDEN_NX2_MT_LITE_REGDEDUP_CHECK: predicted before the shadow word changes.
+        const bool predicted = check && regdedup_front.Drops(m, arg);
         const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
                              fs.control == Regs::ShadowRamControl::TrackWithFilter;
         bool kept = true;
@@ -1162,10 +1197,19 @@ void Maxwell3D::FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split
             if (Profile::Enabled()) [[unlikely]] {
                 Profile::Add(Profile::Counter::SameValueWrites, 1);
             }
+            if (predicted) [[unlikely]] {
+                RD::Checked(false, m, arg);
+            }
             continue;
+        }
+        if (predicted) [[unlikely]] {
+            RD::Checked(true, m, arg);
         }
         fs.regs[m] = arg;
         split.StateWrite(this, m, arg, tracked);
+    }
+    if (dropped != 0) {
+        RD::Dropped(RD::Site::Dma, dropped, true);
     }
 }
 
@@ -1182,6 +1226,33 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             FrontRunMacro(system, split, fs);
         }
         return;
+    }
+    // EDEN_NX2_MT_LITE_REGDEDUP: the leading words of a non-incrementing run to a latch-only
+    // register that keep its value change nothing (the back's CallMethod skips each). The back's
+    // CallMultiMethod also issues a pending deferred draw first: the whole run goes only when no
+    // draw manager method was sent since the back last ran DrawDeferred (else one word stays).
+    if (regdedup_front.latch == nullptr) [[unlikely]] {
+        RegDedupArm();
+    }
+    if (amount != 0 && regdedup_front.Armed() && VideoCommon::MT::RegDedup::Active() &&
+        regdedup_front.Drops(method, base_start[0])) {
+        u32 leading = 1;
+        while (leading < amount && regdedup_front.Drops(method, base_start[leading])) {
+            ++leading;
+        }
+        if (leading == amount && *regdedup_front.draw_pending) {
+            --leading;
+        }
+        if (leading != 0) {
+            VideoCommon::MT::RegDedup::Dropped(VideoCommon::MT::RegDedup::Site::Multi, leading,
+                                               false);
+            if (leading == amount) {
+                return;
+            }
+            base_start += leading;
+            amount -= leading;
+            methods_pending -= leading;
+        }
     }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
@@ -1279,6 +1350,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         // emit callback (no profile counters or verify records to keep then).
         const bool fast_same = VideoCommon::MT::LiteFrontCalls() && fs.skip_same &&
                                !VideoCommon::Nx2Profile::Enabled() && !FrontVerifyEnabled();
+        // EDEN_NX2_MT_LITE_REGDEDUP: same-value writes to latch-only registers return first
+        // (counted for the profile as FrontWrite would).
+        if (regdedup_front.latch == nullptr) [[unlikely]] {
+            RegDedupArm();
+        }
+        const bool dedup = regdedup_front.Armed() && VideoCommon::MT::RegDedup::Active();
+        u32 dedup_dropped = 0;
         const auto result = engine.native_jit->Execute(
             start, fs.parameters, std::span<u32>{native_data_ram},
             [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
@@ -1286,9 +1364,15 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 if (address >= MacroRegistersStart) {
                     return false;
                 }
+                if (dedup && regdedup_front.Drops(address, value)) {
+                    ++dedup_dropped;
+                    return true;
+                }
                 // FrontWrite's same-value return, by shadow RAM mode (Replay writes the shadow
-                // word). Executable methods (the DMA reads below among them) never skip.
-                if (fast_same && !execution_mask[address]) {
+                // word). Executable methods never skip, nor the MME DMA reads below (0x157 and
+                // 0x158 are not in execution_mask: a read repeating the last count must run).
+                if (fast_same && !execution_mask[address] && address != 0x157 &&
+                    address != 0x158) {
                     bool same;
                     if (fs.control == Regs::ShadowRamControl::Track ||
                         fs.control == Regs::ShadowRamControl::TrackWithFilter) {
@@ -1309,6 +1393,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 }
                 return true;
             });
+        if (dedup_dropped != 0) {
+            VideoCommon::MT::RegDedup::Dropped(VideoCommon::MT::RegDedup::Site::Macro,
+                                               dedup_dropped, true);
+        }
         if (!result.success) {
             engine.native_execution_failed = true;
             LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}",

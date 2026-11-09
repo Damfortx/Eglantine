@@ -28,6 +28,7 @@
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
 #include "video_core/mt/reg_delta.h"
+#include "video_core/mt/regdedup.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3269,6 +3270,42 @@ public:
     void FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                        const u32* words, u32 count, bool ends_method);
 
+    /// EDEN_NX2_MT_LITE_REGDEDUP (video_core/mt/regdedup.h): whether a write the split's front
+    /// would take (FrontCallMethod/FrontWriteRun) is a same-value write to a latch-only register
+    /// that FrontWrite would skip with no effect (false until the front exists).
+    [[nodiscard]] bool RegDedupFront(u32 method, u32 value) const noexcept {
+        return regdedup_front.Drops(method, value);
+    }
+    /// Without the split: whether a state write DmaPusher would put in the method sink changes
+    /// nothing (register, shadow RAM word, no sunk write to it pending; as ConsumeSinkImpl).
+    [[nodiscard]] bool RegDedupSink(u32 method, u32 value) {
+        if (regdedup_latch == nullptr) [[unlikely]] {
+            RegDedupArm();
+        }
+        if (!regdedup_latch->Test(method) || front_macros || !SkipSameValueWrites() ||
+            regs.reg_array[method] != value) {
+            return false;
+        }
+        const auto control = shadow_state.shadow_ram_control;
+        if (control == Regs::ShadowRamControl::Replay ||
+            (control != Regs::ShadowRamControl::Passthrough &&
+             shadow_state.reg_array[method] != value)) {
+            return false;
+        }
+        if (method_sink.empty()) {
+            regdedup_sink.Clear();
+            return true;
+        }
+        return method_sink.size() == regdedup_sink.known && !regdedup_sink.Pending(method);
+    }
+    /// DmaPusher is about to put a write to `method` in the method sink (RegDedupSink).
+    void RegDedupSunk(u32 method) noexcept {
+        if (method_sink.empty()) {
+            regdedup_sink.Clear();
+        }
+        regdedup_sink.Note(method);
+    }
+
     /// Reads `count` words at a GPU address the way a GPU-written command list is read (waiting
     /// for its writers): EDEN_NX2_GPUPARAM_CHECK.
     using GpuParamReader = std::function<bool(u64 gpu_addr, u32 count, u32* out)>;
@@ -3471,10 +3508,24 @@ private:
     /// GpuParamDraw's constant buffer words (constants written, GPU words copied on the GPU).
     void GpuParamConstantWords(std::span<const VideoCommon::MT::GpuParam::CbWord> cb_words,
                                const VideoCommon::MT::GpuParam::Call& call);
+    /// GPU params v2 groups: the GpuSplit front hold's function (context: GpuParamState).
+    /// Sends the pending group as one indirect multi-draw, or lets a joining call's own
+    /// zero-word constant buffer writes pass (they leave the back as they found it).
+    static void GpuParamHoldRelease(void* context, u32 why);
+    /// The pending group's draw (front: one Defer of GpuParamDraw).
+    void GpuParamEmitGroup(u32 why);
+    /// v2 on the back: the vertex stage bank holding const_buffer address (-1: none).
+    int GpuParamVertexBank() const;
     struct GpuParamState;
     std::unique_ptr<GpuParamState> gpuparam;
     std::unique_ptr<FrontState> front;
     bool front_macros{};
+    // EDEN_NX2_MT_LITE_REGDEDUP (video_core/mt/regdedup.h): the latch-only table, the front's
+    // registers once it exists, the method sink as DmaPusher filled it; RegDedupArm sets them.
+    void RegDedupArm();
+    const VideoCommon::MT::RegDedup::LatchTable* regdedup_latch{};
+    VideoCommon::MT::RegDedup::FrontView<Regs::ShadowRamControl> regdedup_front{};
+    VideoCommon::MT::RegDedup::SinkTrack regdedup_sink{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
     // mode before, path), printed when the sides disagree.
     struct ControlWrite {

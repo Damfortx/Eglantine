@@ -403,6 +403,29 @@ static size_t FrontBatchMinimum() {
 // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
 static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
 
+// EDEN_NX2_MT_LITE_REGDEDUP without the split: true drops a state write DmaPusher would put
+// in the 3D engine's method sink (same value as the register and its shadow word, no sunk write
+// to it pending); false: the caller sinks it (noted for the next writes). CHECK mode sinks
+// every write and verifies the prediction against the pending sunk writes.
+static bool SinkDedup(Engines::Maxwell3D* maxwell3d, u32 method, u32 argument) {
+    namespace RD = VideoCommon::MT::RegDedup;
+    if (maxwell3d->RegDedupSink(method, argument)) {
+        if (RD::Active()) {
+            RD::Dropped(RD::Site::Sink, 1, false);
+            return true;
+        }
+        if (RD::Check()) [[unlikely]] {
+            bool emitted = false;
+            for (const auto& [sunk_method, sunk_value] : maxwell3d->method_sink) {
+                emitted |= sunk_method == method && sunk_value != argument;
+            }
+            RD::Checked(emitted, method, argument);
+        }
+    }
+    maxwell3d->RegDedupSunk(method);
+    return false;
+}
+
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
@@ -465,8 +488,21 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                     }
                     if (batch_count > 1) {
                         subchannel->method_sink.reserve(subchannel->method_sink.size() + batch_count);
-                        for (u32 i = 0; i < batch_count; ++i) {
-                            subchannel->method_sink.emplace_back(dma_state.method + i, commands[index + i].argument);
+                        // EDEN_NX2_MT_LITE_REGDEDUP (=1 without the split): as in CallMethod.
+                        if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+                            VideoCommon::MT::RegDedup::Armable()) {
+                            auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
+                            for (u32 i = 0; i < batch_count; ++i) {
+                                const u32 method = dma_state.method + i;
+                                const u32 argument = commands[index + i].argument;
+                                if (!SinkDedup(maxwell3d, method, argument)) {
+                                    subchannel->method_sink.emplace_back(method, argument);
+                                }
+                            }
+                        } else {
+                            for (u32 i = 0; i < batch_count; ++i) {
+                                subchannel->method_sink.emplace_back(dma_state.method + i, commands[index + i].argument);
+                            }
                         }
                         dma_state.method += batch_count;
                         dma_state.method_count -= batch_count;
@@ -615,6 +651,14 @@ void DmaPusher::CallMethod(u32 argument) {
             split.Active() && split.FrontMacros()) {
             auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
             if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                // EDEN_NX2_MT_LITE_REGDEDUP: a same-value write to a latch-only register stops
+                // here (FrontWrite would skip it with no effect).
+                if (VideoCommon::MT::RegDedup::Active() &&
+                    maxwell3d->RegDedupFront(dma_state.method, argument)) {
+                    VideoCommon::MT::RegDedup::Dropped(VideoCommon::MT::RegDedup::Site::Dma, 1,
+                                                       true);
+                    return;
+                }
                 VideoCommon::Nx2Profile::Scope front_scope{VideoCommon::Nx2Profile::Zone::FrontMethod};
                 maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
                                            dma_state.is_last_call);
@@ -638,6 +682,13 @@ void DmaPusher::CallMethod(u32 argument) {
                 if (type == Engines::EngineTypes::Maxwell3D) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                        // EDEN_NX2_MT_LITE_REGDEDUP: as above.
+                        if (VideoCommon::MT::RegDedup::Active() &&
+                            maxwell3d->RegDedupFront(dma_state.method, argument)) {
+                            VideoCommon::MT::RegDedup::Dropped(
+                                VideoCommon::MT::RegDedup::Site::Dma, 1, true);
+                            return;
+                        }
                         maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
                                                    dma_state.is_last_call);
                         return;
@@ -656,6 +707,16 @@ void DmaPusher::CallMethod(u32 argument) {
             return;
         }
         if (!subchannel->execution_mask[dma_state.method]) {
+            // EDEN_NX2_MT_LITE_REGDEDUP (=1 without the split): a same-value write to a
+            // latch-only register no sunk write precedes stays out of the sink
+            // (ConsumeSinkImpl would skip it with no effect).
+            if (subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+                VideoCommon::MT::RegDedup::Armable()) {
+                if (SinkDedup(static_cast<Engines::Maxwell3D*>(subchannel), dma_state.method,
+                              argument)) {
+                    return;
+                }
+            }
             subchannel->method_sink.emplace_back(dma_state.method, argument);
         } else {
             VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
