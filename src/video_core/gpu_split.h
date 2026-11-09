@@ -18,9 +18,11 @@
 
 #include "common/common_types.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/mt/lite_switches.h"
 #include "video_core/mt/lite3_front_switches.h"
 #include "video_core/mt/lite4_switches.h"
+#include "video_core/mt/lite5_list_switches.h"
 #include "video_core/mt/seq_diet.h"
 
 namespace Core {
@@ -631,13 +633,73 @@ public:
         ++predicted_acquires;
     }
 
-    /// Compute or copy work was just sent: what can write GPU-written command lists.
-    void NoteWriter() {
+    /// Compute or copy work was just sent: what can write GPU-written command lists. `kind`: the
+    /// engine type (Tegra::Engines::EngineTypes) for EDEN_NX2_LIST_STATS.
+    void NoteWriter(u8 kind = 6) {
         last_writer_position = write_position;
+        last_writer_kind = kind;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters(DrainReason reason = DrainReason::WritersCommands);
+
+    /// EDEN_NX2_LIST_STATS: the ring position WaitForWriters waits for, and the engine type of
+    /// the last writer noted (6: none yet).
+    [[nodiscard]] u64 WritersTarget() {
+        FlushState();
+        return std::min(last_writer_position, write_position);
+    }
+    [[nodiscard]] u8 LastWriterKind() const {
+        return last_writer_kind;
+    }
+
+    struct ListWait {
+        bool waited;    ///< It found the back behind
+        bool shortened; ///< The committer was not waited for up to every writer
+    };
+    /// EDEN_NX2_MT_LITE_LISTPOS (L24): WaitForWriters before a command list on GPU-written pages,
+    /// with the multithreaded back: the sequencer past every writer sent (it marks the pages they
+    /// write at capture, and records the command list pages in Tegra::g_nx2_list_writer_slots),
+    /// then the committer only past `page_bound()` (1 + the last position a capture wrote one of
+    /// the list's pages at, read once `consumed` passed the writers) and its queued guest memory
+    /// writes: the copies and write counts Nx2ReadListCopy reads are made when the committer
+    /// records those writers, and a page no captured writer wrote holds what guest memory holds.
+    template <typename Bound>
+    ListWait WaitForListWriters(const Bound& page_bound) {
+        if (!MtActive()) {
+            return ListWait{WaitForWriters(), false};
+        }
+        FlushState();
+        const u64 target = std::min(last_writer_position, write_position);
+        const auto bound = [&] {
+            return std::min(target,
+                            std::max<u64>(page_bound(),
+                                          committer_write_position.load(std::memory_order_acquire)));
+        };
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        if (consumed_cache >= target) {
+            const u64 settle = bound();
+            const u64 now = settled.load(std::memory_order_acquire);
+            if (now >= settle) {
+                CountWait(DrainReason::WritersCommands, false, 0);
+                return ListWait{false, now < target};
+            }
+        }
+        Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+        const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
+        if (consumed_cache < target) {
+            wait_target.store(target, std::memory_order_seq_cst);
+            Publish();
+            WaitConsumed(target);
+            wait_target.store(~u64{0}, std::memory_order_relaxed);
+        }
+        const u64 settle = bound();
+        TimedWaitSettled(settle);
+        const bool shortened = settled.load(std::memory_order_acquire) < target;
+        CountWait(DrainReason::WritersCommands, true,
+                  Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
+        return ListWait{true, shortened};
+    }
 
 private:
     /// EDEN_NX2_GPU_PROFILE: counts a front wait (`waited`: it found the back behind) and logs
@@ -716,6 +778,7 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    u8 last_writer_kind{6};
     std::array<u64, 2048> list{};
     size_t list_count{};
     Tegra::Engines::EngineInterface* list_engine{};

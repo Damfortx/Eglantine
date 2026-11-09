@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -605,9 +606,10 @@ void DmaPusher::CallMethod(u32 argument) {
         const bool writer = split.Active() &&
                             WritesMemory(subchannel, subchannel_type[dma_state.subchannel],
                                          dma_state.method, 1);
+        const auto writer_kind = static_cast<u8>(subchannel_type[dma_state.subchannel]);
         SCOPE_EXIT {
             if (writer) {
-                split.NoteWriter();
+                split.NoteWriter(writer_kind);
             }
         };
         if (split.Active()) {
@@ -677,9 +679,10 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         const bool writer = split.Active() &&
                             WritesMemory(subchannel, subchannel_type[dma_state.subchannel],
                                          dma_state.method, dma_state.non_incrementing ? 1 : num_methods);
+        const auto writer_kind = static_cast<u8>(subchannel_type[dma_state.subchannel]);
         SCOPE_EXIT {
             if (writer) {
-                split.NoteWriter();
+                split.NoteWriter(writer_kind);
             }
         };
         if (split.Active()) {
@@ -815,23 +818,187 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     }
     const GPUVAddr end = address + u64{count} * sizeof(u32);
     bool written = false;
+    bool new_page = false;
+    // Device addresses of the list's pages (EDEN_NX2_MT_LITE_LISTPOS/LISTKNOWN, statistics).
+    std::array<u64, 4> pages{};
+    size_t page_count = 0;
+    bool pages_fit = true;
     for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
-        if (const auto device = memory_manager.GpuToCpuAddress(page);
-            device && Tegra::Nx2IsGpuWritten(*device)) {
-            Tegra::Nx2MarkCommandListPage(*device);
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        if (device && Tegra::Nx2IsGpuWritten(*device)) {
+            new_page |= Tegra::Nx2MarkCommandListPage(*device);
             written = true;
+        }
+        if (!device || page_count == pages.size()) {
+            pages_fit = false;
+        } else {
+            pages[page_count++] = *device & ~u64{0xfff};
         }
     }
     if (!written) {
         return false;
     }
-    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.WaitForWriters();
+    const std::span<const u64> list_pages{pages.data(), page_count};
+    const auto page_bound = [list_pages] {
+        u64 bound = 0;
+        for (const u64 page : list_pages) {
+            bound = std::max(bound, Tegra::Nx2ListWriterPosition(page));
+        }
+        return bound;
+    };
+    auto& split = VideoCommon::GpuSplit::Get();
+    const bool mt = split.Active() && split.MtActive();
+    // Statistics (EDEN_NX2_GPU_PROFILE, EDEN_NX2_LIST_STATS=1): positions before the wait.
+    const bool stats = VideoCommon::Nx2Profile::Enabled() || VideoCommon::MT::ListStatsFull();
+    const bool full_stats = VideoCommon::MT::ListStatsFull();
+    u64 consumed_before = 0;
+    u64 settled_before = 0;
+    u64 writers_target = 0;
+    std::array<u8, 4> state_before{};
+    if (stats) {
+        auto& counters = list_stats;
+        ++counters.fetches;
+        counters.new_pages += new_page ? 1 : 0;
+        counters.multi_page += page_count > 1 ? 1 : 0;
+        if (split.Active()) {
+            writers_target = split.WritersTarget();
+            consumed_before = split.ConsumedPosition();
+            settled_before = split.SettledPosition();
+        }
+        if (full_stats) {
+            for (size_t i = 0; i < page_count; ++i) {
+                state_before[i] = rasterizer->PeekGpuWrittenCommandList(pages[i]);
+                ++counters.state_before[std::min<size_t>(state_before[i], 4)];
+            }
+        }
     }
-    using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
+
+    // EDEN_NX2_MT_LITE_LISTKNOWN (L25): every page trusted as a CPU list page, and no writer the
+    // sequencer captured on them still uncommitted: no writer wait.
+    // Same policy as IsKnownCpuCommandList: EDEN_NX2_WRITER_WAIT=1 never skips, =0 (and =a)
+    // always may, the default only for the titles that skip known CPU lists.
+    static const char writer_wait_mode = Tegra::Nx2EnvMode("EDEN_NX2_WRITER_WAIT");
+    const bool skip_policy =
+        writer_wait_mode == '0' || writer_wait_mode == 'a' ||
+        (writer_wait_mode == 'd' &&
+         Tegra::g_nx2_skip_known_writer_waits.load(std::memory_order_relaxed));
+    bool skipped = false;
+    bool shortened = false;
+    bool waited = false;
+    if (split.Active()) {
+        if (mt && VideoCommon::MT::LiteListKnown() && !new_page && pages_fit && skip_policy &&
+            std::ranges::all_of(list_pages,
+                                [this](u64 page) { return list_trust.Trusted(page >> 12); }) &&
+            split.SettledPosition() >= page_bound()) {
+            skipped = true;
+        } else if (mt && VideoCommon::MT::LiteListPos() && !new_page && pages_fit) {
+            // EDEN_NX2_MT_LITE_LISTPOS (L24): the committer only up to these pages' writers.
+            const auto wait = split.WaitForListWriters(page_bound);
+            waited = wait.waited;
+            shortened = wait.shortened;
+        } else {
+            waited = split.WaitForWriters();
+        }
+    }
+
     command_headers.resize_destructive(count);
+    std::array<u8, 4> results{};
+    const std::span<u8> page_results{results.data(), page_count};
     u8* const out = reinterpret_cast<u8*>(command_headers.data());
-    for (GPUVAddr chunk = address; chunk < end;) {
+    bool ok = ReadGpuWrittenChunks(address, count, out, page_results);
+    if (skipped && (!ok || std::ranges::any_of(page_results, [](u8 r) { return r != 0; }))) {
+        // A trusted page was written by the GPU after all (a committed write): never trust it
+        // again, and read the list as before (every writer run).
+        for (size_t i = 0; i < page_count; ++i) {
+            if (list_trust.Written(pages[i] >> 12, results[i] == 1)) {
+                ++list_stats.l25_banned;
+            }
+        }
+        ++list_stats.l25_fallback;
+        skipped = false;
+        waited = split.WaitForWriters();
+        results = {};
+        ok = ReadGpuWrittenChunks(address, count, out, page_results);
+    }
+
+    if (stats) {
+        auto& counters = list_stats;
+        counters.l25_skipped += skipped ? 1 : 0;
+        counters.l24_short += shortened ? 1 : 0;
+        const bool behind = split.Active() && !skipped &&
+                            (consumed_before < writers_target || settled_before < writers_target);
+        if (behind) {
+            ++counters.waited;
+            const u64 bound = page_bound();
+            const size_t reason = new_page                  ? 3
+                                  : bound > consumed_before ? 0
+                                  : bound > settled_before  ? 1
+                                                            : 2;
+            ++counters.reasons[reason];
+            ++counters.writer_kind_waited[std::min<size_t>(split.LastWriterKind(), 6)];
+            if (full_stats) {
+                for (size_t i = 0; i < page_count; ++i) {
+                    ++counters.state_before_waited[std::min<size_t>(state_before[i], 4)];
+                    counters.NoteWaitedPage(pages[i] >> 12);
+                }
+            }
+        }
+        const bool copied = std::ranges::any_of(page_results, [](u8 r) { return r == 1; });
+        ++counters.results[!ok ? 2 : copied ? 1 : 0];
+    }
+
+    // L25 bookkeeping: a read with the writers waited for confirms or bans its pages.
+    if (mt && VideoCommon::MT::LiteListKnown() && !skipped && pages_fit) {
+        for (size_t i = 0; i < page_count; ++i) {
+            const u64 page = pages[i] >> 12;
+            if (ok && results[i] == 0) {
+                if (list_trust.Confirm(page, Tegra::Nx2ListWriterPosition(pages[i]))) {
+                    ++list_stats.l25_promoted;
+                }
+            } else if (results[i] != 0) {
+                if (list_trust.Written(page, results[i] == 1)) {
+                    ++list_stats.l25_banned;
+                }
+            }
+        }
+    }
+
+    // EDEN_NX2_MT_LITE_LISTCHECK: read again after every writer ran and compare.
+    if (ok && VideoCommon::MT::LiteListCheck() && (skipped || shortened)) {
+        split.WaitForWriters();
+        check_headers.resize_destructive(count);
+        std::array<u8, 4> check_results{};
+        if (ReadGpuWrittenChunks(address, count, reinterpret_cast<u8*>(check_headers.data()),
+                                 std::span<u8>{check_results.data(), page_count})) {
+            ++list_stats.check_compared;
+            if (std::memcmp(check_headers.data(), command_headers.data(),
+                            size_t{count} * sizeof(u32)) != 0) {
+                if (list_stats.check_stale++ < 16) {
+                    LOG_WARNING(HW_GPU,
+                                "List check: stale GPU-written list {:#x} ({} words, {})",
+                                address, count, skipped ? "L25 skip" : "L24 short settle");
+                }
+                std::memcpy(command_headers.data(), check_headers.data(),
+                            size_t{count} * sizeof(u32));
+            }
+        } else {
+            ++list_stats.check_unverifiable;
+            ok = false;
+        }
+    }
+    if (stats || VideoCommon::MT::LiteListCheck()) {
+        list_stats.MaybeLog(stats);
+    }
+    (void)waited;
+    return ok;
+}
+
+bool DmaPusher::ReadGpuWrittenChunks(GPUVAddr address, u32 count, u8* out,
+                                     std::span<u8> results) {
+    using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
+    const GPUVAddr end = address + u64{count} * sizeof(u32);
+    size_t index = 0;
+    for (GPUVAddr chunk = address; chunk < end; ++index) {
         const GPUVAddr chunk_end = (std::min)(end, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
         const std::span<u8> part{out + (chunk - address), static_cast<size_t>(chunk_end - chunk)};
         const auto device = memory_manager.GpuToCpuAddress(chunk);
@@ -841,6 +1008,11 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         GpuWrittenList where = GpuWrittenList::Synced;
         if (Tegra::Nx2IsGpuWritten(*device)) {
             where = rasterizer->ReadGpuWrittenCommandList(*device, part);
+        }
+        if (index < results.size()) {
+            results[index] = where == GpuWrittenList::Synced   ? 0
+                             : where == GpuWrittenList::Copied ? 1
+                                                               : 2;
         }
         if (where == GpuWrittenList::Unknown) {
             return false;

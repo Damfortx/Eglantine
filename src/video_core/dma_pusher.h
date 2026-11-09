@@ -21,6 +21,7 @@
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
+#include "video_core/mt/lite5_list_switches.h"
 
 namespace Core {
 class System;
@@ -225,6 +226,14 @@ public:
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
     /// flushes and reads guest memory.
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// Reads the list's words into `out` page by page (copy or guest memory); `results` gets,
+    /// per page of the list (up to its size), 0 synced/not GPU-written, 1 copied, 2 unknown.
+    /// False at the first unknown page.
+    bool ReadGpuWrittenChunks(GPUVAddr address, u32 count, u8* out, std::span<u8> results);
+    /// EDEN_NX2_MT_LITE_LISTKNOWN (L25) and the list statistics (docs/mt-lite-plan5.md).
+    VideoCommon::MT::ListTrust list_trust;
+    VideoCommon::MT::ListStats list_stats;
+    Common::ScratchBuffer<CommandHeader> check_headers;
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 

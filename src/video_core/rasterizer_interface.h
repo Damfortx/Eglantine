@@ -112,6 +112,12 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    /// Switch 2, EDEN_NX2_LIST_STATS: the buffer cache's state of a command list page (0 none,
+    /// 1 synced, 2 copy current, 3 written since, 4 written by draws).
+    virtual u8 PeekGpuWrittenCommandList([[maybe_unused]] DAddr page) {
+        return 0;
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;

@@ -973,6 +973,9 @@ inline void Nx2DrawPipeline::Start() {
              VideoCommon::MT::LiteOverlayFirst(), VideoCommon::MT::LiteForeignAcquire(),
              VideoCommon::MT::LiteAsyncFences(), VideoCommon::MT::LiteQmdLedger(),
              VideoCommon::MT::LiteSeqTarget());
+    LOG_INFO(Render_Vulkan, "MT lite 5: listpos {}, listknown {}, listcheck {}",
+             VideoCommon::MT::LiteListPos(), VideoCommon::MT::LiteListKnown(),
+             VideoCommon::MT::LiteListCheck());
 }
 
 inline void Nx2DrawPipeline::Stop() {

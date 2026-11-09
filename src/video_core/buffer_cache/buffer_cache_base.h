@@ -486,6 +486,27 @@ public:
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
+    /// EDEN_NX2_LIST_STATS (front): the state of the command list page `page`: 0 no entry,
+    /// 1 synced, 2 copy current, 3 written since (no current copy), 4 written by draws.
+    u8 Nx2PeekListPage(DAddr page) {
+        if constexpr (IS_OPENGL) {
+            return 0;
+        } else {
+            std::scoped_lock lock{nx2_list_mutex};
+            const auto it = nx2_list_pages.find(page);
+            if (it == nx2_list_pages.end()) {
+                return 0;
+            }
+            const auto& entry = it->second;
+            if (entry.draw_written) {
+                return 4;
+            }
+            if (entry.synced_writes == entry.writes) {
+                return 1;
+            }
+            return entry.copy && entry.copy_writes == entry.writes ? 2 : 3;
+        }
+    }
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);

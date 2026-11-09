@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <cstddef>
 #include <cstdlib>
@@ -101,6 +102,62 @@ inline std::atomic<bool> g_nx2_preflush_pages_only{true};
 inline constexpr u64 Nx2WrittenPageBits = 12;
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
 
+// GPU-written device pages the front has read command lists from (same layout as above). The
+// buffer cache copies these pages into host memory right after the compute or copy work that
+// writes them and submits, so the front reads the copy once the GPU is done instead of draining
+// the split and flushing the caches (BufferCache::Nx2ReadListCopy).
+inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_command_list_pages{};
+inline std::atomic<bool> g_nx2_has_command_list_pages{false};
+
+/// True when the page was not a command list page before (its first list).
+inline bool Nx2MarkCommandListPage(u64 device_address) {
+    const u64 page = device_address >> Nx2WrittenPageBits;
+    if (page >= g_nx2_command_list_pages.size() * 64) {
+        return false;
+    }
+    auto& word = g_nx2_command_list_pages[page / 64];
+    const u64 bit = u64{1} << (page % 64);
+    if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+        word.fetch_or(bit, std::memory_order_relaxed);
+        g_nx2_has_command_list_pages.store(true, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+// EDEN_NX2_MT_LITE_LISTPOS (docs/mt-lite-plan5.md, L24): the ring position (1 + the entry's) of
+// the last entry whose capture on the split's sequencer marked a command list page GPU-written,
+// by page hashed into slots (lossy the safe way: a slot holds the newest position of any page in
+// it, so a collision only makes a read wait longer). Written by the sequencer only, before it
+// stores `consumed` past the entry: a front that saw `consumed` past its writers reads them.
+inline constexpr u64 Nx2ListWriterSlotBits = 14;
+inline std::array<std::atomic<u64>, u64{1} << Nx2ListWriterSlotBits> g_nx2_list_writer_slots{};
+/// Sequencer thread: 1 + the ring position of the entry it runs (0: not recording positions).
+inline thread_local u64 t_nx2_list_writer_position = 0;
+/// Sequencer thread: the entry it runs marked a command list page (it then stores a mark).
+inline thread_local bool t_nx2_list_page_written = false;
+[[nodiscard]] inline u64 Nx2ListWriterSlot(u64 page_index) {
+    return (page_index * 0x9E3779B97F4A7C15ULL) >> (64 - Nx2ListWriterSlotBits);
+}
+/// 1 + the last ring position a sequencer capture wrote the device page of `device_address` at
+/// (or a later one of a colliding page; 0: none recorded).
+[[nodiscard]] inline u64 Nx2ListWriterPosition(u64 device_address) {
+    return g_nx2_list_writer_slots[Nx2ListWriterSlot(device_address >> Nx2WrittenPageBits)].load(
+        std::memory_order_relaxed);
+}
+/// Sequencer, from Nx2MarkGpuWritten: the pages of `mask` in bitmap word `mask_word_index`
+/// were written; records the command list pages among them.
+inline void Nx2NoteListPagesWritten(u64 mask_word_index, u64 mask) {
+    u64 lists = g_nx2_command_list_pages[mask_word_index].load(std::memory_order_relaxed) & mask;
+    while (lists != 0) {
+        const u64 bit = static_cast<u64>(std::countr_zero(lists));
+        lists &= lists - 1;
+        g_nx2_list_writer_slots[Nx2ListWriterSlot(mask_word_index * 64 + bit)].store(
+            t_nx2_list_writer_position, std::memory_order_relaxed);
+        t_nx2_list_page_written = true;
+    }
+}
+
 inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
         return;
@@ -115,27 +172,11 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
         if ((word.load(std::memory_order_relaxed) & mask) != mask) {
             word.fetch_or(mask, std::memory_order_relaxed);
         }
+        if (t_nx2_list_writer_position != 0 &&
+            g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
+            Nx2NoteListPagesWritten(page / 64, mask);
+        }
         page += bits;
-    }
-}
-
-// GPU-written device pages the front has read command lists from (same layout as above). The
-// buffer cache copies these pages into host memory right after the compute or copy work that
-// writes them and submits, so the front reads the copy once the GPU is done instead of draining
-// the split and flushing the caches (BufferCache::Nx2ReadListCopy).
-inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_command_list_pages{};
-inline std::atomic<bool> g_nx2_has_command_list_pages{false};
-
-inline void Nx2MarkCommandListPage(u64 device_address) {
-    const u64 page = device_address >> Nx2WrittenPageBits;
-    if (page >= g_nx2_command_list_pages.size() * 64) {
-        return;
-    }
-    auto& word = g_nx2_command_list_pages[page / 64];
-    const u64 bit = u64{1} << (page % 64);
-    if ((word.load(std::memory_order_relaxed) & bit) == 0) {
-        word.fetch_or(bit, std::memory_order_relaxed);
-        g_nx2_has_command_list_pages.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -154,6 +195,9 @@ inline void Nx2ClearGpuWrittenPages() {
     }
     for (auto& word : g_nx2_command_list_pages) {
         word.store(0, std::memory_order_relaxed);
+    }
+    for (auto& slot : g_nx2_list_writer_slots) {
+        slot.store(0, std::memory_order_relaxed);
     }
     g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);
 }

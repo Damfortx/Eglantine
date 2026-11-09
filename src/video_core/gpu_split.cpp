@@ -918,6 +918,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #endif
     u64 read_position = 0;
     const bool seq_target = mt && VideoCommon::MT::LiteSeqTarget();
+    // EDEN_NX2_MT_LITE_LISTPOS (L24): captures record the command list pages they write with
+    // the entry's position (Tegra::Nx2MarkGpuWritten), and such an entry stores a mark so the
+    // committer can settle right after it.
+    const bool list_pos = mt && VideoCommon::MT::LiteListPos();
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
@@ -989,8 +993,15 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             back_exec_position = read_position;
+            if (list_pos) {
+                Tegra::t_nx2_list_writer_position = read_position + 1;
+            }
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
+            if (Tegra::t_nx2_list_page_written) [[unlikely]] {
+                Tegra::t_nx2_list_page_written = false;
+                exec_wrote_committer = true;
+            }
             if (exec_wrote_committer) [[unlikely]] {
                 exec_wrote_committer = false;
                 // EDEN_NX2_MT_LITE_WMARK: settled can reach the write without the rest.
