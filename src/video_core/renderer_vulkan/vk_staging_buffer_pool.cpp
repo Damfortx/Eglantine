@@ -17,6 +17,7 @@
 #include "common/literals.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/mt/lite8_vram.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -131,9 +132,11 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     ASSERT(it->deferred);
     it->tick = scheduler.CurrentTick();
     it->deferred = false;
+    it->last_frame = frame;
 }
 
 void StagingBufferPool::TickFrame() {
+    ++frame;
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
@@ -213,6 +216,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     it->tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick();
     ASSERT(!it->deferred);
     it->deferred = deferred;
+    it->last_frame = frame;
     return it->Ref();
 }
 
@@ -255,6 +259,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .index = unique_ids++,
         .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
         .deferred = deferred,
+        .last_frame = frame,
     });
     return entry.Ref();
 }
@@ -283,7 +288,16 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
 
-    const auto is_deletable = [this](const StagingBuffer& entry) {
+    // Batch 8 U4 (EDEN_NX2_VRAM_STAGING_KEEP): a buffer requested in the last 600 frames stays
+    // for the next request of its size; freeing the steady-state set every sweep (64 frames)
+    // only made the driver allocate it again. Buffers over 64 MiB (one huge upload) still go.
+    const char keep_mode = Lite8Vram::StagingKeepMode();
+    const bool keep = keep_mode != '0' && log2 <= 26 &&
+                      (&cache != &device_local_cache || keep_mode == '2');
+    const auto is_deletable = [this, keep](const StagingBuffer& entry) {
+        if (keep && frame - entry.last_frame < Lite8Vram::StagingKeepFrames) {
+            return false;
+        }
         return scheduler.IsFree(entry.tick);
     };
     const size_t begin_offset = staging.delete_index;

@@ -61,6 +61,7 @@ private:
         u64 index;
         u64 tick = 0;
         bool deferred{};
+        u64 last_frame = 0; ///< Batch 8 U4: frame of the last request (EDEN_NX2_VRAM_STAGING_KEEP)
 
         StagingBufferRef Ref() const noexcept {
             return {
@@ -124,6 +125,7 @@ private:
     StagingBuffersCache download_cache;
 
     size_t current_delete_level = 0;
+    u64 frame = 0; ///< TickFrame calls (Batch 8 U4)
     u64 buffer_index = 0;
     u64 unique_ids{};
 };

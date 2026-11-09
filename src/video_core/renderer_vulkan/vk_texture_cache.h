@@ -17,6 +17,7 @@
 #include <span>
 
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/mt/lite8_vram.h"
 
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
@@ -90,10 +91,19 @@ public:
 
     bool CanReportMemoryUsage() const;
 
-    /// Images that did not fit the device memory budget so far (see MemoryAllocator).
+    /// Images that did not fit the device memory budget so far (see MemoryAllocator), plus
+    /// (Batch 8 U4, EDEN_NX2_VRAM_SLOWPRESSURE) driver allocations that took >= 20 ms.
     u32 MemoryPressureEvents() const noexcept {
-        return memory_allocator.MemoryPressureEvents();
+        u32 events = memory_allocator.MemoryPressureEvents();
+        if (Lite8Vram::SlowPressureEnabled()) {
+            events += static_cast<u32>(Lite8Vram::SlowAllocations());
+        }
+        return events;
     }
+
+    /// Batch 8 U4: once a frame from TextureCache::TickFrame (EDEN_NX2_VRAM_STATS line,
+    /// EDEN_NX2_VRAM_DECODE_TRIM).
+    void TickVram(u64 cache_used, u64 expected, u64 critical);
 
     void LogMemoryStatistics() const;
 
@@ -305,8 +315,11 @@ public:
         vk::Image image;
         std::vector<vk::ImageView> views;
         bool initialized{};
+        u64 tick{};       ///< Batch 8 U4: GPU tick of the last use (EDEN_NX2_VRAM_DECODE_TRIM)
+        u64 last_frame{}; ///< vram_frame of the last use
     };
     std::unordered_map<u64, PersistentDecode> persistent_decodes;
+    u64 vram_frame{}; ///< Batch 8 U4: TickVram calls
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;

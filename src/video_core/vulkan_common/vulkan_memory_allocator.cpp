@@ -7,11 +7,15 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -20,6 +24,7 @@
 #include "common/logging.h"
 #include <ranges>
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/mt/lite8_vram.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -233,7 +238,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > (u64{1} << 28);
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+                           : CreateImageAllocation(ci, alloc_ci, handle, allocation, alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -248,7 +253,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         pressure_events.fetch_add(1, std::memory_order_relaxed);
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        result = CreateImageAllocation(ci, relaxed, handle, allocation, alloc_info);
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Still out of device memory: a real image in host memory (slow, but valid) beats one
@@ -302,6 +307,58 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
 
     return vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                         device.GetDispatchLoader());
+}
+
+VkResult MemoryAllocator::CreateImageAllocation(const VkImageCreateInfo& ci,
+                                                const VmaAllocationCreateInfo& alloc_ci,
+                                                VkImage& handle, VmaAllocation& allocation,
+                                                VmaAllocationInfo& alloc_info) const {
+    // Batch 8 U4 (EDEN_NX2_VRAM_NODEDICATED): vmaCreateImage gives the image its own device
+    // memory whenever the driver prefers that (VK_KHR_dedicated_allocation), however small:
+    // one driver allocation per image, slow with the heap at its budget. Small images are
+    // suballocated from the shared blocks instead, from plain memory requirements (no
+    // dedicated hint; the driver never requires one for these non-external images).
+    if ((alloc_ci.flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT) == 0 &&
+        alloc_ci.pool == VK_NULL_HANDLE &&
+        Tegra::Nx2Switch(Lite8Vram::NoDedicatedMode(), false)) {
+        const auto& dld = device.GetDispatchLoader();
+        const VkDevice logical = *device.GetLogical();
+        VkImage image{};
+        VkResult result = dld.vkCreateImage(logical, &ci, nullptr, &image);
+        if (result != VK_SUCCESS) {
+            return result;
+        }
+        VkMemoryRequirements requirements{};
+        dld.vkGetImageMemoryRequirements(logical, image, &requirements);
+        if (requirements.size <= Lite8Vram::NoDedicatedLimit()) {
+            VmaAllocationCreateInfo block_ci = alloc_ci;
+            // AUTO usages need the resource's create info, which vmaAllocateMemory lacks.
+            block_ci.usage = VMA_MEMORY_USAGE_UNKNOWN;
+            block_ci.memoryTypeBits = requirements.memoryTypeBits;
+            if (alloc_ci.usage == VMA_MEMORY_USAGE_AUTO_PREFER_HOST) {
+                block_ci.preferredFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            } else {
+                block_ci.preferredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            }
+            VmaAllocation block_allocation{};
+            result = vmaAllocateMemory(allocator, &requirements, &block_ci, &block_allocation,
+                                       &alloc_info);
+            if (result == VK_SUCCESS) {
+                result = vmaBindImageMemory(allocator, block_allocation, image);
+                if (result == VK_SUCCESS) {
+                    handle = image;
+                    allocation = block_allocation;
+                    Lite8Vram::g_counters.nodedicated_images.fetch_add(1, std::memory_order_relaxed);
+                    return VK_SUCCESS;
+                }
+                vmaFreeMemory(allocator, block_allocation);
+            }
+            dld.vkDestroyImage(logical, image, nullptr);
+            return result;
+        }
+        dld.vkDestroyImage(logical, image, nullptr);
+    }
+    return vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
 }
 
 vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased) const {
@@ -595,6 +652,91 @@ void LogMemoryStatistics(const Device& device) {
                  heap, budgets[heap].usage >> 20, budgets[heap].budget >> 20,
                  budgets[heap].statistics.blockBytes >> 20);
     }
+}
+
+void TickVramStats(const Device& device, const VramCacheFigures& cache) {
+    if (!Lite8Vram::StatsEnabled()) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point last = Clock::now();
+    static u64 frames{};
+    struct Snapshot {
+        u64 allocs, alloc_bytes, dedicated, dedicated_bytes, failed, alloc_ns, slow, frees,
+            free_ns, nodedicated;
+    };
+    static Snapshot previous{};
+    ++frames;
+    const Clock::time_point now = Clock::now();
+    if (now - last < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - last).count();
+    last = now;
+    auto& c = Lite8Vram::g_counters;
+    const Snapshot current{
+        .allocs = c.allocs.load(std::memory_order_relaxed),
+        .alloc_bytes = c.alloc_bytes.load(std::memory_order_relaxed),
+        .dedicated = c.dedicated.load(std::memory_order_relaxed),
+        .dedicated_bytes = c.dedicated_bytes.load(std::memory_order_relaxed),
+        .failed = c.failed.load(std::memory_order_relaxed),
+        .alloc_ns = c.alloc_ns.load(std::memory_order_relaxed),
+        .slow = c.slow.load(std::memory_order_relaxed),
+        .frees = c.frees.load(std::memory_order_relaxed),
+        .free_ns = c.free_ns.load(std::memory_order_relaxed),
+        .nodedicated = c.nodedicated_images.load(std::memory_order_relaxed),
+    };
+    const u64 max_alloc_ns = c.max_alloc_ns.exchange(0, std::memory_order_relaxed);
+    const VmaAllocator allocator = device.GetAllocator();
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> vma_budgets{};
+    if (allocator != nullptr) {
+        vmaGetHeapBudgets(allocator, vma_budgets.data());
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    const bool has_budget = device.CanReportMemoryUsage();
+    const auto properties =
+        device.GetPhysical().GetMemoryProperties(has_budget ? &budget : nullptr).memoryProperties;
+    std::string heaps;
+    for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
+        if ((properties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+            continue;
+        }
+        const VmaStatistics& stats = vma_budgets[heap].statistics;
+        const u64 slack = stats.blockBytes - (std::min)(stats.blockBytes, stats.allocationBytes);
+        // usage: the driver's figure for this process; budget: what the driver lets it use
+        // (other programs' VRAM already taken out); size: the heap.
+        heaps += fmt::format("{}heap {}: usage {} / budget {} / size {} MiB, VMA {} blocks {} MiB "
+                             "({} allocations {} MiB, slack {} MiB)",
+                             heaps.empty() ? "" : "; ", heap,
+                             has_budget ? budget.heapUsage[heap] >> 20 : 0,
+                             has_budget ? budget.heapBudget[heap] >> 20 : 0,
+                             properties.memoryHeaps[heap].size >> 20, stats.blockCount,
+                             stats.blockBytes >> 20, stats.allocationCount,
+                             stats.allocationBytes >> 20, slack >> 20);
+    }
+    const u64 allocs = current.allocs - previous.allocs;
+    LOG_INFO(Render_Vulkan, "VRAM in 10 s ({:.1f} s, {} frames): {}", seconds, frames, heaps);
+    LOG_INFO(Render_Vulkan,
+             "VRAM in 10 s: vkAllocateMemory {} ({} MiB; dedicated {} / {} MiB; failed {}; "
+             ">=20 ms {}) total {:.1f} ms max {:.2f} ms avg {:.3f} ms; vkFreeMemory {} total {:.1f} "
+             "ms; nodedicated images {}; texture cache used {} MiB, expected {} MiB, critical {} "
+             "MiB, pressure events {}",
+             allocs, (current.alloc_bytes - previous.alloc_bytes) >> 20,
+             current.dedicated - previous.dedicated,
+             (current.dedicated_bytes - previous.dedicated_bytes) >> 20,
+             current.failed - previous.failed, current.slow - previous.slow,
+             static_cast<double>(current.alloc_ns - previous.alloc_ns) / 1e6,
+             static_cast<double>(max_alloc_ns) / 1e6,
+             allocs != 0 ? static_cast<double>(current.alloc_ns - previous.alloc_ns) / 1e6 /
+                               static_cast<double>(allocs)
+                         : 0.0,
+             current.frees - previous.frees,
+             static_cast<double>(current.free_ns - previous.free_ns) / 1e6,
+             current.nodedicated - previous.nodedicated, cache.used >> 20, cache.expected >> 20,
+             cache.critical >> 20, cache.pressure_events);
+    previous = current;
+    frames = 0;
 }
 
 } // namespace Vulkan

@@ -412,6 +412,10 @@ void TextureCache<P>::TickFrame() {
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
     }
+    // Batch 8 U4: VRAM stats line (EDEN_NX2_VRAM_STATS) and decode image trim.
+    if constexpr (requires { runtime.TickVram(u64{}, u64{}, u64{}); }) {
+        runtime.TickVram(total_used_memory, expected_memory, critical_memory);
+    }
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
     static const bool log_tc = std::getenv("EDEN_NX2_TC_LOG") != nullptr;

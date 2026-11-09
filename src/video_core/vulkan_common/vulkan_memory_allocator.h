@@ -152,6 +152,12 @@ namespace Vulkan {
         MemoryCommit Commit(const vk::Buffer &buffer, MemoryUsage usage);
 
     private:
+        /// vmaCreateImage, or (EDEN_NX2_VRAM_NODEDICATED) a small image in the shared blocks.
+        VkResult CreateImageAllocation(const VkImageCreateInfo& ci,
+                                       const VmaAllocationCreateInfo& alloc_ci, VkImage& handle,
+                                       VmaAllocation& allocation,
+                                       VmaAllocationInfo& alloc_info) const;
+
         static bool IsAutoUsage(VmaMemoryUsage u) noexcept {
             switch (u) {
                 case VMA_MEMORY_USAGE_AUTO:
@@ -176,5 +182,17 @@ namespace Vulkan {
 
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.
     void LogMemoryStatistics(const Device& device);
+
+    /// Batch 8 U4: the texture cache's view of device memory for the VRAM stats line.
+    struct VramCacheFigures {
+        u64 used;      ///< Texture cache total_used_memory
+        u64 expected;  ///< Collector thresholds
+        u64 critical;
+        u32 pressure_events; ///< MemoryAllocator::MemoryPressureEvents
+    };
+    /// EDEN_NX2_VRAM_STATS=1: every 10 s, "VRAM in 10 s: ..." (per device-local heap driver usage
+    /// and budget, VMA blocks / slack, driver allocations, texture cache thresholds). Call once
+    /// a frame from one thread; does nothing in between or with the switch off.
+    void TickVramStats(const Device& device, const VramCacheFigures& cache);
 
 } // namespace Vulkan

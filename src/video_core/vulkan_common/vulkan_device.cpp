@@ -27,6 +27,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/mt/lite8_vram.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -776,6 +777,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
+    // Batch 8 U4 (EDEN_NX2_VRAM_TIMING): VMA's driver allocations counted and timed.
+    if (Lite8Vram::InstallCounting(*logical, dld.vkAllocateMemory, dld.vkFreeMemory)) {
+        functions.vkAllocateMemory = &Lite8Vram::CountingAllocateMemory;
+        functions.vkFreeMemory = &Lite8Vram::CountingFreeMemory;
+    }
 
     VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
     if (extensions.memory_budget) {

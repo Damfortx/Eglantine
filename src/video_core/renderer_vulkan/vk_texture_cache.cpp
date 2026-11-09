@@ -2640,6 +2640,30 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
+void TextureCacheRuntime::TickVram(u64 cache_used, u64 expected, u64 critical) {
+    ++vram_frame;
+    TickVramStats(device, VramCacheFigures{
+                              .used = cache_used,
+                              .expected = expected,
+                              .critical = critical,
+                              .pressure_events = MemoryPressureEvents(),
+                          });
+    // EDEN_NX2_VRAM_DECODE_TRIM: persistent decode images of the large classes go back to the
+    // driver after a minute unused (the GPU done with them); the next texture of that class
+    // allocates one again.
+    if (Lite8Vram::DecodeTrimEnabled() && vram_frame % 600 == 0) {
+        std::erase_if(persistent_decodes, [this](const auto& entry) {
+            const u64 width = entry.first >> 32;
+            const u64 height = entry.first & 0xFFFF'FFFFULL;
+            const u64 bytes = width * height * 4 * 4 / 3; // RGBA8 with its mip chain
+            const PersistentDecode& decode = entry.second;
+            return bytes >= Lite8Vram::DecodeTrimMinBytes &&
+                   vram_frame - decode.last_frame >= Lite8Vram::DecodeTrimFrames &&
+                   scheduler.IsFree(decode.tick);
+        });
+    }
+}
+
 void TextureCacheRuntime::TickFrame() {
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
     // Finished decode images wait for the next texture of their shape, up to this much memory.
@@ -5102,6 +5126,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 map, swizzles);
             decode.initialized = true;
             EncodeTranscoded(image, info, width, height, levels, layers, decode.views);
+            decode.tick = scheduler.CurrentTick(); // Batch 8 U4: EDEN_NX2_VRAM_DECODE_TRIM
+            decode.last_frame = vram_frame;
             return;
         }
     }
