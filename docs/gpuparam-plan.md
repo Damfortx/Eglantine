@@ -121,6 +121,57 @@ Without the MT back (EDEN_NX2_GPUPARAM=1, default off) the same: the single GPU 
 zero call through CallMacroMethod and the indirect draw inline; with the split but no MT, the
 split front path and a back Defer.
 
+## Round 2: macro 40 writes driver constants (const buffer words from the GPU words)
+
+First run: every call rejected, `macro 40 start=1e7 hash=5360a09ac90e16c0 single: rejected
+(executable write)`. Macro 40's code (tools/mmedis.py, now prints immediates):
+```
+1e7: r4=p0 (begin) | r3=p1 (count)
+1e8: r2=p2 (instances) | index_buffer.first = p3
+1e9: r1=p4 | r0=p5 | vertex_id_base = p4 | global_base_vertex_index = p4, method++
+1ea: global_base_instance_index = p5 | const_buffer.offset = 0x640, method++
+1eb: cb_data = p4 (base vertex) | cb_data = p5 (base instance)    -> cb +0x640, +0x644
+1ec: if instances == 0 goto 1f1
+1ed..1f0: per instance draw.begin / index_buffer.count / draw.end (as macro 41)
+1f1: vertex_id_base = 0 | global_base_vertex_index = 0
+1f2: global_base_instance_index = 0 | const_buffer.offset (method)
+1f3: END const_buffer.offset = 0x640 | cb_data = 0              -> cb +0x640 = 0
+1f4: cb_data = 0                                                 -> cb +0x644 = 0
+```
+Macro 41 plus NVN's driver constants: base vertex and base instance at 0x640/0x644 of the
+selected constant buffer for the draw (the shaders read them; yuzu's HLE replaces these cbuf
+reads instead), cleared after it.
+
+Classifier extension: const_buffer data writes (0x8e4..0x8f3) are tracked as words at
+address + offset (offset from the macro's own const_buffer.offset write; one taken from state,
+or a const_buffer size/address write, rejects), const_buffer.offset writes may follow the draws.
+Over the test runs every word must have the same offset, a value that is constant or one GPU
+word in every run, and be written before the first draw ("pre") or after the last ("post"; only
+offsets also written pre). The result is a CbPlan carried by the Call (logged: `GPU params:
+macro 40 constant buffer words: pre +0x640=word3 pre +0x644=word4 post +0x640=0x0 post
++0x644=0x0`). GPU words to the constant buffer in a multi-draw are refused (one indirect count
+draw can't change them per draw).
+
+Back (GpuParamDraw): the zero-word call already wrote every cb word (final values) as cached
+writes. Then: FlushCaching (those writes reach the buffer cache now, so the copy's destination
+sync uploads them before the copy and nothing uploads over it later); pre words: constants with
+WriteBlockCached, GPU words with `AccessAccelerateDMA().BufferCopy(records + 4k, cb + offset)`
+(the MaxwellDMA path: BufferCache::DMACopy syncs both ranges, copies on the GPU in queue order
+after the compute that wrote the source, marks the destination GPU-modified so the draw's
+uniform buffer binds the buffer instead of streaming guest memory; on the sequencer
+SeqDmaCopy, serial or a packet with EDEN_NX2_MT_DMA=packet); consecutive words in one copy (8
+bytes for macro 40); the indirect draw; post words the same way (constants: WriteBlockCached,
+which clears the GPU-modified state and pending downloads of those bytes, so the next draws
+stream the zeros again). BufferCopy false (neither range in the buffer cache): guest memory copy
+as MaxwellDMA does (counted: "constant buffer copies from guest memory" in the stats line).
+Check mode also compares the constant buffer words the macro leaves before its draws and after
+them with the plan's.
+
+Risks added: one DMA buffer copy per call on the back (SeqDmaCopy is a Serial unless
+EDEN_NX2_MT_DMA=packet: a sequencer/committer sync ~420 times a second); the copy marks the cb
+page GPU-written (Nx2MarkGpuWritten): MME DMA reads or lists on that page would now wait for
+writers; the uniform buffer of those draws takes the buffer path (not streamed) for that draw.
+
 ## Switches
 
 | switch | default | effect |

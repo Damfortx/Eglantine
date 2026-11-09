@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -84,6 +85,16 @@ inline constexpr u32 RegMeshControl = 0x114c / 4;
 inline constexpr u32 MacroRegistersStart = 0xe00;
 inline constexpr u32 MmeDmaRead = 0x157;
 inline constexpr u32 MmeDmaReadFifoed = 0x158;
+/// const_buffer: size, address high/low, offset, then 16 data registers (each data word goes
+/// to address + offset and advances the offset by 4: Maxwell3D::ProcessCBMultiData).
+inline constexpr u32 RegCbSize = 0x8e0;
+inline constexpr u32 RegCbAddressLow = 0x8e2;
+inline constexpr u32 RegCbOffset = 0x8e3;
+inline constexpr u32 RegCbData = 0x8e4;
+inline constexpr u32 RegCbDataEnd = RegCbData + 16;
+[[nodiscard]] constexpr bool IsCbData(u32 method) {
+    return method >= RegCbData && method < RegCbDataEnd;
+}
 
 /// Registers whose values the indirect draw replaces (the draw takes them from the words) or
 /// does not read: a call may leave them GPU-dependent (the front and the back then both hold
@@ -127,6 +138,30 @@ inline constexpr u32 MmeDmaReadFifoed = 0x158;
 
 // --------------------------------------------------------------------------------- the calls
 
+/// A constant buffer word the call writes (at const_buffer address + `offset`): `value`, or the
+/// call's GPU word `gpu_word` (index into its GPU-written words) when that is not NoGpuWord.
+struct CbWord {
+    u32 offset;
+    u32 value;
+    u8 gpu_word;
+};
+inline constexpr u8 NoGpuWord = 0xff;
+inline constexpr size_t MaxCbWords = 8;
+
+/// The call's constant buffer writes around its draws: `pre` what the draws see (written before
+/// the first draw), `post` what the call leaves after them (offsets also in `pre`). The zero-word
+/// call has already written every word (with zeros for GPU words) before the back's draw.
+struct CbPlan {
+    std::array<CbWord, MaxCbWords> pre{};
+    std::array<CbWord, MaxCbWords> post{};
+    u8 pre_count{};
+    u8 post_count{};
+};
+
+/// Constant buffer words the back could not copy on the GPU (BufferCopy false: copied from
+/// guest memory instead, possibly stale). Back thread; logged by Stats.
+inline std::atomic<u64> g_cb_copy_fallbacks{};
+
 /// One GPFIFO entry of the call's GPU-written parameters.
 struct Segment {
     u64 gpu_addr;
@@ -147,6 +182,7 @@ struct Call {
     u32 begin;      ///< p0, the draw.begin word
     u32 max_draws;
     Kind kind;
+    CbPlan cb;
 };
 
 /// Why a call with GPU-written parameters was not deferred (statistics).
@@ -178,11 +214,18 @@ enum class Reject : u8 {
     StateAfterDraw,    ///< a non-draw register written after the first draw
     GpuDependentState, ///< non-draw register writes depend on the GPU words
     GpuDependentDram,  ///< data RAM writes depend on the GPU words
+    CbLayout,          ///< constant buffer writes: offset from state, address changed, offsets
+                       ///< differ between runs, or too many words
+    CbValue,           ///< a constant buffer word neither constant nor a GPU word
+    CbBetweenDraws,    ///< a constant buffer word written between draws (or phases differ)
+    CbPostOnly,        ///< a word written after the draws only (its old value is gone)
+    CbGpuMulti,        ///< GPU words to the constant buffer in a multi-draw call
     Count,
 };
 inline constexpr std::array<std::string_view, static_cast<size_t>(Reject::Count)> RejectNames{
     "none", "run error", "forbidden emit", "executable write", "draws differ",
-    "placeholder draws", "state after draw", "gpu-dependent state", "gpu-dependent dram"};
+    "placeholder draws", "state after draw", "gpu-dependent state", "gpu-dependent dram",
+    "cb layout", "cb value", "cb between draws", "cb post only", "cb gpu multi"};
 
 // ---------------------------------------------------------------------------- the reference
 
@@ -236,6 +279,14 @@ struct Trace {
     bool other_after_draw{};
     bool read_state{};
     bool read_dram{};
+    bool cb_offset_from_state{}; ///< constant buffer data before the macro set the offset
+    bool cb_address_write{};     ///< the macro wrote const_buffer size/address
+    struct CbWrite {
+        u32 offset;
+        u32 value;
+        u32 draws_before;
+    };
+    std::vector<CbWrite> cb_writes;
     std::vector<DrawRecord> draws;
     std::vector<std::pair<u32, u32>> other_writes; ///< non-draw registers, in order
     std::vector<std::pair<u32, u32>> dram_writes;
@@ -263,6 +314,8 @@ void RunTrace(Tegra::TuringMacroInterpreter& interp, std::span<const u32> code, 
         return method < regs.size() ? regs[method] : 0U;
     };
     bool indexed_pending = false;
+    bool cb_offset_known = false;
+    u32 cb_offset = RegCbOffset < regs.size() ? regs[RegCbOffset] : 0U;
     interp.active_dram = &dram;
     const auto result = interp.Execute(
         code, start, params,
@@ -275,6 +328,24 @@ void RunTrace(Tegra::TuringMacroInterpreter& interp, std::span<const u32> code, 
                 method == MmeDmaReadFifoed) {
                 t.forbidden = true;
                 return false;
+            }
+            if (IsCbData(method)) {
+                // ProcessCBMultiData: the word at address + offset, the offset advances.
+                t.cb_offset_from_state |= !cb_offset_known;
+                t.cb_writes.push_back({cb_offset, value, static_cast<u32>(t.draws.size())});
+                cb_offset += 4;
+                overlay.emplace_back(RegCbOffset, cb_offset);
+                return true;
+            }
+            if (method == RegCbOffset) {
+                cb_offset = value;
+                cb_offset_known = true;
+                overlay.emplace_back(method, value);
+                t.other_writes.emplace_back(method, value); // must not depend on the GPU words
+                return true;
+            }
+            if (method >= RegCbSize && method < RegCbOffset) {
+                t.cb_address_write = true;
             }
             overlay.emplace_back(method, value);
             if (method == RegIndexCount) {
@@ -351,6 +422,7 @@ public:
         bool ok{};
         Reject reject{};
         bool cached{};
+        CbPlan cb{};
     };
 
     template <typename Executable>
@@ -361,13 +433,14 @@ public:
         const u64 code_hash = CodeHash(code_ram, positions, start, generation);
         const u64 key = Key(start, code_hash, kind, max_draws, begin);
         if (const auto it = verdicts.find(key); it != verdicts.end()) {
-            return {it->second.ok, it->second.reject, true};
+            return {it->second.ok, it->second.reject, true, it->second.cb};
         }
+        CbPlan cb{};
         const auto [reject, stateful] =
-            Run(code_ram, start, kind, begin, max_draws, regs, dram, executable);
+            Run(code_ram, start, kind, begin, max_draws, regs, dram, executable, cb);
         const bool ok = reject == Reject::None;
         if (!stateful) {
-            verdicts.emplace(key, Entry{ok, reject});
+            verdicts.emplace(key, Entry{ok, reject, cb});
         }
         if (logged.insert(code_hash ^ (u64{static_cast<u8>(kind)} << 60) ^ (ok ? 1 : 0)).second) {
             const auto code = MacroCode(code_ram, positions, start);
@@ -388,17 +461,32 @@ public:
             if (!ok && !last_error.empty()) {
                 LOG_INFO(HW_GPU, "GPU params: macro {} run error: {}", index, last_error);
             }
+            if (ok && (cb.pre_count != 0 || cb.post_count != 0)) {
+                std::string text;
+                const auto add = [&text](const char* phase, const CbWord& w) {
+                    text += w.gpu_word == NoGpuWord
+                                ? fmt::format(" {} +{:#x}={:#x}", phase, w.offset, w.value)
+                                : fmt::format(" {} +{:#x}=word{}", phase, w.offset, w.gpu_word);
+                };
+                for (u8 i = 0; i < cb.pre_count; ++i) {
+                    add("pre", cb.pre[i]);
+                }
+                for (u8 i = 0; i < cb.post_count; ++i) {
+                    add("post", cb.post[i]);
+                }
+                LOG_INFO(HW_GPU, "GPU params: macro {} constant buffer words:{}", index, text);
+            }
         }
-        return {ok, reject, false};
+        return {ok, reject, false, cb};
     }
 
     /// EDEN_NX2_GPUPARAM_CHECK: the macro's draws for the real words against the reference's.
     /// Returns whether they match (`actual`/`expected` hold both).
     template <typename Executable>
     bool Compare(std::span<const u32> code_ram, u32 start, Kind kind, u32 begin, u32 max_draws,
-                 std::span<const u32> words, std::span<const u32> regs, const DataRam& dram,
-                 Executable&& executable, std::vector<DrawRecord>& actual,
-                 std::vector<DrawRecord>& expected, std::string_view& error) {
+                 const CbPlan& cb, std::span<const u32> words, std::span<const u32> regs,
+                 const DataRam& dram, Executable&& executable, std::vector<DrawRecord>& actual,
+                 std::vector<DrawRecord>& expected, std::string_view& error, bool& cb_same) {
         params.assign(1, begin);
         params.insert(params.end(), words.begin(), words.end());
         scratch_dram = dram;
@@ -406,13 +494,46 @@ public:
         error = trace.error;
         actual = trace.draws;
         ReferenceDraws(kind, begin, words, max_draws, expected, 1U << 20);
-        return trace.ok && actual == expected;
+        // The constant buffer words the draws saw and the call left, against the plan's.
+        cb_same = true;
+        if (!trace.draws.empty()) {
+            const auto resolve = [&words](const CbWord& w) {
+                return w.gpu_word == NoGpuWord ? w.value
+                       : w.gpu_word < words.size() ? words[w.gpu_word]
+                                                   : 0U;
+            };
+            const auto net = [this](u32 offset, bool before_draws, u32& out) {
+                bool found = false;
+                for (const auto& write : trace.cb_writes) {
+                    if (write.offset == offset && (!before_draws || write.draws_before == 0)) {
+                        out = write.value;
+                        found = true;
+                    }
+                }
+                return found;
+            };
+            for (u8 i = 0; i < cb.pre_count; ++i) {
+                u32 value{};
+                cb_same &= net(cb.pre[i].offset, true, value) && value == resolve(cb.pre[i]);
+            }
+            for (u8 i = 0; i < cb.post_count; ++i) {
+                u32 value{};
+                cb_same &= net(cb.post[i].offset, false, value) && value == resolve(cb.post[i]);
+            }
+            size_t pre_writes = 0;
+            for (const auto& write : trace.cb_writes) {
+                pre_writes += write.draws_before == 0 ? 1 : 0;
+            }
+            cb_same &= (pre_writes == 0) == (cb.pre_count == 0);
+        }
+        return trace.ok && actual == expected && cb_same;
     }
 
 private:
     struct Entry {
         bool ok;
         Reject reject;
+        CbPlan cb;
     };
 
     static u64 Key(u32 start, u64 code_hash, Kind kind, u32 max_draws, u32 begin) {
@@ -473,11 +594,14 @@ private:
     template <typename Executable>
     std::pair<Reject, bool> Run(std::span<const u32> code_ram, u32 start, Kind kind, u32 begin,
                                 u32 max_draws, std::span<const u32> regs, const DataRam& dram,
-                                Executable& executable) {
+                                Executable& executable, CbPlan& cb) {
         last_error = {};
         bool stateful = false;
         std::vector<std::pair<u32, u32>> base_writes;
         std::vector<std::pair<u32, u32>> base_dram;
+        std::array<std::vector<Trace::CbWrite>, 7> cb_runs;
+        std::array<std::array<u32, 5>, 7> single_words{};
+        std::array<size_t, 7> draw_counts{};
         for (u32 v = 0; v < 7; ++v) {
             TestWords(kind, max_draws, v, words);
             params.assign(1, begin);
@@ -515,8 +639,101 @@ private:
             } else if (trace.dram_writes != base_dram) {
                 return {Reject::GpuDependentDram, stateful};
             }
+            if (!trace.cb_writes.empty() &&
+                (trace.cb_offset_from_state || trace.cb_address_write)) {
+                return {Reject::CbLayout, stateful};
+            }
+            cb_runs[v] = std::move(trace.cb_writes);
+            draw_counts[v] = trace.draws.size();
+            if (kind == Kind::IndexedSingle) {
+                std::copy_n(words.begin(), 5, single_words[v].begin());
+            }
         }
-        return {Reject::None, stateful};
+        return {PlanConstantBuffer(kind, cb_runs, single_words, draw_counts, cb), stateful};
+    }
+
+    /// The constant buffer words of the runs as a plan: the same offsets in every run, each value
+    /// a constant or one GPU word in every run, written before the first draw or after the last.
+    static Reject PlanConstantBuffer(Kind kind,
+                                     const std::array<std::vector<Trace::CbWrite>, 7>& runs,
+                                     const std::array<std::array<u32, 5>, 7>& single_words,
+                                     const std::array<size_t, 7>& draw_counts, CbPlan& cb) {
+        cb = CbPlan{};
+        const auto& first = runs[0];
+        if (first.empty()) {
+            return Reject::None;
+        }
+        if (first.size() > 2 * MaxCbWords) {
+            return Reject::CbLayout;
+        }
+        for (const auto& run : runs) {
+            if (run.size() != first.size()) {
+                return Reject::CbLayout;
+            }
+            for (size_t j = 0; j < run.size(); ++j) {
+                if (run[j].offset != first[j].offset) {
+                    return Reject::CbLayout;
+                }
+            }
+        }
+        for (size_t j = 0; j < first.size(); ++j) {
+            CbWord word{first[j].offset, first[j].value, NoGpuWord};
+            const bool constant = std::ranges::all_of(
+                runs, [&](const auto& run) { return run[j].value == first[j].value; });
+            if (!constant) {
+                if (kind != Kind::IndexedSingle) {
+                    return Reject::CbGpuMulti;
+                }
+                for (u8 k = 0; k < 5 && word.gpu_word == NoGpuWord; ++k) {
+                    bool all = true;
+                    for (size_t v = 0; v < runs.size(); ++v) {
+                        all &= runs[v][j].value == single_words[v][k];
+                    }
+                    if (all) {
+                        word.gpu_word = k;
+                        word.value = 0;
+                    }
+                }
+                if (word.gpu_word == NoGpuWord) {
+                    return Reject::CbValue;
+                }
+            }
+            // Phase from the runs that draw: before every draw or after all of them.
+            int phase = -1;
+            for (size_t v = 0; v < runs.size(); ++v) {
+                if (draw_counts[v] == 0) {
+                    continue;
+                }
+                const u32 before = runs[v][j].draws_before;
+                const int this_phase = before == 0 ? 0 : before == draw_counts[v] ? 1 : 2;
+                if (this_phase == 2 || (phase != -1 && phase != this_phase)) {
+                    return Reject::CbBetweenDraws;
+                }
+                phase = this_phase;
+            }
+            if (phase == -1) {
+                return Reject::CbBetweenDraws; // no run drew: phases unknown
+            }
+            auto& list = phase == 0 ? cb.pre : cb.post;
+            u8& count = phase == 0 ? cb.pre_count : cb.post_count;
+            if (phase == 1 && std::ranges::none_of(
+                                  std::span{cb.pre.data(), cb.pre_count},
+                                  [&](const CbWord& w) { return w.offset == word.offset; })) {
+                return Reject::CbPostOnly;
+            }
+            const auto same = std::ranges::find_if(std::span{list.data(), count},
+                                                   [&](const CbWord& w) {
+                                                       return w.offset == word.offset;
+                                                   });
+            if (same != std::span{list.data(), count}.end()) {
+                *same = word; // the last write of an offset wins
+            } else if (count == MaxCbWords) {
+                return Reject::CbLayout;
+            } else {
+                list[count++] = word;
+            }
+        }
+        return Reject::None;
     }
 
     struct CodeSlot {
@@ -579,10 +796,11 @@ struct Stats {
         LOG_INFO(HW_GPU,
                  "GPU params in 10 s: {} deferred ({} single, {} multi; {} entries not read), "
                  "kept waiting:{}{} rejects:{} verified {}; check {} compared, {} mismatched, "
-                 "{} unreadable, {} draws",
+                 "{} unreadable, {} draws; constant buffer copies from guest memory {}",
                  reasons[0], single, multi, entries, text.empty() ? " none" : text, "",
                  rejected.empty() ? " none" : rejected, verified, check_compared, check_mismatch,
-                 check_unreadable, check_draws);
+                 check_unreadable, check_draws,
+                 g_cb_copy_fallbacks.exchange(0, std::memory_order_relaxed));
         const auto keep = window;
         *this = Stats{};
         window = keep;

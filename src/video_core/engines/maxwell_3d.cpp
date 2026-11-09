@@ -23,6 +23,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/engines/maxwell_dma.h"
 #include "video_core/mt/gpuparam.h"
 #include <fmt/ranges.h>
 #include "video_core/nx2.h"
@@ -1668,6 +1669,10 @@ static_assert(MAXWELL3D_REG_INDEX(global_base_vertex_index) == GP::RegBaseVertex
 static_assert(MAXWELL3D_REG_INDEX(global_base_instance_index) == GP::RegBaseInstance);
 static_assert(Maxwell3D::Regs::MeshControl == GP::RegMeshControl);
 static_assert(MacroRegistersStart == GP::MacroRegistersStart);
+static_assert(MAXWELL3D_REG_INDEX(const_buffer.size) == GP::RegCbSize);
+static_assert(MAXWELL3D_REG_INDEX(const_buffer.address_low) == GP::RegCbAddressLow);
+static_assert(MAXWELL3D_REG_INDEX(const_buffer.offset) == GP::RegCbOffset);
+static_assert(MAXWELL3D_REG_INDEX(const_buffer.buffer) == GP::RegCbData);
 static_assert(static_cast<u32>(Maxwell3D::Regs::IndexFormat::UnsignedByte) == 0);
 
 struct Maxwell3D::GpuParamState {
@@ -1774,6 +1779,7 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
         ++gs.stats.rejects[static_cast<size_t>(verdict.reject)];
         return keep_waiting(GP::Reason::Rejected);
     }
+    call.cb = verdict.cb;
 
     // EDEN_NX2_GPUPARAM_CHECK: the words as the old path reads them (after their writers), and
     // the macro's draws for them against the indirect draw's.
@@ -1790,11 +1796,12 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
             ++gs.stats.check_unreadable;
         } else {
             std::string_view error;
+            bool cb_same = true;
             const u32 start = positions[index % positions.size()];
             const bool same = gs.classifier.Compare(code_ram, start, call.kind, call.begin,
-                                                    call.max_draws, gs.words, reg_span,
+                                                    call.max_draws, call.cb, gs.words, reg_span,
                                                     native_data_ram, executable, gs.actual,
-                                                    gs.expected, error);
+                                                    gs.expected, error, cb_same);
             ++gs.stats.check_compared;
             gs.stats.check_draws += gs.expected.size();
             if (!same) {
@@ -1818,10 +1825,11 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
                     };
                     LOG_WARNING(HW_GPU,
                                 "GPU params check: macro {} at {:#x} ({} words): macro draws {}, "
-                                "indirect draws {}{}{}; first difference #{}: macro {} / "
+                                "indirect draws {}{}{}{}; first difference #{}: macro {} / "
                                 "indirect {}; words {:x}",
                                 index, call.records_addr, words, gs.actual.size(),
-                                gs.expected.size(), error.empty() ? "" : ", error ", error,
+                                gs.expected.size(), cb_same ? "" : ", constant buffer words differ",
+                                error.empty() ? "" : ", error ", error,
                                 first_difference, describe(gs.actual, first_difference),
                                 describe(gs.expected, first_difference),
                                 fmt::join(std::span<const u32>{gs.words}.first(
@@ -1870,6 +1878,17 @@ void Maxwell3D::GpuParamDraw(Core::System& system, const GP::Call& call) {
     // instanced draw. Then HLE_DrawIndexedIndirect's draw with the words in GPU memory.
     ConsumeSink(system);
     draw_manager.DrawDeferred(*this);
+    // The constant buffer words the draws read (driver constants: base vertex/instance at
+    // 0x640/0x644 for macro 40). The zero-word call wrote them all already, with its final
+    // values: put the draw-time values there first (GPU words as GPU copies from the parameter
+    // buffer, after its writer in queue order), restore the final ones after the draw.
+    const bool has_cb = call.cb.pre_count != 0 || call.cb.post_count != 0;
+    if (has_cb) {
+        // The zero-word call's cached constant buffer writes reach the buffer cache first, so
+        // the copy's destination sync uploads them before the copy, never after it.
+        memory_manager.FlushCaching();
+        GpuParamConstantWords(std::span{call.cb.pre.data(), call.cb.pre_count}, call);
+    }
     auto& params = draw_manager.indirect_state;
     params.is_byte_count = false;
     params.is_indexed = true;
@@ -1886,6 +1905,51 @@ void Maxwell3D::GpuParamDraw(Core::System& system, const GP::Call& call) {
     dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     // A drawing call leaves no indexed draw pending (DrawEnd clears it).
     draw_manager.draw_state.draw_indexed = false;
+    if (has_cb) {
+        GpuParamConstantWords(std::span{call.cb.post.data(), call.cb.post_count}, call);
+    }
+}
+
+void Maxwell3D::GpuParamConstantWords(std::span<const GP::CbWord> cb_words, const GP::Call& call) {
+    // As ProcessCBMultiData: at const_buffer address + offset, nothing past const_buffer.size.
+    const GPUVAddr base = regs.const_buffer.Address();
+    const u32 size = regs.const_buffer.size;
+    if (base == 0) {
+        return;
+    }
+    for (size_t i = 0; i < cb_words.size();) {
+        const GP::CbWord& word = cb_words[i];
+        if (word.gpu_word == GP::NoGpuWord) {
+            if (u64{word.offset} + sizeof(u32) <= size) {
+                memory_manager.WriteBlockCached(base + word.offset, &word.value, sizeof(u32));
+            }
+            ++i;
+            continue;
+        }
+        // A run of GPU words consecutive in both the parameters and the constant buffer: one
+        // buffer copy (BufferCopy: syncs the destination, copies on the GPU, marks it
+        // GPU-modified so the draw binds the buffer instead of streaming guest memory).
+        size_t run = 1;
+        while (i + run < cb_words.size() && cb_words[i + run].gpu_word != GP::NoGpuWord &&
+               cb_words[i + run].gpu_word == word.gpu_word + run &&
+               cb_words[i + run].offset == word.offset + run * sizeof(u32)) {
+            ++run;
+        }
+        const u64 bytes = std::min<u64>(run * sizeof(u32),
+                                        word.offset < size ? (size - word.offset) & ~3U : 0);
+        if (bytes != 0) {
+            const GPUVAddr source = call.records_addr + u64{word.gpu_word} * sizeof(u32);
+            const GPUVAddr dest = base + word.offset;
+            if (!rasterizer->AccessAccelerateDMA().BufferCopy(source, dest, bytes)) {
+                // Neither range in the buffer cache: guest memory (MaxwellDMA's fallback).
+                GP::g_cb_copy_fallbacks.fetch_add(1, std::memory_order_relaxed);
+                std::array<u32, GP::MaxCbWords> copied{};
+                memory_manager.ReadBlock(source, copied.data(), bytes);
+                memory_manager.WriteBlockCached(dest, copied.data(), bytes);
+            }
+        }
+        i += run;
+    }
 }
 
 } // namespace Tegra::Engines

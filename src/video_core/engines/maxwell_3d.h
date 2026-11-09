@@ -46,6 +46,7 @@ class GpuSplit;
 namespace VideoCommon::MT::GpuParam {
 struct Segment;
 struct Call;
+struct CbWord;
 } // namespace VideoCommon::MT::GpuParam
 
 namespace VideoCore {
@@ -3461,6 +3462,9 @@ private:
     void FinishFrontMacro(Core::System& system);
     /// GpuParamCall's indirect draw (on the back with the split, else inline).
     void GpuParamDraw(Core::System& system, const VideoCommon::MT::GpuParam::Call& call);
+    /// GpuParamDraw's constant buffer words (constants written, GPU words copied on the GPU).
+    void GpuParamConstantWords(std::span<const VideoCommon::MT::GpuParam::CbWord> cb_words,
+                               const VideoCommon::MT::GpuParam::Call& call);
     struct GpuParamState;
     std::unique_ptr<GpuParamState> gpuparam;
     std::unique_ptr<FrontState> front;
