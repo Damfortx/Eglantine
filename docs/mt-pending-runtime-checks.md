@@ -230,3 +230,27 @@ Compiled only (build/pgo rc=0); nothing below has run. BIN, demo.sh, L as in Rou
    (`L EDEN_NX2_MT_VERIFY=1`, b7-verify): 0 mismatches. Bisect on picture problems: UBOLOCK,
    DESCDEDUP, OVERLAY, LOCKSKIP (=0 each).
 5. fps pairs vs MT unset (>= 3 each, alternating) as Round 6 step 2 with tags b7-off<i> / b7-lite<i>.
+
+## Batch 8 (branch mkw-mt-lite, docs/batch8-plan.md): one test round
+Compiled only (build rc=0); nothing below has run. BIN, demo.sh, L as in Round 6.
+1. Upstream picks first (MT unset and L, 1 run each, b8-off / b8-lite): picture vs batch 7 (portal
+   screenshot; water, particles = mesh changes; occlusion pop-in = counter pause; new render targets
+   flashing = clear-upload skip). If shaders look stale delete the title's Vulkan pipeline cache once.
+   Boot log: new "Skipping tessellation pipeline" / lowering rejections. Docked photo mode: 4K photo
+   not empty. Close during shader builds: clean exit, cache saved. fps pairs vs batch 7 binary (>= 3
+   alternating); A/B EDEN_NX2_IDLE_SPIN_US=0 and EDEN_NX2_LOWER_EXTENDED=0 if fps or picture regress.
+2. U3 macros: CHECK run `L EDEN_NX2_MT_LITE8_MACRO_CHECK=1` (b8-mcheck): no "Front macro HLE CHECK"
+   lines. Stats `L EDEN_NX2_MT_LITE8_MACRO_STATS=1` (b8-mstats): "Front macros in 10 s" top-10 list and
+   C++ hit share (copy the top hashes into the next plan). GPU_PROFILE "macro" ms/s vs 162. In-run A/B
+   3 runs each: `L EDEN_NX2_ALT_RANDOM=1 EDEN_NX2_ALT_SECONDS=2 EDEN_NX2_MT_LITE8_MEMIT=a` (b8-ab-memit-<i>),
+   same with MHLE=a. VERIFY (`L EDEN_NX2_MT_VERIFY=1`) and SPLIT_VERIFY: no new differences.
+   Bisect on picture problems: MHLE=0, then MEMIT=0.
+3. U4 VRAM: `L EDEN_NX2_VRAM_STATS=1` at 2x (b8-vram): "VRAM in 10 s": budget < heap - desktop use?
+   allocation count / dedicated / max latency per 10 s; WARNING ">= 50 ms" allocations. Then A/B
+   `EDEN_NX2_VRAM_NODEDICATED=a` (in-run, 3 runs) and separate runs with EDEN_NX2_VRAM_STAGING_KEEP=2,
+   EDEN_NX2_VRAM_SLOWPRESSURE=1, EDEN_NX2_VRAM_DECODE_TRIM=1: hitch count / slow allocations / fps.
+   STAGING_KEEP (default 1) regress => STAGING_KEEP=0.
+4. U2 frame gen (needs a >= 120 Hz display, not a fps benchmark): `EDEN_NX2_FRAMEGEN=1
+   EDEN_NX2_FRAMEGEN_RATE=<display Hz>` (b8-fg): INFO "FrameGen: ..." line; on-screen rate ~2x; check
+   ghosting on the HUD/fast edges (smear in the wrong direction = motion-vector sign), pacing judder,
+   input latency; VRAM +33 MB at 1440p. Without the switch: no change vs b8-off.
