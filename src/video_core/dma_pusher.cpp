@@ -98,6 +98,8 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
 DmaPusher::~DmaPusher() = default;
 
 void DmaPusher::DispatchCalls() {
+    // EDEN_NX2_FRONT2_STATS (mt/front2.h, W4): read-only census of the queued lists; inert unset.
+    [[maybe_unused]] const auto front2_guard = VideoCommon::MT::Front2Entry(*this);
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
     dma_state.is_last_call = true;
     while (system.IsPoweredOn()) {

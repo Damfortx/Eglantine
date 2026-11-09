@@ -23,6 +23,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/mt/lite5_list_switches.h"
 #include "video_core/mt/list_dump.h"
+#include "video_core/mt/front2.h"
 
 namespace Core {
 class System;
@@ -236,6 +237,8 @@ public:
     VideoCommon::MT::ListStats list_stats;
     /// EDEN_NX2_LIST_DUMP: sampled GPU-written list records (video_core/mt/list_dump.h).
     VideoCommon::MT::ListDump list_dump;
+    /// EDEN_NX2_FRONT2_STATS (mt/front2.h): read-only census of the parse/execute split.
+    VideoCommon::MT::Front2Census front2_census;
     void RecordListDump(const CommandListHeader& header, std::span<const CommandHeader> commands,
                         u32 path);
     Common::ScratchBuffer<CommandHeader> check_headers;
