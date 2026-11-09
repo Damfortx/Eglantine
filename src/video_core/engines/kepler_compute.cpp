@@ -382,6 +382,21 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
                 Tegra::Nx2NoteQmdReleaseTarget(address, (flags & (1U << 26)) ? 1 : (flags & (1U << 19)) ? 2 : 0);
+                // EDEN_NX2_MT_LITE_FOREIGNACQ: front acquires on words back-only releases target
+                // still drain (a never-cleared bitset; the hash above is lossy).
+                if (VideoCommon::MT::LiteForeignAcquire()) {
+                    VideoCommon::MT::BackReleaseTargets::Get().Note(address);
+                }
+                // EDEN_NX2_MT_LITE_QMDLEDGER: a max release in flight from now until its fence
+                // callback wrote memory (recorded before SignalFence, which may run it at once).
+                std::optional<u64> ledger_device;
+                if ((flags & (1U << 26)) == 0 && (flags & (1U << 19)) != 0 &&
+                    VideoCommon::MT::LiteQmdLedger()) {
+                    ledger_device = memory_manager.GpuToCpuAddress(address);
+                    if (ledger_device) {
+                        VideoCommon::MT::QmdMaxLedger::Get().Add(*ledger_device, payload);
+                    }
+                }
                 if (static const bool stats = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr; stats) {
                     static u64 back_adds{};
                     if ((flags & (1U << 26)) && (++back_adds % 5000) == 0) {
@@ -410,11 +425,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    rasterizer->SignalFence([this, address, payload] {
+                    rasterizer->SignalFence([this, address, payload, ledger_device] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
                             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                        }
+                        if (ledger_device) {
+                            VideoCommon::MT::QmdMaxLedger::Get().Landed(*ledger_device, payload);
                         }
                     });
                 } else {

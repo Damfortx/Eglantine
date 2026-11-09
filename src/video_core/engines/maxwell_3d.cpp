@@ -982,10 +982,21 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
     if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) [[unlikely]] {
         // Every report but an acquire writes up to 16 bytes there.
         if ((fs.regs[method] & 3) != static_cast<u32>(Regs::ReportSemaphore::Operation::Acquire)) {
+            // EDEN_NX2_MT_LITE_OVERLAY: a payload release (report Payload, no reduction) writes
+            // the payload register's value as its first word.
+            const u32 query = fs.regs[method];
+            const bool payload_release =
+                sent && VideoCommon::MT::LiteOverlayFirst() &&
+                (query & 3) == static_cast<u32>(Regs::ReportSemaphore::Operation::Release) &&
+                ((query >> 23) & 0x1f) == static_cast<u32>(Regs::ReportSemaphore::Report::Payload) &&
+                ((query >> 3) & 1) == 0;
             split.NotePendingWrite(
                 (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
                     fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)],
-                16, known, 2);
+                16, known, 2,
+                payload_release
+                    ? std::optional<u32>{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)]}
+                    : std::nullopt);
         }
     }
 }
@@ -1360,7 +1371,21 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // until the front sends again, and position waits only go up to the committer's guest writes.
     static const char partial_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_PARTIAL");
     const auto pending = split.PendingWritesFor(source, read_bytes);
-    const bool partial = !always_drain && !on_gpu_written && !pending.drain &&
+    // EDEN_NX2_MT_LITE_OVERLAY: a read whose queued writes all have known values takes the
+    // overlay below (no wait) before the partial wait: with DMAPARTIAL on, every one of them
+    // waited for its newest release (~67 a second, ~1.2 ms each in title 1).
+    static const char overlay_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_OVERLAY");
+    static std::vector<VideoCommon::GpuSplit::KnownWord> known_words;
+    known_words.clear();
+    const bool overlay_first =
+        VideoCommon::MT::LiteOverlayFirst() && !always_drain && !on_gpu_written &&
+        !pending.drain && !pending.writers && pending.position != 0 &&
+        Tegra::Nx2Switch(overlay_mode, true) &&
+        split.KnownPendingWords(source, read_bytes, known_words);
+    if (!overlay_first) {
+        known_words.clear();
+    }
+    const bool partial = !overlay_first && !always_drain && !on_gpu_written && !pending.drain &&
                          (pending.writers || pending.position != 0) &&
                          Tegra::Nx2Switch(partial_mode, VideoCommon::MT::LiteDmaPartial());
     const bool plain_skip = !always_drain && !on_gpu_written && !pending.drain &&
@@ -1369,13 +1394,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // queued, whose payloads the front knows: the read gets them laid over memory instead of
     // draining the back. Only releases the back hasn't run count; memory has the rest.
     // EDEN_NX2_DMA_READ_OVERLAY=0 drains as before (=a alternates).
-    static const char overlay_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_OVERLAY");
-    static std::vector<VideoCommon::GpuSplit::KnownWord> known_words;
-    known_words.clear();
-    const bool overlay = !always_drain && !on_gpu_written && !pending.drain && !pending.writers &&
-                         pending.position != 0 && !partial &&
-                         Tegra::Nx2Switch(overlay_mode, true) &&
-                         split.KnownPendingWords(source, read_bytes, known_words);
+    const bool overlay = overlay_first ||
+                         (!always_drain && !on_gpu_written && !pending.drain && !pending.writers &&
+                          pending.position != 0 && !partial &&
+                          Tegra::Nx2Switch(overlay_mode, true) &&
+                          split.KnownPendingWords(source, read_bytes, known_words));
+    if (!overlay) {
+        known_words.clear();
+    }
     const bool skipped = plain_skip || overlay;
     const auto apply_known = [&](u32* data, u32 count) {
         for (const auto& known : known_words) {

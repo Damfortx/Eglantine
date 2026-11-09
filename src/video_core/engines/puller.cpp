@@ -30,6 +30,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/mt/lite4_switches.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
@@ -53,6 +54,9 @@ enum class PullerSite : u32 {
     ExecSkipped,     ///< ... neither, EDEN_NX2_SEM_EXECUTE_NODRAIN
     ReadFlush,       ///< ReadSemaphoreWord downloading a GPU-written word (Run)
     Legacy,          ///< pre-Ampere acquires
+    AcquireNoDrain,  ///< EDEN_NX2_MT_LITE_FOREIGNACQ: nothing queued can write it, no drain
+    AcquireLedger,   ///< EDEN_NX2_MT_LITE_QMDLEDGER: an in-flight QMD max release meets it
+    AcquireSeqWait,  ///< EDEN_NX2_MT_LITE_QMDLEDGER: sequencer-only wait before the drain
     Count,
 };
 void NotePullerSite(PullerSite site, bool run = false) {
@@ -72,7 +76,8 @@ void NotePullerSite(PullerSite site, bool run = false) {
     }
     static constexpr std::array<const char*, static_cast<size_t>(PullerSite::Count)> names{
         "acquire drain", "acquire fences", "resume poll",   "sem_execute drain",
-        "sem_execute fences", "sem_execute skipped", "word flush", "legacy acquire"};
+        "sem_execute fences", "sem_execute skipped", "word flush", "legacy acquire",
+        "acquire nodrain", "acquire ledger", "acquire seq wait"};
     std::string line;
     for (size_t i = 0; i < names.size(); ++i) {
         if (calls[i] != 0) {
@@ -120,6 +125,40 @@ void ReleaseFences(DmaPusher& dma_pusher) {
     VideoCommon::GpuSplit::Get().Run(
         [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
         VideoCommon::GpuSplit::DrainReason::Puller);
+}
+
+// EDEN_NX2_MT_LITE_ASYNCFENCES / FOREIGNACQ: the same fence release, sent to the back without
+// waiting for it (it runs after everything sent so far, as the Run would).
+void SendFences(DmaPusher& dma_pusher) {
+    OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+}
+
+// EDEN_NX2_MT_LITE_FOREIGNACQ: whether nothing queued for the back can write the word: nothing
+// the front noted (GpuSplit::NothingPendingFor), no back-only release ever targeted it (QMD and
+// copy engine releases), and the GPU never wrote its page through the caches (shaders, copies).
+// What can still meet such an acquire is the CPU or another un-noted writer: draining first only
+// made the front wait before suspending the channel.
+bool NothingQueuedWrites(DmaPusher& dma_pusher, GPUVAddr address) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || !split.PredictAcquires() || Tegra::Nx2QmdReleaseKind(address) != 0 ||
+        VideoCommon::MT::BackReleaseTargets::Get().MayBeTarget(address)) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Tegra::Nx2IsGpuWritten(*device)) {
+        return false;
+    }
+    return split.NothingPendingFor(address);
+}
+
+// EDEN_NX2_MT_LITE_QMDLEDGER: a QMD max release the back ran (not yet in memory) leaves the
+// word >= `value` (GEQ acquires only).
+bool LedgerMeets(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+    if (!VideoCommon::MT::LiteQmdLedger() || !VideoCommon::GpuSplit::Get().Active()) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    return device && VideoCommon::MT::QmdMaxLedger::Get().Meets(*device, value);
 }
 
 void NoteRelease(GPUVAddr address, u32 payload, u64 size = 16) {
@@ -272,6 +311,12 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         VideoCommon::GpuSplit::Get().NotePredictedAcquire();
         return true;
     }
+    if (pending_acquire->operation == static_cast<u32>(GpuSemaphoreOperation::AcquireGequal) &&
+        LedgerMeets(dma_pusher, pending_acquire->address, pending_acquire->value)) {
+        NotePullerSite(PullerSite::AcquireLedger);
+        VideoCommon::GpuSplit::Get().NotePredictedAcquire();
+        return true;
+    }
     // Title 1 polled ~13,000 times a second, ~330 of them draining a busy back, for semaphores
     // the CPU or another channel releases. Without a queued release for the address the back
     // can't meet it soon: check memory and the waiter latch without draining, and drain only
@@ -288,7 +333,13 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
             return true;
         }
-        if ((++lazy_polls & 7) != 0) {
+        // EDEN_NX2_MT_LITE_FOREIGNACQ: nothing queued can write the word, so a drain can
+        // only find an un-noted GPU write: every 64th poll.
+        const u32 period = VideoCommon::MT::LiteForeignAcquire() &&
+                                   NothingQueuedWrites(dma_pusher, pending_acquire->address)
+                               ? 63
+                               : 7;
+        if ((++lazy_polls & period) != 0) {
             return false;
         }
     }
@@ -488,6 +539,53 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VideoCommon::GpuSplit::Get().NotePredictedAcquire();
             return;
         }
+        if (op == GpuSemaphoreOperation::AcquireGequal &&
+            LedgerMeets(dma_pusher, acquire.address, acquire.value)) {
+            NotePullerSite(PullerSite::AcquireLedger);
+            VideoCommon::GpuSplit::Get().NotePredictedAcquire();
+            return;
+        }
+        // EDEN_NX2_MT_LITE_FOREIGNACQ: nothing queued can write the word: suspend without the
+        // drain (as the old path did after it for these: ~690 in 10 s stayed unmet in title 1).
+        // The waiter latch goes first, then the fences go to the back without a wait (a fence
+        // callback may be what lets the CPU release the word), then one look at memory.
+        if (VideoCommon::MT::LiteForeignAcquire() &&
+            NothingQueuedWrites(dma_pusher, acquire.address)) {
+            NotePullerSite(PullerSite::AcquireNoDrain);
+            auto& waiters = Nx2SemaphoreWaiters::Get();
+            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+                waiters.Add(this, *device, acquire.value, acquire.operation);
+            }
+            SendFences(dma_pusher);
+            const bool met_now =
+                waiters.Latched(this) ||
+                acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address));
+            NoteAcquireDrain(dma_pusher, 3, static_cast<u32>(op), acquire.address, acquire.value,
+                             met_now);
+            if (!met_now) {
+                pending_acquire = acquire;
+                dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+            } else {
+                waiters.Remove(this);
+            }
+            return;
+        }
+        // EDEN_NX2_MT_LITE_QMDLEDGER: a word QMD max releases target, met after the drain without
+        // a release the front noted (~50/s in title 1): the QMD is probably still queued. Wait
+        // for the sequencer only (it records the release in the ledger), then look again.
+        if (op == GpuSemaphoreOperation::AcquireGequal && VideoCommon::MT::LiteQmdLedger() &&
+            VideoCommon::GpuSplit::Get().MtActive() &&
+            Tegra::Nx2QmdReleaseKind(acquire.address) == 3) {
+            NotePullerSite(PullerSite::AcquireSeqWait);
+            VideoCommon::GpuSplit::Get().WaitSequencer(VideoCommon::GpuSplit::DrainReason::Puller);
+            if (LedgerMeets(dma_pusher, acquire.address, acquire.value) ||
+                MetInMemory(dma_pusher, acquire.address, acquire.value, false)) {
+                NotePullerSite(PullerSite::AcquireLedger);
+                VideoCommon::GpuSplit::Get().NotePredictedAcquire();
+                return;
+            }
+        }
         const bool had_pending =
             VideoCommon::GpuSplit::Get().HasPendingRelease(acquire.address);
         static const bool acquire_stats = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr;
@@ -517,8 +615,15 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
-        NotePullerSite(PullerSite::TriggerFences, true);
-        ReleaseFences(dma_pusher);
+        // EDEN_NX2_MT_LITE_ASYNCFENCES: sent, not waited for (a second round trip right after
+        // the drain); the resume poll sees what the callbacks write (memory, the latch).
+        const bool async_fences = VideoCommon::MT::LiteAsyncFences();
+        NotePullerSite(PullerSite::TriggerFences, !async_fences);
+        if (async_fences) {
+            SendFences(dma_pusher);
+        } else {
+            ReleaseFences(dma_pusher);
+        }
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);

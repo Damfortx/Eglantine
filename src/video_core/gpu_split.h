@@ -20,6 +20,7 @@
 #include "video_core/nx2.h"
 #include "video_core/mt/lite_switches.h"
 #include "video_core/mt/lite3_front_switches.h"
+#include "video_core/mt/lite4_switches.h"
 #include "video_core/mt/seq_diet.h"
 
 namespace Core {
@@ -445,9 +446,13 @@ public:
             }
         }
         const u64 position = known == WriteKnown::Position ? SentPosition() : 0;
+        // EDEN_NX2_MT_LITE_OVERLAY: a wider write (a 16-byte release: payload + timestamp) keeps
+        // the value of its first word; KnownPendingWords refuses reads past it.
+        const bool has_value =
+            value.has_value() && (size == 4 || (size > 4 && VideoCommon::MT::LiteOverlayFirst()));
         pending_writes[pending_write_count++] = {address,          address + size, position,
                                                  known,            tag,
-                                                 value.value_or(0), value.has_value() && size == 4};
+                                                 value.value_or(0), has_value};
     }
     /// What a read of the range must wait for. `drain`: everything sent; else `writers` and
     /// `position` (0: nothing).
@@ -502,6 +507,10 @@ public:
             if (!write.has_value || write.known != WriteKnown::Position) {
                 return false;
             }
+            // Only the first word of a wider write is known: the read must not reach past it.
+            if (write.end - write.begin > 4 && address + size > write.begin + 4) {
+                return false;
+            }
             out.push_back({write.begin, write.value});
         }
         return true;
@@ -526,6 +535,28 @@ public:
     }
     /// Waits until the back has run everything sent before `position`.
     void WaitForPosition(u64 position, DrainReason reason = DrainReason::Position);
+    /// EDEN_NX2_MT_LITE_QMDLEDGER: waits until the sequencer (`consumed`) ran everything sent,
+    /// not the committer (without the MT back, the back). Clears no noted write.
+    void WaitSequencer(DrainReason reason);
+
+    /// EDEN_NX2_MT_LITE_FOREIGNACQ (front): whether nothing the front noted as queued can still
+    /// write the word at `address`: no release or add release pending, no noted write over it
+    /// the back has not settled, no table overflow. (Back-only writers are the caller's part.)
+    [[nodiscard]] bool NothingPendingFor(GPUVAddr address) {
+        if (pending_write_overflow || HasPendingRelease(address)) {
+            return false;
+        }
+        if (const auto it = pending_adds.find(address); it != pending_adds.end()) {
+            if (PendingAddSum(address) != 0) {
+                return false;
+            }
+        }
+        const ReadWait wait = PendingWritesFor(address, 4);
+        if (wait.drain || wait.writers) {
+            return false;
+        }
+        return wait.position == 0 || wait.position <= SettledPosition();
+    }
 
     /// A QMD release that adds `payload` to the word at `address` was just sent to the back.
     u64 noted_adds{}; ///< EDEN_NX2_ACQUIRE_STATS

@@ -634,6 +634,24 @@ void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
 
+void GpuSplit::WaitSequencer(DrainReason reason) {
+    FlushState();
+    const u64 target = write_position;
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    if (consumed_cache >= target) {
+        CountWait(reason, false, 0);
+        return;
+    }
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
+    wait_target.store(target, std::memory_order_seq_cst);
+    Publish();
+    WaitConsumed(target);
+    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    publish_every = 8;
+    CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
+}
+
 u64 GpuSplit::ReadSettleTarget(u64 target, DrainReason reason) const {
     // EDEN_NX2_MT_LITE_WRITERS: a command list on pages no GPU work wrote, or an MME DMA read
     // under no write the front noted (it notes every release and report it sends, with its
@@ -899,6 +917,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    const bool seq_target = mt && VideoCommon::MT::LiteSeqTarget();
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
@@ -989,6 +1008,17 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
+                // EDEN_NX2_MT_LITE_SEQTARGET: the target is reached once; without clearing it
+                // every following entry stored `consumed` and sent a Mark until the front, which
+                // waits for the committer meanwhile, cleared it. A front that sets the same
+                // target again finds it consumed already.
+                if (mt && seq_target) {
+                    u64 target = wait_target.load(std::memory_order_relaxed);
+                    if (read_position >= target) {
+                        wait_target.compare_exchange_strong(target, ~u64{0},
+                                                            std::memory_order_relaxed);
+                    }
+                }
                 if (mt) {
                     mt_back->SeqMark(read_position);
                 }

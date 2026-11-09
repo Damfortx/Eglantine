@@ -15,6 +15,8 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/mt/lite4_switches.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -380,6 +382,14 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
+    // EDEN_NX2_MT_LITE_FOREIGNACQ: the front does not note copy engine releases; acquires on
+    // their words keep draining (EDEN_NX2_ACQUIRE_STATS shows them as kind 4).
+    if (type != LaunchDMA::SemaphoreType::NONE && VideoCommon::MT::LiteForeignAcquire()) {
+        VideoCommon::MT::BackReleaseTargets::Get().Note(address);
+        if (Tegra::Nx2QmdReleaseKind(address) == 0) {
+            Tegra::Nx2NoteQmdReleaseTarget(address, 3);
+        }
+    }
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
         break;

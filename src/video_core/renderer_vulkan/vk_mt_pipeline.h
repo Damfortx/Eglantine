@@ -968,6 +968,11 @@ inline void Nx2DrawPipeline::Start() {
              VideoCommon::MT::LiteAcquireNoDrain(), VideoCommon::MT::LiteWriteMark(),
              VideoCommon::MT::LiteCommitTracker(), lite_seq_lock, lite_cap_memo, lite_xlate,
              resolver_count);
+    LOG_INFO(Render_Vulkan,
+             "MT lite 4: overlay {}, foreignacq {}, asyncfences {}, qmdledger {}, seqtarget {}",
+             VideoCommon::MT::LiteOverlayFirst(), VideoCommon::MT::LiteForeignAcquire(),
+             VideoCommon::MT::LiteAsyncFences(), VideoCommon::MT::LiteQmdLedger(),
+             VideoCommon::MT::LiteSeqTarget());
 }
 
 inline void Nx2DrawPipeline::Stop() {
