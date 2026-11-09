@@ -23,6 +23,7 @@
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
+#include "video_core/renderer_vulkan/present/framegen_switches.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
@@ -197,6 +198,7 @@ try
 #endif
 
     Report();
+    FrameGenSwitches::LogOnce(); // Batch 8 U2: EDEN_NX2_FRAMEGEN
 } catch (const vk::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Vulkan initialization failed with error: {}", exception.what());
     throw std::runtime_error{fmt::format("Vulkan initialization error {}", exception.what())};

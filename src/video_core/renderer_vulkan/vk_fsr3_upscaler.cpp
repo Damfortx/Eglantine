@@ -312,10 +312,15 @@ bool Fsr3Upscaler::IsSupported(const Device& device) {
             return false;
         }
     }
-    return device.IsFormatSupported(VK_FORMAT_R32_UINT, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+    return device.IsFormatSupported(VK_FORMAT_R32_UINT,
+                                    VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+                                        VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT |
+                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
                                     FormatType::Optimal) &&
            device.IsFormatSupported(VK_FORMAT_R32G32B32A32_SFLOAT,
-                                    VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT, FormatType::Optimal) &&
+                                    VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+                                    FormatType::Optimal) &&
            device.IsFormatSupported(VK_FORMAT_R16_SNORM,
                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
                                         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,

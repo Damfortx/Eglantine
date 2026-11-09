@@ -10,6 +10,7 @@
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/present/frame_gen.h"
+#include "video_core/renderer_vulkan/present/framegen_switches.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -202,7 +203,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         shaders.emplace(device);
     }
 
-    if (unavailable || !Settings::values.frame_gen.GetValue()) {
+    if (unavailable || !FrameGenSwitches::Enabled()) {
         if (chain || fsr3_chain) {
             scheduler.Finish();
             chain.reset();
@@ -212,7 +213,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         return;
     }
 
-    if (!shaders->IsValid() && Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3) {
+    if (!shaders->IsValid() && !FrameGenSwitches::UseFsr3()) {
         unavailable = true;
         return;
     }
@@ -240,11 +241,13 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     warm_streak = warm ? warm_streak + 1 : 0;
     generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
 
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
+    const bool use_fsr3 = FrameGenSwitches::UseFsr3();
 
     if (use_fsr3 && fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
         fsr3_chain->Process(device, scheduler, *frame->image, *frame->storage_view, count);
+        // Generate() writes nothing without a valid flow; never present such a frame.
+        generated = generated && fsr3_chain->IsReady();
     } else if (chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([this, source = *frame->image, extent, count,
@@ -279,14 +282,15 @@ size_t FrameGen::GeneratedFrameCount() const {
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
+    const bool use_fsr3 = FrameGenSwitches::UseFsr3();
 
     if (use_fsr3 && fsr3_chain) {
         const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
         const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
 
         scheduler.RequestOutsideRenderPassOperationContext();
-        fsr3_chain->Generate(device, scheduler, *destination->storage_view, blend, flow_scale);
+        fsr3_chain->Generate(device, scheduler, *destination->image, *destination->storage_view,
+                             blend, flow_scale);
     } else if (chain) {
         chain->SetTarget(device, last_generations, generation, destination->index,
                          *destination->storage_view);
@@ -310,7 +314,7 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
 
     built_flow_scale = flow_scale;
 
-    if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3) {
+    if (FrameGenSwitches::UseFsr3()) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);

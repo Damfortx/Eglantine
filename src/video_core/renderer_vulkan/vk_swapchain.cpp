@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "video_core/nx2.h"
+#include "video_core/renderer_vulkan/present/framegen_switches.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
@@ -53,7 +54,7 @@ static VkPresentModeKHR ChooseSwapPresentModeBase(bool has_imm, bool has_mailbox
     Settings::VSyncMode setting = [has_imm, has_mailbox]() {
         // Choose Mailbox or Immediate if unlocked and those modes are supported
         const auto mode = Settings::values.vsync_mode.GetValue();
-        if (Settings::values.frame_gen.GetValue()) {
+        if (FrameGenSwitches::Enabled()) {
             return mode == Settings::VSyncMode::FifoRelaxed ? mode : Settings::VSyncMode::Fifo;
         }
         if (Settings::values.use_speed_limit.GetValue() &&
@@ -101,7 +102,7 @@ static VkPresentModeKHR ChooseSwapPresentModeBase(bool has_imm, bool has_mailbox
 static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
                                               bool has_fifo_relaxed, bool force_mailbox) {
     const VkPresentModeKHR mode = ChooseSwapPresentModeBase(has_imm, has_mailbox, has_fifo_relaxed);
-    if (force_mailbox && has_mailbox && !Settings::values.frame_gen.GetValue() &&
+    if (force_mailbox && has_mailbox && !FrameGenSwitches::Enabled() &&
         (mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
         return VK_PRESENT_MODE_MAILBOX_KHR;
     }

@@ -12,6 +12,7 @@
 #include "video_core/framebuffer_config.h"
 #include "video_core/present.h"
 #include "video_core/renderer_vulkan/present/filters.h"
+#include "video_core/renderer_vulkan/present/framegen_switches.h"
 #include "video_core/renderer_vulkan/present/layer.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
@@ -127,7 +128,7 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
         swapchain_view_format = current_swapchain_view_format;
     }
 
-    const bool storage_required = Settings::values.frame_gen.GetValue();
+    const bool storage_required = FrameGenSwitches::Enabled();
     if (resource_update_required) {
         WaitIdle(device);
         SetWindowAdaptPass(device);
