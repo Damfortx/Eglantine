@@ -90,6 +90,13 @@ public:
         if (auto_collect && retired.size() >= 64) {
             CollectLocked();
         }
+        pending_hint.store(retired.size(), std::memory_order_release);
+    }
+
+    /// Lock-free hint: something is retired (exact for the retiring thread; other threads may
+    /// see a stale value, which only delays or repeats a check).
+    [[nodiscard]] bool MaybePending() const noexcept {
+        return pending_hint.load(std::memory_order_acquire) != 0;
     }
 
     /// Run retired destructors whose grace period has passed. Returns how many ran.
@@ -139,6 +146,7 @@ private:
             ++freed;
         }
         retired.erase(retired.begin(), it);
+        pending_hint.store(retired.size(), std::memory_order_release);
         return freed;
     }
 
@@ -153,6 +161,7 @@ private:
     std::mutex retire_mutex;
     std::vector<std::pair<u64, std::function<void()>>> retired;
     bool auto_collect = true;
+    std::atomic<size_t> pending_hint{0};
 };
 
 /// RAII critical section of a registered reader.
