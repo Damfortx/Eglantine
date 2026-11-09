@@ -57,6 +57,9 @@ enum class PullerSite : u32 {
     AcquireNoDrain,  ///< EDEN_NX2_MT_LITE_FOREIGNACQ: nothing queued can write it, no drain
     AcquireLedger,   ///< EDEN_NX2_MT_LITE_QMDLEDGER: an in-flight QMD max release meets it
     AcquireSeqWait,  ///< EDEN_NX2_MT_LITE_QMDLEDGER: sequencer-only wait before the drain
+    PendAcquire,     ///< EDEN_NX2_MT_LITE_PENDACQ: no queued value meets it, no drain
+    PendPollLazy,    ///< EDEN_NX2_MT_LITE_PENDPOLL: resume poll with a release pending, no drain
+    PendCheckMet,    ///< EDEN_NX2_MT_LITE_PENDCHECK: a D5/D6 skip the drain found met
     Count,
 };
 void NotePullerSite(PullerSite site, bool run = false) {
@@ -77,7 +80,8 @@ void NotePullerSite(PullerSite site, bool run = false) {
     static constexpr std::array<const char*, static_cast<size_t>(PullerSite::Count)> names{
         "acquire drain", "acquire fences", "resume poll",   "sem_execute drain",
         "sem_execute fences", "sem_execute skipped", "word flush", "legacy acquire",
-        "acquire nodrain", "acquire ledger", "acquire seq wait"};
+        "acquire nodrain", "acquire ledger", "acquire seq wait", "pendacq nodrain",
+        "pendpoll lazy", "pendacq would meet"};
     std::string line;
     for (size_t i = 0; i < names.size(); ++i) {
         if (calls[i] != 0) {
@@ -169,9 +173,35 @@ void NoteRelease(GPUVAddr address, u32 payload, u64 size = 16) {
         // packed next to them (~230 a second) drain the back: EDEN_NX2_RELEASE_SIZE=0 restores
         // that (=a alternates).
         static const char size_mode = Tegra::Nx2EnvMode("EDEN_NX2_RELEASE_SIZE");
+        // EDEN_NX2_MT_LITE_OVERLAY64 / SEQPOS: a 16-byte release (not a fence) is written as a
+        // 64-bit payload by the sequencer (RasterizerVulkan::Query).
+        const bool direct =
+            size == 16 &&
+            (VideoCommon::MT::Lite6Overlay64() || VideoCommon::MT::Lite6SeqPosition()) &&
+            VideoCommon::MT::Lite6DirectPayloads();
         split.NotePendingWrite(address, Tegra::Nx2Switch(size_mode, true) ? size : 16,
-                               VideoCommon::GpuSplit::WriteKnown::Position, 0, payload);
+                               VideoCommon::GpuSplit::WriteKnown::Position,
+                               VideoCommon::MT::TagPullerRelease, payload,
+                               direct ? VideoCommon::GpuSplit::WriteDirect64 : u8{0});
     }
+}
+
+// EDEN_NX2_MT_LITE_PENDACQ / PENDPOLL: whether every write still queued for the back that the
+// front noted over the word has a known value none of which `matches`, and nothing un-noted the
+// back queued can write it (as NothingQueuedWrites): a drain could then only find it met through
+// a write nobody noted.
+template <typename Matches>
+bool PendingValuesFail(DmaPusher& dma_pusher, GPUVAddr address, const Matches& matches) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || !split.PredictAcquires() || Tegra::Nx2QmdReleaseKind(address) != 0 ||
+        VideoCommon::MT::BackReleaseTargets::Get().MayBeTarget(address)) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Tegra::Nx2IsGpuWritten(*device)) {
+        return false;
+    }
+    return split.PendingValuesFail(address, matches);
 }
 
 // The payload a release still queued for the back will write at `address`, if any (gpu_split.h).
@@ -340,6 +370,30 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                                ? 63
                                : 7;
         if ((++lazy_polls & period) != 0) {
+            return false;
+        }
+    } else if (VideoCommon::MT::Lite6PendingPoll() && split.Active() &&
+               split.HasPendingRelease(pending_acquire->address) &&
+               PendingValuesFail(dma_pusher, pending_acquire->address,
+                                 [this](u32 value) { return pending_acquire->Matches(value); })) {
+        // EDEN_NX2_MT_LITE_PENDPOLL (D6): a release is still queued, but none of the queued
+        // values meets the acquire: only the latch (a write that met it) answers between drains,
+        // which come every 8th poll (memory may still change to a queued value).
+        const bool latched = Nx2SemaphoreWaiters::Get().Latched(this);
+        if (latched) {
+            return true;
+        }
+        if ((++lazy_polls & 7) != 0) {
+            if (VideoCommon::MT::Lite6PendingCheck()) [[unlikely]] {
+                DrainBack();
+                if (Nx2SemaphoreWaiters::Get().Latched(this) ||
+                    pending_acquire->Matches(
+                        ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
+                    NotePullerSite(PullerSite::PendCheckMet);
+                    return true;
+                }
+            }
+            NotePullerSite(PullerSite::PendPollLazy);
             return false;
         }
     }
@@ -549,9 +603,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         // drain (as the old path did after it for these: ~690 in 10 s stayed unmet in title 1).
         // The waiter latch goes first, then the fences go to the back without a wait (a fence
         // callback may be what lets the CPU release the word), then one look at memory.
-        if (VideoCommon::MT::LiteForeignAcquire() &&
-            NothingQueuedWrites(dma_pusher, acquire.address)) {
-            NotePullerSite(PullerSite::AcquireNoDrain);
+        const auto suspend_without_drain = [&](int site) {
             auto& waiters = Nx2SemaphoreWaiters::Get();
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
                 waiters.Add(this, *device, acquire.value, acquire.operation);
@@ -560,8 +612,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             const bool met_now =
                 waiters.Latched(this) ||
                 acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address));
-            NoteAcquireDrain(dma_pusher, 3, static_cast<u32>(op), acquire.address, acquire.value,
-                             met_now);
+            NoteAcquireDrain(dma_pusher, site, static_cast<u32>(op), acquire.address,
+                             acquire.value, met_now);
             if (!met_now) {
                 pending_acquire = acquire;
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
@@ -569,6 +621,29 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             } else {
                 waiters.Remove(this);
             }
+        };
+        if (VideoCommon::MT::LiteForeignAcquire() &&
+            NothingQueuedWrites(dma_pusher, acquire.address)) {
+            NotePullerSite(PullerSite::AcquireNoDrain);
+            suspend_without_drain(3);
+            return;
+        }
+        // EDEN_NX2_MT_LITE_PENDACQ (D5): releases are queued for the word, but none of their
+        // (known) values meets the acquire, nor does memory now: the drain could only find it met
+        // through a write nobody noted. Suspend as above (ACQUIRE_STATS site 4).
+        if (VideoCommon::MT::Lite6PendingAcquire() &&
+            PendingValuesFail(dma_pusher, acquire.address,
+                              [&acquire](u32 value) { return acquire.Matches(value); }) &&
+            !acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+            if (VideoCommon::MT::Lite6PendingCheck()) [[unlikely]] {
+                DrainBack();
+                if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+                    NotePullerSite(PullerSite::PendCheckMet);
+                    return;
+                }
+            }
+            NotePullerSite(PullerSite::PendAcquire);
+            suspend_without_drain(4);
             return;
         }
         // EDEN_NX2_MT_LITE_QMDLEDGER: a word QMD max releases target, met after the drain without

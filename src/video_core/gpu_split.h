@@ -23,6 +23,7 @@
 #include "video_core/mt/lite3_front_switches.h"
 #include "video_core/mt/lite4_switches.h"
 #include "video_core/mt/lite5_list_switches.h"
+#include "video_core/mt/lite6_drain_switches.h"
 #include "video_core/mt/seq_diet.h"
 
 namespace Core {
@@ -480,8 +481,12 @@ public:
     /// the entry that makes it was sent), with the copy and compute writers (WaitForWriters),
     /// or only once everything sent so far has run.
     enum class WriteKnown : u8 { Position, Writers, Drain };
+    /// NotePendingWrite `flags`. WriteDirect64 (EDEN_NX2_MT_LITE_OVERLAY64/SEQPOS): a 16-byte
+    /// payload release the sequencer writes when it runs the entry (RasterizerVulkan::Query's
+    /// direct path: no fence, GPU accuracy not high): word 0 = the value, word 1 = 0.
+    static constexpr u8 WriteDirect64 = 1;
     void NotePendingWrite(GPUVAddr address, u64 size, WriteKnown known = WriteKnown::Position,
-                          u8 tag = 0, std::optional<u32> value = std::nullopt) {
+                          u8 tag = 0, std::optional<u32> value = std::nullopt, u8 flags = 0) {
         // Writes known with the writers only ever make reads of their range wait for the
         // writers, so one entry a range is enough: title 1's inline QMDs reuse their addresses
         // and, kept until a drain, overflowed the table a few times a second (every MME DMA
@@ -497,48 +502,61 @@ public:
                 }
             }
         }
-        if (pending_write_count == pending_writes.size()) {
-            // Drop the ones the back has run.
-            const u64 done = SettledPosition();
-            size_t kept = 0;
-            for (size_t i = 0; i < pending_write_count; ++i) {
-                if (pending_writes[i].known != WriteKnown::Position ||
-                    pending_writes[i].position > done) {
-                    pending_writes[kept++] = pending_writes[i];
-                }
-            }
-            pending_write_count = kept;
-            if (pending_write_count == pending_writes.size()) {
-                pending_write_overflow = true;
-                return;
-            }
-        }
         const u64 position = known == WriteKnown::Position ? SentPosition() : 0;
         // EDEN_NX2_MT_LITE_OVERLAY: a wider write (a 16-byte release: payload + timestamp) keeps
         // the value of its first word; KnownPendingWords refuses reads past it.
         const bool has_value =
             value.has_value() && (size == 4 || (size > 4 && VideoCommon::MT::LiteOverlayFirst()));
-        pending_writes[pending_write_count++] = {address,          address + size, position,
-                                                 known,            tag,
-                                                 value.value_or(0), has_value};
+        PushPendingWrite({address, address + size, position, known, tag, value.value_or(0),
+                          has_value, static_cast<u8>(size == 16 ? flags : 0)});
     }
+
+    /// EDEN_NX2_MT_LITE_I2MPOS (D4): a 3D inline upload (launch_dma) starts. Its destination is
+    /// written as the back runs the data words that follow (each entry of them rewrites it), so
+    /// the note stays open: NoteI2mData moves its position past each data entry sent, drains keep
+    /// it (data may still follow), and the next upload closes it (into the table).
+    void OpenI2mWrite(GPUVAddr address, u64 size, WriteKnown known) {
+        CloseI2mWrite();
+        open_i2m = {address, address + size, known == WriteKnown::Position ? SentPosition() : 0,
+                    known, VideoCommon::MT::TagI2m, 0, false, 0};
+        open_i2m_active = true;
+    }
+    /// D4: inline_data words were just sent to the back (one method or a multi-method run).
+    void NoteI2mData() {
+        if (open_i2m_active && open_i2m.known == WriteKnown::Position) {
+            open_i2m.position = SentPosition();
+        }
+    }
+
     /// What a read of the range must wait for. `drain`: everything sent; else `writers` and
-    /// `position` (0: nothing).
+    /// `position` (0: nothing). `settle_position`: the newest of those positions whose write the
+    /// committer makes (EDEN_NX2_MT_LITE_SEQPOS; else == position): 0, only the sequencer.
     struct ReadWait {
         bool drain;
         bool writers;
         u64 position;
+        u64 settle_position{};
+        u8 newest_tag{};       ///< Tag of the write at `position` (stats)
+        bool newest_direct{};  ///< ... a WriteDirect64 one
+        bool open_i2m{};       ///< An open I2M note overlaps (D4)
     };
     [[nodiscard]] ReadWait PendingWritesFor(GPUVAddr address, u64 size) const {
         ReadWait wait{pending_write_overflow, false, 0};
-        for (size_t i = 0; i < pending_write_count && !wait.drain; ++i) {
-            const auto& write = pending_writes[i];
+        const bool seq_pos = VideoCommon::MT::Lite6SeqPosition();
+        const auto add = [&](const PendingWrite& write) {
             if (!(address < write.end && write.begin < address + size)) {
-                continue;
+                return;
             }
             switch (write.known) {
             case WriteKnown::Position:
+                if (write.position >= wait.position) {
+                    wait.newest_tag = write.tag;
+                    wait.newest_direct = (write.flags & WriteDirect64) != 0;
+                }
                 wait.position = (std::max)(wait.position, write.position);
+                if (!seq_pos || (write.flags & WriteDirect64) == 0) {
+                    wait.settle_position = (std::max)(wait.settle_position, write.position);
+                }
                 break;
             case WriteKnown::Writers:
                 wait.writers = true;
@@ -547,23 +565,43 @@ public:
                 wait.drain = true;
                 break;
             }
+        };
+        for (size_t i = 0; i < pending_write_count && !wait.drain; ++i) {
+            add(pending_writes[i]);
+        }
+        if (open_i2m_active && !wait.drain) {
+            wait.open_i2m = address < open_i2m.end && open_i2m.begin < address + size;
+            add(open_i2m);
         }
         return wait;
     }
     /// For a read of [address, address + size): the words that writes the back hasn't run yet
     /// will hold, in the order they were noted, if all of those writes have a known value.
     /// Returns false when one doesn't (the read must wait for it). Writes the back has run
-    /// are left to memory, which may have been written again since.
+    /// are left to memory, which may have been written again since. `refusal` (stats): 1 a write
+    /// without a value, 2 the read reaches past a wider write's known words.
     struct KnownWord {
         GPUVAddr address;
         u32 value;
     };
-    [[nodiscard]] bool KnownPendingWords(GPUVAddr address, u64 size, std::vector<KnownWord>& out) {
+    [[nodiscard]] bool KnownPendingWords(GPUVAddr address, u64 size, std::vector<KnownWord>& out,
+                                         u8* refusal = nullptr) {
         out.clear();
         if (pending_write_overflow) {
             return false;
         }
         const u64 done = SettledPosition();
+        const bool overlay64 = VideoCommon::MT::Lite6Overlay64();
+        const auto refuse = [&](u8 why) {
+            if (refusal != nullptr) {
+                *refusal = why;
+            }
+            return false;
+        };
+        if (open_i2m_active && address < open_i2m.end && open_i2m.begin < address + size &&
+            (open_i2m.known != WriteKnown::Position || open_i2m.position > done)) {
+            return refuse(1);
+        }
         for (size_t i = 0; i < pending_write_count; ++i) {
             const auto& write = pending_writes[i];
             if (!(address < write.end && write.begin < address + size)) {
@@ -573,13 +611,62 @@ public:
                 continue;
             }
             if (!write.has_value || write.known != WriteKnown::Position) {
-                return false;
+                return refuse(1);
+            }
+            // EDEN_NX2_MT_LITE_OVERLAY64 (D2): a direct 16-byte payload release also writes word
+            // 1 (0, the payload's high half).
+            if (overlay64 && (write.flags & WriteDirect64) != 0) {
+                if (address + size > write.begin + 8) {
+                    return refuse(2);
+                }
+                out.push_back({write.begin, write.value});
+                out.push_back({write.begin + 4, 0});
+                continue;
             }
             // Only the first word of a wider write is known: the read must not reach past it.
             if (write.end - write.begin > 4 && address + size > write.begin + 4) {
-                return false;
+                return refuse(2);
             }
             out.push_back({write.begin, write.value});
+        }
+        return true;
+    }
+    /// EDEN_NX2_MT_LITE_PENDACQ (D5/D6): whether every write the front noted as still queued over
+    /// the word at `address` has a known value there and `meets` none of them: no table overflow,
+    /// no queued add, no writer/drain-known or valueless write, no open I2M note over it. Writes
+    /// the back has run are memory's part (read memory after this).
+    template <typename Meets>
+    [[nodiscard]] bool PendingValuesFail(GPUVAddr address, const Meets& meets) {
+        if (pending_write_overflow || PendingAddSum(address) != 0) {
+            return false;
+        }
+        const u64 done = SettledPosition();
+        if (open_i2m_active && address < open_i2m.end && open_i2m.begin < address + 4 &&
+            (open_i2m.known != WriteKnown::Position || open_i2m.position > done)) {
+            return false;
+        }
+        for (size_t i = 0; i < pending_write_count; ++i) {
+            const auto& write = pending_writes[i];
+            if (!(address < write.end && write.begin < address + 4)) {
+                continue;
+            }
+            if (write.known == WriteKnown::Position && write.position <= done) {
+                continue;
+            }
+            if (write.known != WriteKnown::Position || !write.has_value) {
+                return false;
+            }
+            u32 value;
+            if (write.begin == address) {
+                value = write.value;
+            } else if ((write.flags & WriteDirect64) != 0 && write.begin + 4 == address) {
+                value = 0;
+            } else {
+                return false;
+            }
+            if (meets(value)) {
+                return false;
+            }
         }
         return true;
     }
@@ -592,6 +679,9 @@ public:
                 tags |= 1U << write.tag;
             }
         }
+        if (open_i2m_active && address < open_i2m.end && open_i2m.begin < address + size) {
+            tags |= 1U << open_i2m.tag;
+        }
         return tags;
     }
     [[nodiscard]] bool PendingWriteOverflow() const {
@@ -602,7 +692,13 @@ public:
         return wait.drain || wait.writers || wait.position != 0;
     }
     /// Waits until the back has run everything sent before `position`.
-    void WaitForPosition(u64 position, DrainReason reason = DrainReason::Position);
+    void WaitForPosition(u64 position, DrainReason reason = DrainReason::Position) {
+        WaitForPosition(position, position, reason);
+    }
+    /// EDEN_NX2_MT_LITE_SEQPOS (D3): the sequencer past `position`, the committer only as far as
+    /// `settle_position` needs (0: not at all; ReadWait::settle_position). Returns whether it
+    /// found the back behind.
+    bool WaitForPosition(u64 position, u64 settle_position, DrainReason reason);
     /// EDEN_NX2_MT_LITE_QMDLEDGER: waits until the sequencer (`consumed`) ran everything sent,
     /// not the committer (without the MT back, the back). Clears no noted write.
     void WaitSequencer(DrainReason reason);
@@ -854,13 +950,55 @@ private:
         GPUVAddr end;
         u64 position;
         WriteKnown known;
-        u8 tag; ///< Who noted it (EDEN_NX2_DMA_READ_WHY): 1 I2M, 2 3D report, 0 other.
+        u8 tag; ///< Who noted it (VideoCommon::MT::Lite6WriteTag; EDEN_NX2_DMA_READ_WHY)
         u32 value;      ///< The word it writes, when has_value.
         bool has_value; ///< A 4-byte write whose value the front knows (a fence release).
+        u8 flags;       ///< WriteDirect64
     };
     std::array<PendingWrite, 256> pending_writes{};
     size_t pending_write_count{};
     bool pending_write_overflow{};
+    /// EDEN_NX2_MT_LITE_I2MPOS: the 3D inline upload whose data words may still come.
+    PendingWrite open_i2m{};
+    bool open_i2m_active{};
+    void PushPendingWrite(const PendingWrite& write) {
+        if (pending_write_count == pending_writes.size()) {
+            // Drop the ones the back has run.
+            const u64 done = SettledPosition();
+            size_t kept = 0;
+            for (size_t i = 0; i < pending_write_count; ++i) {
+                if (pending_writes[i].known != WriteKnown::Position ||
+                    pending_writes[i].position > done) {
+                    pending_writes[kept++] = pending_writes[i];
+                }
+            }
+            pending_write_count = kept;
+            if (pending_write_count == pending_writes.size()) {
+                pending_write_overflow = true;
+                return;
+            }
+        }
+        pending_writes[pending_write_count++] = write;
+    }
+    /// D4, at a drain (everything sent has run): an open note known only by drains becomes known
+    /// by position (the data words sent from now on move it).
+    void DrainedOpenI2m() {
+        if (open_i2m_active && open_i2m.known == WriteKnown::Drain) {
+            open_i2m.known = WriteKnown::Position;
+            open_i2m.position = write_position;
+        }
+    }
+    /// D4: the open I2M note goes into the table (no more data for it), unless already run.
+    void CloseI2mWrite() {
+        if (!open_i2m_active) {
+            return;
+        }
+        open_i2m_active = false;
+        if (open_i2m.known == WriteKnown::Position && open_i2m.position <= SettledPosition()) {
+            return;
+        }
+        PushPendingWrite(open_i2m);
+    }
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

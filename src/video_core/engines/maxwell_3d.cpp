@@ -980,7 +980,18 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
         const u64 lines = std::max<u32>(upload.line_count, 1);
         const u64 size = pitch ? u64{upload.dest.pitch} * (lines - 1) + upload.line_length_in
                                : ~u64{0} >> 1;
-        split.NotePendingWrite(pitch ? upload.dest.Address() : 0, size, known, 1);
+        // EDEN_NX2_MT_LITE_I2MPOS: the note stays open while data words come (NoteI2mData).
+        if (VideoCommon::MT::Lite6I2mPosition()) {
+            split.OpenI2mWrite(pitch ? upload.dest.Address() : 0, size, known);
+        } else {
+            split.NotePendingWrite(pitch ? upload.dest.Address() : 0, size, known,
+                                   VideoCommon::MT::TagI2m);
+        }
+    }
+    if (method == MAXWELL3D_REG_INDEX(inline_data) && sent) [[unlikely]] {
+        if (VideoCommon::MT::Lite6I2mPosition()) {
+            split.NoteI2mData();
+        }
     }
     if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) [[unlikely]] {
         // Every report but an acquire writes up to 16 bytes there.
@@ -988,18 +999,64 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
             // EDEN_NX2_MT_LITE_OVERLAY: a payload release (report Payload, no reduction) writes
             // the payload register's value as its first word.
             const u32 query = fs.regs[method];
-            const bool payload_release =
-                sent && VideoCommon::MT::LiteOverlayFirst() &&
-                (query & 3) == static_cast<u32>(Regs::ReportSemaphore::Operation::Release) &&
+            const bool payload_report =
                 ((query >> 23) & 0x1f) == static_cast<u32>(Regs::ReportSemaphore::Report::Payload) &&
                 ((query >> 3) & 1) == 0;
+            const bool release =
+                (query & 3) == static_cast<u32>(Regs::ReportSemaphore::Operation::Release);
+            const bool payload_release =
+                sent && VideoCommon::MT::LiteOverlayFirst() && release && payload_report;
+            // EDEN_NX2_MT_LITE_REPORTSIZE: a short query writes one 32-bit word (no timestamp).
+            const bool short_query = ((query >> 28) & 1) != 0;
+            const bool report4 = short_query && VideoCommon::MT::Lite6ReportSize();
+            // EDEN_NX2_MT_LITE_OVERLAY64 / SEQPOS: a 16-byte payload release (no short query: not
+            // a fence) is written as a 64-bit payload by the sequencer (RasterizerVulkan::Query).
+            const bool direct = sent && !short_query && release && payload_report &&
+                                (VideoCommon::MT::Lite6Overlay64() ||
+                                 VideoCommon::MT::Lite6SeqPosition()) &&
+                                VideoCommon::MT::Lite6DirectPayloads();
+            if (report4 && VideoCommon::MT::Lite6Stats()) [[unlikely]] {
+                ++VideoCommon::MT::Lite6PositionStats::Get().report4;
+            }
             split.NotePendingWrite(
                 (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
                     fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)],
-                16, known, 2,
+                report4 ? 4 : 16, known,
+                payload_report ? VideoCommon::MT::TagPayloadReport
+                               : VideoCommon::MT::TagCounterReport,
                 payload_release
                     ? std::optional<u32>{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)]}
-                    : std::nullopt);
+                    : std::nullopt,
+                direct ? VideoCommon::GpuSplit::WriteDirect64 : u8{0});
+        }
+    }
+}
+
+// EDEN_NX2_MT_LITE_REGDEDUP (video_core/mt/regdedup.h): the latch-only table (built once: not
+// executable, no front-side handling, not an instance loop method, not the MME DMA read
+// triggers 0x157/0x158, not a puller method), and the front's registers once it exists.
+void Maxwell3D::RegDedupArm() {
+    namespace RD = VideoCommon::MT::RegDedup;
+    static const RD::LatchTable table = [this] {
+        RD::LatchTable latch;
+        for (u32 m = 0x40; m < RD::LatchTable::Size; ++m) {
+            if (execution_mask[m] || IsMethodExecutable(m) || FrontHandledOutsideDrawManager(m) ||
+                DrawManager::IsInstanceLoopMethod(m) || m == 0x157 || m == 0x158) {
+                continue;
+            }
+            latch.Set(m);
+        }
+        LOG_INFO(HW_GPU, "Register dedup: {} latch-only 3D registers", latch.Count());
+        return latch;
+    }();
+    regdedup_latch = &table;
+    if (front && regdedup_front.latch == nullptr) {
+        regdedup_front.latch = &table; // Tried (it stays unarmed without skip_same).
+        if (front->skip_same && RD::Armable()) {
+            regdedup_front.regs = front->regs.data();
+            regdedup_front.shadow = front->shadow.data();
+            regdedup_front.control = &front->control;
+            regdedup_front.draw_pending = &front->draw_pending;
         }
     }
 }
@@ -1328,6 +1385,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    if (method == MAXWELL3D_REG_INDEX(inline_data) && VideoCommon::MT::Lite6I2mPosition())
+        [[unlikely]] {
+        split.NoteI2mData(); // EDEN_NX2_MT_LITE_I2MPOS: upload data words just sent
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1419,6 +1480,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                              u32 count) {
+    VideoCommon::MT::Lite6LogOnce();
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
@@ -1468,11 +1530,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     static const char overlay_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_OVERLAY");
     static std::vector<VideoCommon::GpuSplit::KnownWord> known_words;
     known_words.clear();
+    u8 overlay_refusal = 0; // EDEN_NX2_MT_LITE stats: why KnownPendingWords said no
     const bool overlay_first =
         VideoCommon::MT::LiteOverlayFirst() && !always_drain && !on_gpu_written &&
         !pending.drain && !pending.writers && pending.position != 0 &&
         Tegra::Nx2Switch(overlay_mode, true) &&
-        split.KnownPendingWords(source, read_bytes, known_words);
+        split.KnownPendingWords(source, read_bytes, known_words, &overlay_refusal);
     if (!overlay_first) {
         known_words.clear();
     }
@@ -1489,7 +1552,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                          (!always_drain && !on_gpu_written && !pending.drain && !pending.writers &&
                           pending.position != 0 && !partial &&
                           Tegra::Nx2Switch(overlay_mode, true) &&
-                          split.KnownPendingWords(source, read_bytes, known_words));
+                          split.KnownPendingWords(source, read_bytes, known_words,
+                                                  &overlay_refusal));
     if (!overlay) {
         known_words.clear();
     }
@@ -1522,18 +1586,26 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         n_drain += pending.drain && !split.PendingWriteOverflow() ? 1 : 0;
         n_writers += pending.writers ? 1 : 0;
         n_position += pending.position != 0 ? 1 : 0;
-        static u64 n_tag[3]{};
+        // Tags: VideoCommon::MT::Lite6WriteTag (reports: counter 2, payload 3).
+        static std::array<u64, VideoCommon::MT::TagCount> n_tag{};
         const u32 tags = split.PendingWriteTags(source, read_bytes);
-        for (u32 t = 0; t < 3; ++t) {
+        for (u32 t = 0; t < VideoCommon::MT::TagCount; ++t) {
             n_tag[t] += (tags >> t) & 1;
         }
         if (std::chrono::steady_clock::now() - why_window > std::chrono::seconds{10}) {
             LOG_INFO(HW_GPU, "MME DMA read waits in 10 s: {} reads, {} GPU-written, {} table "
                      "overflow, {} drain-known writes, {} writers, {} positions (I2M {}, "
-                     "report {}, other {}); last {:#x} {} bytes",
-                     n_total, n_gpu, n_overflow, n_drain, n_writers, n_position, n_tag[1],
-                     n_tag[2], n_tag[0], source, read_bytes);
-            n_tag[0] = n_tag[1] = n_tag[2] = 0;
+                     "report {} (counter {}, payload {}), puller release {}, qmd {}, other {}); "
+                     "last {:#x} {} bytes",
+                     n_total, n_gpu, n_overflow, n_drain, n_writers, n_position,
+                     n_tag[VideoCommon::MT::TagI2m],
+                     n_tag[VideoCommon::MT::TagCounterReport] +
+                         n_tag[VideoCommon::MT::TagPayloadReport],
+                     n_tag[VideoCommon::MT::TagCounterReport],
+                     n_tag[VideoCommon::MT::TagPayloadReport],
+                     n_tag[VideoCommon::MT::TagPullerRelease], n_tag[VideoCommon::MT::TagQmd],
+                     n_tag[VideoCommon::MT::TagOther], source, read_bytes);
+            n_tag = {};
             n_total = n_gpu = n_overflow = n_drain = n_writers = n_position = 0;
             why_window = std::chrono::steady_clock::now();
         }
@@ -1569,8 +1641,35 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
         return true;
     };
+    // EDEN_NX2_GPU_PROFILE / EDEN_NX2_PULLER_STATS: position waits by kind (lite 6 line).
+    const bool lite6_stats = VideoCommon::MT::Lite6Stats();
+    if (lite6_stats) [[unlikely]] {
+        auto& stats = VideoCommon::MT::Lite6PositionStats::Get();
+        stats.refused_no_value += overlay_refusal == 1 ? 1 : 0;
+        stats.refused_past_known += overlay_refusal == 2 ? 1 : 0;
+        stats.open_i2m += pending.open_i2m ? 1 : 0;
+        stats.overlay_reads += overlay ? 1 : 0;
+        stats.writers_only += partial && pending.position == 0 ? 1 : 0;
+        stats.MaybeLog();
+    }
     if (partial) {
-        split.WaitForPosition(pending.position);
+        if (pending.position != 0) {
+            // EDEN_NX2_MT_LITE_SEQPOS: the committer only for the writes it makes; with writers
+            // over the read (QMD release words, written by fences) as far as before.
+            const u64 settle = pending.writers ? pending.position : pending.settle_position;
+            const u64 begin = lite6_stats ? VideoCommon::Nx2Profile::Now() : 0;
+            const bool waited = split.WaitForPosition(
+                pending.position, settle, VideoCommon::GpuSplit::DrainReason::Position);
+            if (lite6_stats) [[unlikely]] {
+                auto& stats = VideoCommon::MT::Lite6PositionStats::Get();
+                stats.Note(VideoCommon::MT::Lite6PositionStats::KindOf(pending.newest_tag,
+                                                                       pending.newest_direct),
+                           settle == 0, waited,
+                           waited ? VideoCommon::Nx2Profile::Now() - begin : 0);
+            }
+        } else {
+            split.WaitForPosition(0);
+        }
         split.WaitForWriters(VideoCommon::GpuSplit::DrainReason::WritersDmaRead);
         if (check) [[unlikely]] {
             memory_manager.ReadBlockUnsafe(source, before.data(), checked * sizeof(u32));

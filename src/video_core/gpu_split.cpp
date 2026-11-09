@@ -584,6 +584,7 @@ void GpuSplit::Drain(DrainReason reason) {
     // Everything sent so far has run once this returns: so have the writes it noted.
     pending_write_count = 0;
     pending_write_overflow = false;
+    DrainedOpenI2m();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position && SettledPosition() >= write_position && BackQuiet()) {
         CountWait(reason, false, 0);
@@ -613,30 +614,37 @@ void GpuSplit::Drain(DrainReason reason) {
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
 
-void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
+bool GpuSplit::WaitForPosition(u64 position, u64 settle_position, DrainReason reason) {
+    ReleaseFrontHold(HoldWait); // W1 GPUPARAM v2 front hold
     FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
     // EDEN_NX2_MT_LITE_DRAIN: the committer only up to its guest writes queued before `position`
-    // (ReadSettleTarget, read once `consumed` passed it).
+    // (ReadSettleTarget, read once `consumed` passed it). EDEN_NX2_MT_LITE_SEQPOS: only up to
+    // the writes the committer makes (`settle_position`, 0: none; the sequencer made the rest).
     const bool lite = MtActive() && LiteDrainReason(reason);
+    const auto settle_target = [&] {
+        return lite ? ReadSettleTarget(settle_position, reason) : settle_position;
+    };
     if (consumed_cache >= position &&
-        SettledPosition() >= (lite ? ReadSettleTarget(position, reason) : position)) {
+        (settle_position == 0 || SettledPosition() >= settle_target())) {
         CountWait(reason, false, 0);
-        return;
+        return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     wait_target.store(position, std::memory_order_seq_cst);
     Publish();
     WaitConsumed(position);
-    if (MtActive()) {
-        TimedWaitSettled(lite ? ReadSettleTarget(position, reason) : position);
+    if (MtActive() && settle_position != 0) {
+        TimedWaitSettled(settle_target());
     }
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
+    return true;
 }
 
 void GpuSplit::WaitSequencer(DrainReason reason) {
+    ReleaseFrontHold(HoldWait); // W1 GPUPARAM v2 front hold
     FlushState();
     const u64 target = write_position;
     consumed_cache = consumed.load(std::memory_order_acquire);
@@ -690,6 +698,7 @@ void GpuSplit::DrainToSettleTarget(DrainReason reason) {
     // committer makes are inside the settle target).
     pending_write_count = 0;
     pending_write_overflow = false;
+    DrainedOpenI2m();
     const u64 target = write_position;
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target &&

@@ -1228,7 +1228,7 @@ void KeplerCompute::FrontMirrorInlineQmd(FrontState& fs) {
     std::memcpy(entry.descriptor.data(), fs.registers.data() + 0xc8, sizeof(entry.descriptor));
     entry.position = split.SentPosition();
     split.NotePendingWrite(address, sizeof(entry.descriptor),
-                           VideoCommon::GpuSplit::WriteKnown::Writers);
+                           VideoCommon::GpuSplit::WriteKnown::Writers, VideoCommon::MT::TagQmd);
     if ((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12))) {
         const u32 previous = fs.registers[0xad];
         fs.registers[0xad] = static_cast<u32>(address >> 8);
@@ -1276,7 +1276,8 @@ void KeplerCompute::FrontMirrorQmd(FrontState& fs, u32 method, u32 argument) {
                 // drains a second until these were predicted (GpuSplit::PendingAddSum).
                 split.NoteAddRelease(address, payload);
             }
-            split.NotePendingWrite(address, 4, VideoCommon::GpuSplit::WriteKnown::Writers);
+            split.NotePendingWrite(address, 4, VideoCommon::GpuSplit::WriteKnown::Writers,
+                                   VideoCommon::MT::TagQmd);
             return true;
         },
         [](const auto&) { return true; }));
