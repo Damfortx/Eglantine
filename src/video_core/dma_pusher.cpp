@@ -302,6 +302,9 @@ bool DmaPusher::Step() {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
             DumpGpuWrittenList(header.addr, commands, 1);
+            if (VideoCommon::MT::ListDump::Enabled()) {
+                RecordListDump(header, commands, 1);
+            }
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
@@ -311,6 +314,9 @@ bool DmaPusher::Step() {
             RecordParsedEntry(header, commands);
             if (gpu_written) {
                 DumpGpuWrittenList(header.addr, commands, 2);
+                if (VideoCommon::MT::ListDump::Enabled()) {
+                    RecordListDump(header, commands, 2);
+                }
             }
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
@@ -816,6 +822,9 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         rasterizer == nullptr) {
         return false;
     }
+    if (VideoCommon::MT::ListDump::Enabled()) {
+        list_dump.fetch.sampled = false;
+    }
     const GPUVAddr end = address + u64{count} * sizeof(u32);
     bool written = false;
     bool new_page = false;
@@ -851,27 +860,37 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     // Statistics (EDEN_NX2_GPU_PROFILE, EDEN_NX2_LIST_STATS=1): positions before the wait.
     const bool stats = VideoCommon::Nx2Profile::Enabled() || VideoCommon::MT::ListStatsFull();
     const bool full_stats = VideoCommon::MT::ListStatsFull();
+    // EDEN_NX2_LIST_DUMP: the same positions for a sampled fetch.
+    const bool dump = VideoCommon::MT::ListDump::Enabled() && list_dump.Sample();
     u64 consumed_before = 0;
     u64 settled_before = 0;
     u64 writers_target = 0;
     std::array<u8, 4> state_before{};
-    if (stats) {
-        auto& counters = list_stats;
-        ++counters.fetches;
-        counters.new_pages += new_page ? 1 : 0;
-        counters.multi_page += page_count > 1 ? 1 : 0;
+    if (stats || dump) {
         if (split.Active()) {
             writers_target = split.WritersTarget();
             consumed_before = split.ConsumedPosition();
             settled_before = split.SettledPosition();
         }
-        if (full_stats) {
+        if (full_stats || dump) {
             for (size_t i = 0; i < page_count; ++i) {
                 state_before[i] = rasterizer->PeekGpuWrittenCommandList(pages[i]);
+            }
+        }
+    }
+    if (stats) {
+        auto& counters = list_stats;
+        ++counters.fetches;
+        counters.new_pages += new_page ? 1 : 0;
+        counters.multi_page += page_count > 1 ? 1 : 0;
+        if (full_stats) {
+            for (size_t i = 0; i < page_count; ++i) {
                 ++counters.state_before[std::min<size_t>(state_before[i], 4)];
             }
         }
     }
+    const auto wait_start = dump ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
 
     // EDEN_NX2_MT_LITE_LISTKNOWN (L25): every page trusted as a CPU list page, and no writer the
     // sequencer captured on them still uncommitted: no writer wait.
@@ -900,6 +919,12 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
             waited = split.WaitForWriters();
         }
     }
+
+    const u64 wait_ns =
+        dump ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - wait_start)
+                                    .count())
+             : 0;
 
     command_headers.resize_destructive(count);
     std::array<u8, 4> results{};
@@ -947,6 +972,24 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         ++counters.results[!ok ? 2 : copied ? 1 : 0];
     }
 
+    if (dump) {
+        auto& fetch = list_dump.fetch;
+        fetch.ok = ok;
+        fetch.new_page = new_page;
+        fetch.waited = waited;
+        fetch.skipped = skipped;
+        fetch.shortened = shortened;
+        fetch.page_count = static_cast<u8>(page_count);
+        fetch.writer_kind = split.Active() ? split.LastWriterKind() : u8{6};
+        fetch.results = results;
+        fetch.state_before = state_before;
+        fetch.page_bound = page_bound();
+        fetch.writers_target = writers_target;
+        fetch.consumed_before = consumed_before;
+        fetch.settled_before = settled_before;
+        fetch.wait_ns = wait_ns;
+    }
+
     // L25 bookkeeping: a read with the writers waited for confirms or bans its pages.
     if (mt && VideoCommon::MT::LiteListKnown() && !skipped && pages_fit) {
         for (size_t i = 0; i < page_count; ++i) {
@@ -991,6 +1034,75 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     }
     (void)waited;
     return ok;
+}
+
+void DmaPusher::RecordListDump(const CommandListHeader& header,
+                               std::span<const CommandHeader> commands, u32 path) {
+    if (!list_dump.fetch.sampled) {
+        return;
+    }
+    const CommandList& list = dma_pushbuffer.front();
+    VideoCommon::MT::ListDump::Entry entry{};
+    entry.address = header.addr;
+    entry.header_raw = header.raw;
+    entry.path = path;
+    entry.channel = channel_state.bind_id;
+    entry.subindex = static_cast<u32>(dma_pushbuffer_subindex);
+    entry.entries = static_cast<u32>(list.command_lists.size());
+    if (dma_pushbuffer_subindex > 0) {
+        const CommandListHeader& prev = list.command_lists[dma_pushbuffer_subindex - 1];
+        entry.prev_address = prev.addr;
+        entry.prev_size = static_cast<u32>(prev.size);
+    }
+    if (dma_pushbuffer_subindex + 1 < list.command_lists.size()) {
+        const CommandListHeader& next = list.command_lists[dma_pushbuffer_subindex + 1];
+        entry.next_address = next.addr;
+        entry.next_size = static_cast<u32>(next.size);
+    }
+    entry.resume_offset = static_cast<u32>(command_resume_offset);
+    entry.frame = g_nx2_presents.load(std::memory_order_relaxed);
+    Engines::Maxwell3D* maxwell3d = nullptr;
+    for (u32 i = 0; i < max_subchannels; ++i) {
+        entry.engines[i] =
+            subchannels[i] != nullptr ? static_cast<u8>(subchannel_type[i]) : u8{0xff};
+        if (maxwell3d == nullptr && subchannels[i] != nullptr &&
+            subchannel_type[i] == Engines::EngineTypes::Maxwell3D) {
+            maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[i]);
+        }
+    }
+    if (dma_state.method_count != 0) {
+        entry.carry_method = dma_state.method;
+        entry.carry_subchannel = dma_state.subchannel;
+        entry.carry_count = dma_state.method_count;
+        entry.carry_mode =
+            dma_increment_once ? 'O' : dma_state.non_incrementing ? 'N' : 'I';
+    }
+    // Diagnostic read of the native (Turing) macro code: the macro index's start and the words
+    // up to the next macro's start (at most 256 instructions).
+    const auto macro = [maxwell3d](u32 index) -> std::pair<u32, std::span<const u32>> {
+        if (maxwell3d == nullptr) {
+            return {0, {}};
+        }
+        auto& engine = maxwell3d->GetNativeMacroEngine();
+        const auto positions = maxwell3d->GetNativeMacroPositions();
+        const u32 start = positions[index % positions.size()];
+        if (!engine.native_turing) {
+            return {start, {}};
+        }
+        u32 end = start + 256;
+        for (const u32 position : positions) {
+            if (position > start && position < end) {
+                end = position;
+            }
+        }
+        const size_t first = std::min<size_t>(size_t{start} * 3, engine.native_code.size());
+        const size_t last = std::min<size_t>(size_t{end} * 3, engine.native_code.size());
+        return {start, std::span<const u32>{engine.native_code.data() + first, last - first}};
+    };
+    list_dump.Record(entry,
+                     std::span<const u32>{reinterpret_cast<const u32*>(commands.data()),
+                                          commands.size()},
+                     macro);
 }
 
 bool DmaPusher::ReadGpuWrittenChunks(GPUVAddr address, u32 count, u8* out,

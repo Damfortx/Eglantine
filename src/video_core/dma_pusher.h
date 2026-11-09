@@ -22,6 +22,7 @@
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
 #include "video_core/mt/lite5_list_switches.h"
+#include "video_core/mt/list_dump.h"
 
 namespace Core {
 class System;
@@ -233,6 +234,10 @@ public:
     /// EDEN_NX2_MT_LITE_LISTKNOWN (L25) and the list statistics (docs/mt-lite-plan5.md).
     VideoCommon::MT::ListTrust list_trust;
     VideoCommon::MT::ListStats list_stats;
+    /// EDEN_NX2_LIST_DUMP: sampled GPU-written list records (video_core/mt/list_dump.h).
+    VideoCommon::MT::ListDump list_dump;
+    void RecordListDump(const CommandListHeader& header, std::span<const CommandHeader> commands,
+                        u32 path);
     Common::ScratchBuffer<CommandHeader> check_headers;
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
