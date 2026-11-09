@@ -709,6 +709,12 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     is_proprietary_driver = maxwell3d->GetNativeMacroEngine().native_turing || texture_bound == 2;
     has_hle_engine_state =
         maxwell3d->engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro;
+    // GPU params v2: a fixed table from (hint, bank), never the mutable replace_table. The
+    // Vulkan cache sets it again from the pipeline key (the same value: both read the engine at
+    // the draw, the key on the back/sequencer, this while the sequencer waits for the build).
+    if (maxwell3d->engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw) {
+        gpuparam_draw_bank = maxwell3d->gpuparam_cb_bank;
+    }
 }
 
 u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
@@ -724,6 +730,20 @@ u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
 
 std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffer(u32 bank,
                                                                                   u32 offset) {
+    if (gpuparam_draw_bank != ~0U) {
+        // GPU params v2 (docs/mt-lite-plan6.md, W1): cbuf[bank][0x640] = base vertex,
+        // [0x644] = base instance, as built-ins in vertex stages only (other stages have none:
+        // they keep the memory read, counted by the constant propagation pass).
+        if (bank != gpuparam_draw_bank || (offset != 0x640 && offset != 0x644) ||
+            (stage != Shader::Stage::VertexA && stage != Shader::Stage::VertexB)) {
+            return std::nullopt;
+        }
+        const Shader::ReplaceConstant value = offset == 0x640 ? Shader::ReplaceConstant::BaseVertex
+                                                              : Shader::ReplaceConstant::BaseInstance;
+        cbuf_replacements.emplace((static_cast<u64>(bank) << 32) | static_cast<u64>(offset),
+                                  value);
+        return value;
+    }
     if (!has_hle_engine_state) {
         return std::nullopt;
     }

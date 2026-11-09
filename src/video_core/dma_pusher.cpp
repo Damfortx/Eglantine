@@ -106,6 +106,8 @@ void DmaPusher::DispatchCalls() {
         }
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        // GPU params v2: a held group of draws goes out before the submission ends.
+        split.ReleaseFrontHold(VideoCommon::GpuSplit::HoldDispatchEnd);
         split.Defer([gpu = &system.GPU()] {
             gpu->FlushCommands();
             gpu->OnCommandListEnd();

@@ -894,6 +894,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        // GPU params v2: the replacements come from the record; the hint only feeds the log of
+        // reads those pipelines keep (Environment::GpuParamMemoryReads).
+        if (key.state.app_stage == Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw) {
+            for (FileEnvironment& env : envs) {
+                env.SetGpuParamDrawBank(key.state.gpuparam_bank.Value());
+            }
+        }
 
         // Task/mesh pipelines live in their own file, with their mesh registers; vulkan.bin
         // doesn't carry those, so skip any it holds.
@@ -1314,6 +1321,53 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     return nullptr;
 }
 
+namespace {
+// GPU params v2 (docs/mt-lite-plan6.md, W1): pipelines translated for draws with the hint
+// OnGpuParamDraw (their vertex stages read cbuf[bank][0x640/0x644] as BaseVertex/BaseInstance).
+// The draw's memory holds 0 in those words, so a stage that still reads them from memory
+// (fragment/geometry/tessellation, sub-word or two-word reads) or reads that bank at a dynamic
+// offset sees 0 there: logged once per pipeline (first 64), and a count with the first hashes.
+// Runs on the committer, the build threads at boot and the background prebuild threads.
+void ReportGpuParamPipeline(const GraphicsPipelineCacheKey& key,
+                            std::span<Shader::Environment* const> envs) {
+    static std::mutex mutex;
+    static u32 built{};
+    static u32 with_memory_reads{};
+    static std::string first_hashes;
+    const u64 hash = key.Hash();
+    std::scoped_lock lock{mutex};
+    ++built;
+    bool reads_memory = false;
+    for (const Shader::Environment* const env : envs) {
+        const u32 memory = env->GpuParamMemoryReads();
+        const u32 dynamic = env->GpuParamDynamicReads();
+        if (memory == 0 && dynamic == 0) {
+            continue;
+        }
+        reads_memory = true;
+        if (with_memory_reads < 64) {
+            LOG_WARNING(HW_GPU,
+                        "GPU params v2: pipeline {:016x} stage {} reads the draw parameter words "
+                        "from memory ({} reads of cb{}[0x640..0x648), {} at a dynamic offset)",
+                        hash, static_cast<u32>(env->ShaderStage()), memory,
+                        key.state.gpuparam_bank.Value(), dynamic);
+        }
+    }
+    if (reads_memory) {
+        ++with_memory_reads;
+    }
+    if (built <= 8) {
+        first_hashes += fmt::format(" {:016x}", hash);
+    }
+    if (built <= 8 || (built & (built - 1)) == 0) {
+        LOG_INFO(HW_GPU,
+                 "GPU params v2: pipeline {:016x} built with draw parameter built-ins (cb{}): {} "
+                 "such pipelines, {} with stages reading the words from memory; first:{}",
+                 hash, key.state.gpuparam_bank.Value(), built, with_memory_reads, first_hashes);
+    }
+}
+} // Anonymous namespace
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
@@ -1435,6 +1489,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    if (key.state.app_stage == Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw) {
+        ReportGpuParamPipeline(key, envs);
+    }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
@@ -1498,6 +1555,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    // GPU params v2: the fixed replacement table follows the key (hint + bank), the same value
+    // the environments took from the engine at the draw.
+    {
+        const bool gpuparam = graphics_key.state.app_stage ==
+                              Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw;
+        const u32 bank = gpuparam ? graphics_key.state.gpuparam_bank.Value() : ~0U;
+        for (Shader::Environment* const env : environments.Span()) {
+            env->SetGpuParamDrawBank(bank);
+        }
+    }
 
     main_pools.ReleaseContents();
     auto pipeline{

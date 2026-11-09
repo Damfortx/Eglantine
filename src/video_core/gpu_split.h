@@ -211,6 +211,7 @@ public:
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
                 const GPUVAddr* segment) {
+        ReleaseFrontHold(HoldMethod | (method & 0xffff)); // W1 GPUPARAM v2 front hold
         FlushState();
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
@@ -233,6 +234,7 @@ public:
     /// consecutive runs the back runs as one multi-method (one write, not one a word).
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
                     bool mergeable = false) {
+        ReleaseFrontHold(HoldMacroWrite | (method & 0xffff)); // W1 GPUPARAM v2 front hold
         // With the back idle half the time (title 1's presents waiting 3 ms for their own frame)
         // the lists showed no gain; with that gone the back is the limit again and they gave
         // 0.8-3.2 more frames a second, 0.64 us less back time a draw (medians, two A/B runs).
@@ -281,6 +283,7 @@ public:
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     template <typename Func>
     void Defer(const Func& func) {
+        ReleaseFrontHold(HoldDefer); // W1 GPUPARAM v2 front hold
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         FlushState();
@@ -292,6 +295,66 @@ public:
     }
     void DeferFunction(std::function<void()>&& func);
 
+    // ---- W1 GPUPARAM v2 (mt/gpuparam2.h): the front hold ----
+    /// A draw the front holds back instead of sending it (a pending group of GPU-parameter
+    /// draws that the next call may join). Every function that sends to the ring or waits for
+    /// the back runs it first (ReleaseFrontHold at its top), so it is sent before anything that
+    /// follows it in the stream. `why`: Hold* kind | method (for the method kinds), statistics.
+    /// Publish has no release: it runs inside Reserve (WaitForSpace) mid-entry, and every wait
+    /// that publishes releases first; DmaPusher::DispatchCalls releases at its end.
+    using FrontHoldFn = void (*)(void* context, u32 why);
+    static constexpr u32 HoldMethod = 1U << 16;
+    static constexpr u32 HoldMultiMethod = 2U << 16;
+    static constexpr u32 HoldMacroWrite = 3U << 16;
+    static constexpr u32 HoldStateWrite = 4U << 16;
+    static constexpr u32 HoldDefer = 5U << 16;
+    static constexpr u32 HoldDeferFunction = 6U << 16;
+    static constexpr u32 HoldDrain = 7U << 16;
+    static constexpr u32 HoldWait = 8U << 16;
+    static constexpr u32 HoldRun = 9U << 16;
+    static constexpr u32 HoldDispatchEnd = 10U << 16;
+    static constexpr u32 HoldNonJoinable = 11U << 16;
+    static constexpr u32 HoldFull = 12U << 16;
+    static constexpr u32 HoldOther = 13U << 16;
+    /// Installs the hold (front thread only; replaces none: release the old one first).
+    void SetFrontHold(FrontHoldFn fn, void* context) {
+        hold_fn = fn;
+        hold_ctx = context;
+        hold_thread = true;
+    }
+    /// The installed hold's context (nullptr: none).
+    [[nodiscard]] void* FrontHoldContext() const {
+        return hold_fn != nullptr ? hold_ctx : nullptr;
+    }
+    /// Takes the hold off without running it (its context; nullptr: none). Resume with
+    /// SetFrontHold. Also used to drop it (Stop, its owner going away).
+    void* TakeFrontHold() {
+        void* const context = hold_fn != nullptr ? hold_ctx : nullptr;
+        hold_fn = nullptr;
+        hold_ctx = nullptr;
+        return context;
+    }
+    /// Runs the hold (cleared first: it sends with Defer) if one is installed.
+    void ReleaseFrontHold(u32 why) {
+        if (hold_fn != nullptr) [[unlikely]] {
+            ReleaseFrontHoldSlow(why);
+        }
+    }
+    void ReleaseFrontHoldSlow(u32 why) {
+        if (!hold_thread) {
+            return; // not the front thread that installed it
+        }
+        const FrontHoldFn fn = hold_fn;
+        void* const context = hold_ctx;
+        hold_fn = nullptr;
+        hold_ctx = nullptr;
+        fn(context, why);
+    }
+    FrontHoldFn hold_fn{};
+    void* hold_ctx{};
+    static inline thread_local bool hold_thread{};
+    // ---- end W1 front hold ----
+
     /// A write to a register that is not executable (state only), with the shadow RAM already
     /// applied by the front: `value` is what the register will hold, and `track_shadow` whether
     /// the shadow copy takes it too. Writes are gathered until the next entry of another kind and
@@ -299,6 +362,7 @@ public:
     /// instead of running every write through the engine (~3 million a second in title 1).
     void StateWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value,
                     bool track_shadow) {
+        ReleaseFrontHold(HoldStateWrite | (method & 0xffff)); // W1 GPUPARAM v2 front hold
         if (engine != state_engine || track_shadow != state_track) [[unlikely]] {
             FlushState();
             state_engine = engine;
@@ -360,6 +424,7 @@ public:
     /// its idle hook, so the front never touches that state itself.
     template <typename Func>
     void Run(const Func& func, DrainReason reason = DrainReason::Other) {
+        ReleaseFrontHold(HoldRun); // W1 GPUPARAM v2 front hold
         if (on_back_thread || !active) {
             func();
             return;
@@ -373,6 +438,7 @@ public:
     /// Inline (on the back or without the split), the flush stays synchronous.
     template <typename Func>
     void RunFlush(const Func& func, DrainReason reason = DrainReason::Other) {
+        ReleaseFrontHold(HoldRun); // W1 GPUPARAM v2 front hold
         if (on_back_thread || !active) {
             func();
             return;
@@ -666,6 +732,7 @@ public:
     /// records those writers, and a page no captured writer wrote holds what guest memory holds.
     template <typename Bound>
     ListWait WaitForListWriters(const Bound& page_bound) {
+        ReleaseFrontHold(HoldWait); // W1 GPUPARAM v2 front hold
         if (!MtActive()) {
             return ListWait{WaitForWriters(), false};
         }

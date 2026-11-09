@@ -3142,9 +3142,15 @@ public:
     enum class EngineHint : u32 {
         None = 0x0,
         OnHLEMacro = 0x1,
+        /// GPU params v2 (mt/gpuparam2.h): the draw's vertex stage reads cbuf[gpuparam_cb_bank]
+        /// +0x640 / +0x644 as the BaseVertex / BaseInstance built-ins (fixed table).
+        OnGpuParamDraw = 0x2,
     };
 
     EngineHint engine_state{EngineHint::None};
+    /// With engine_state == OnGpuParamDraw: the vertex stage's constant buffer bank of the
+    /// driver constants (Maxwell3D::GpuParamDraw sets it; only bank 0 is used).
+    u32 gpuparam_cb_bank{0};
 
     enum class HLEReplacementAttributeType : u32 {
         BaseVertex = 0x0,

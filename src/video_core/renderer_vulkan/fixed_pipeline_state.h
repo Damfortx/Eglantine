@@ -232,6 +232,9 @@ struct FixedPipelineState {
         BitField<15, 1, u32> alpha_to_coverage_enabled;
         BitField<16, 1, u32> alpha_to_one_enabled;
         BitField<17, 3, Tegra::Engines::Maxwell3D::EngineHint> app_stage;
+        /// app_stage == OnGpuParamDraw: the vertex stage's constant buffer whose words
+        /// 0x640/0x644 the shaders read as BaseVertex/BaseInstance (GPU params v2); else 0.
+        BitField<20, 5, u32> gpuparam_bank;
     };
     std::array<u8, Maxwell::NumRenderTargets> color_formats;
 

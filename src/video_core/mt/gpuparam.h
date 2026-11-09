@@ -22,6 +22,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "video_core/macro_turing.h"
+#include "video_core/mt/gpuparam2.h"
 #include "video_core/mt/lite_switches.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -57,8 +58,9 @@ namespace VideoCommon::MT::GpuParam {
     static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_GPUPARAM");
     return Tegra::Nx2Switch(mode, false);
 }
+/// v1, or v2 (mt/gpuparam2.h), which implies the deferral.
 [[nodiscard]] inline bool On(bool mt) {
-    return mt ? MtSwitch() : PlainSwitch();
+    return mt ? (MtSwitch() || V2MtSwitch()) : (PlainSwitch() || V2PlainSwitch());
 }
 /// EDEN_NX2_GPUPARAM_CHECK=1 (diagnostic): every deferred call also waits and reads the words
 /// as before, runs the macro on them and compares its draws with the indirect draw's.
@@ -183,8 +185,60 @@ struct Call {
     u32 begin;      ///< p0, the draw.begin word
     u32 max_draws;
     Kind kind;
+    /// v2: base vertex/instance as shader built-ins (no constant buffer copies); IndexedSingle
+    /// records, `max_draws` consecutive ones 20 bytes apart (a group).
+    bool builtins;
     CbPlan cb;
 };
+
+[[nodiscard]] inline bool SamePlan(const CbPlan& a, const CbPlan& b) {
+    const auto same = [](const CbWord& x, const CbWord& y) {
+        return x.offset == y.offset && x.value == y.value && x.gpu_word == y.gpu_word;
+    };
+    if (a.pre_count != b.pre_count || a.post_count != b.post_count) {
+        return false;
+    }
+    for (u8 i = 0; i < a.pre_count; ++i) {
+        if (!same(a.pre[i], b.pre[i])) {
+            return false;
+        }
+    }
+    for (u8 i = 0; i < a.post_count; ++i) {
+        if (!same(a.post[i], b.post[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// v2: the driver constants the built-ins give: exactly pre +0x640 = word 3 (vertex offset),
+/// +0x644 = word 4 (first instance), and the call leaves constants at both after its draws
+/// (the zero-word call leaves them too: memory ends as the real call leaves it).
+inline constexpr u32 BuiltinBaseVertexOffset = 0x640;
+inline constexpr u32 BuiltinBaseInstanceOffset = 0x644;
+[[nodiscard]] inline bool BuiltinPlan(const CbPlan& cb) {
+    if (cb.pre_count != 2 || cb.post_count != 2) {
+        return false;
+    }
+    bool vertex = false;
+    bool instance = false;
+    for (u8 i = 0; i < 2; ++i) {
+        const CbWord& w = cb.pre[i];
+        vertex |= w.offset == BuiltinBaseVertexOffset && w.gpu_word == 3;
+        instance |= w.offset == BuiltinBaseInstanceOffset && w.gpu_word == 4;
+    }
+    bool post_vertex = false;
+    bool post_instance = false;
+    for (u8 i = 0; i < 2; ++i) {
+        const CbWord& w = cb.post[i];
+        if (w.gpu_word != NoGpuWord) {
+            return false;
+        }
+        post_vertex |= w.offset == BuiltinBaseVertexOffset;
+        post_instance |= w.offset == BuiltinBaseInstanceOffset;
+    }
+    return vertex && instance && post_vertex && post_instance;
+}
 
 /// Why a call with GPU-written parameters was not deferred (statistics).
 enum class Reason : u8 {
@@ -291,6 +345,7 @@ struct Trace {
     std::vector<DrawRecord> draws;
     std::vector<std::pair<u32, u32>> other_writes; ///< non-draw registers, in order
     std::vector<std::pair<u32, u32>> dram_writes;
+    std::vector<u32> written; ///< every register written (methods, in order; v2 group check)
 };
 
 using DataRam = Tegra::TuringMacroInterpreter::DataRam;
@@ -330,6 +385,7 @@ void RunTrace(Tegra::TuringMacroInterpreter& interp, std::span<const u32> code, 
                 t.forbidden = true;
                 return false;
             }
+            t.written.push_back(method);
             if (IsCbData(method)) {
                 // ProcessCBMultiData: the word at address + offset, the offset advances.
                 t.cb_offset_from_state |= !cb_offset_known;
@@ -424,6 +480,11 @@ public:
         Reject reject{};
         bool cached{};
         CbPlan cb{};
+        /// v2 groups: the verdict holds for every call (no register/data RAM reads) and the
+        /// zero-word call writes, besides state, only constant buffer data and index_buffer.first
+        /// (whose method does nothing but latch): its writes leave the back as they found it when
+        /// repeated, so they may go before the held draws of earlier calls.
+        bool group_safe{};
     };
 
     template <typename Executable>
@@ -434,14 +495,16 @@ public:
         const u64 code_hash = CodeHash(code_ram, positions, start, generation);
         const u64 key = Key(start, code_hash, kind, max_draws, begin);
         if (const auto it = verdicts.find(key); it != verdicts.end()) {
-            return {it->second.ok, it->second.reject, true, it->second.cb};
+            return {it->second.ok, it->second.reject, true, it->second.cb, it->second.group_safe};
         }
         CbPlan cb{};
-        const auto [reject, stateful] =
-            Run(code_ram, start, kind, begin, max_draws, regs, dram, executable, cb);
+        bool zero_groupable = false;
+        const auto [reject, stateful] = Run(code_ram, start, kind, begin, max_draws, regs, dram,
+                                            executable, cb, zero_groupable);
         const bool ok = reject == Reject::None;
+        const bool group_safe = ok && !stateful && zero_groupable;
         if (!stateful) {
-            verdicts.emplace(key, Entry{ok, reject, cb});
+            verdicts.emplace(key, Entry{ok, reject, cb, group_safe});
         }
         if (logged.insert(code_hash ^ (u64{static_cast<u8>(kind)} << 60) ^ (ok ? 1 : 0)).second) {
             const auto code = MacroCode(code_ram, positions, start);
@@ -478,7 +541,30 @@ public:
                 LOG_INFO(HW_GPU, "GPU params: macro {} constant buffer words:{}", index, text);
             }
         }
-        return {ok, reject, false, cb};
+        return {ok, reject, false, cb, group_safe};
+    }
+
+    /// v2 check, after Compare: the constant buffer words the macro wrote before its draws for
+    /// the real words are what the built-ins give (record words 3 and 4). True when it drew
+    /// nothing (nothing to compare).
+    [[nodiscard]] bool BuiltinsMatch(std::span<const u32> words) const {
+        if (trace.draws.empty() || words.size() < 5) {
+            return true;
+        }
+        const auto pre = [this](u32 offset, u32& out) {
+            bool found = false;
+            for (const auto& write : trace.cb_writes) {
+                if (write.offset == offset && write.draws_before == 0) {
+                    out = write.value;
+                    found = true;
+                }
+            }
+            return found;
+        };
+        u32 vertex{};
+        u32 instance{};
+        return pre(BuiltinBaseVertexOffset, vertex) && pre(BuiltinBaseInstanceOffset, instance) &&
+               vertex == words[3] && instance == words[4];
     }
 
     /// EDEN_NX2_GPUPARAM_CHECK: the macro's draws for the real words against the reference's.
@@ -535,6 +621,7 @@ private:
         bool ok;
         Reject reject;
         CbPlan cb;
+        bool group_safe;
     };
 
     static u64 Key(u32 start, u64 code_hash, Kind kind, u32 max_draws, u32 begin) {
@@ -595,8 +682,9 @@ private:
     template <typename Executable>
     std::pair<Reject, bool> Run(std::span<const u32> code_ram, u32 start, Kind kind, u32 begin,
                                 u32 max_draws, std::span<const u32> regs, const DataRam& dram,
-                                Executable& executable, CbPlan& cb) {
+                                Executable& executable, CbPlan& cb, bool& zero_groupable) {
         last_error = {};
+        zero_groupable = false;
         bool stateful = false;
         std::vector<std::pair<u32, u32>> base_writes;
         std::vector<std::pair<u32, u32>> base_dram;
@@ -635,6 +723,10 @@ private:
             if (v == 0) {
                 base_writes = trace.other_writes;
                 base_dram = trace.dram_writes;
+                zero_groupable = trace.draws.empty() &&
+                                 std::ranges::all_of(trace.written, [&](u32 m) {
+                                     return IsCbData(m) || m == RegIndexFirst || !executable(m);
+                                 });
             } else if (trace.other_writes != base_writes) {
                 return {Reject::GpuDependentState, stateful};
             } else if (trace.dram_writes != base_dram) {
@@ -774,6 +866,11 @@ struct Stats {
     }
 
     void MaybeLog() {
+        MaybeLog([] { return std::string{}; });
+    }
+    /// `extra()`: text appended to the line (GPU params v2's counters, mt/gpuparam2.h).
+    template <typename Extra>
+    void MaybeLog(Extra&& extra) {
         if (!StatsOn()) {
             return;
         }
@@ -797,11 +894,11 @@ struct Stats {
         LOG_INFO(HW_GPU,
                  "GPU params in 10 s: {} deferred ({} single, {} multi; {} entries not read), "
                  "kept waiting:{}{} rejects:{} verified {}; check {} compared, {} mismatched, "
-                 "{} unreadable, {} draws; constant buffer copies from guest memory {}",
+                 "{} unreadable, {} draws; constant buffer copies from guest memory {}{}",
                  reasons[0], single, multi, entries, text.empty() ? " none" : text, "",
                  rejected.empty() ? " none" : rejected, verified, check_compared, check_mismatch,
                  check_unreadable, check_draws,
-                 g_cb_copy_fallbacks.exchange(0, std::memory_order_relaxed));
+                 g_cb_copy_fallbacks.exchange(0, std::memory_order_relaxed), extra());
         const auto keep = window;
         *this = Stats{};
         window = keep;

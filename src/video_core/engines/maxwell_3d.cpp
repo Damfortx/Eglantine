@@ -1683,6 +1683,30 @@ struct Maxwell3D::GpuParamState {
     std::vector<GP::DrawRecord> actual;
     std::vector<GP::DrawRecord> expected;
     u32 mismatch_logs{};
+    // GPU params v2 (mt/gpuparam2.h).
+    GP::V2Stats v2;
+    Maxwell3D* self{};
+    Core::System* system{};
+    /// The pending group (valid while the split's front hold context is this state).
+    GP::Call group{};
+    u32 group_macro{};
+    /// A joining call's zero-word call runs with the hold installed: its constant buffer
+    /// writes (and const_buffer.offset) pass, anything else sends the group first.
+    bool tolerant{};
+
+    ~GpuParamState() {
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (split.FrontHoldContext() == this) {
+            split.TakeFrontHold();
+        }
+    }
+    void MaybeLog() {
+        stats.MaybeLog([this] {
+            std::string text = v2.Format();
+            v2 = GP::V2Stats{};
+            return text;
+        });
+    }
 };
 
 bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment* segments,
@@ -1704,7 +1728,7 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
     GpuParamState& gs = *gpuparam;
     const auto keep_waiting = [&gs](GP::Reason reason) {
         gs.stats.Note(reason);
-        gs.stats.MaybeLog();
+        gs.MaybeLog();
         return false;
     };
     if (!engine.native_turing) {
@@ -1780,6 +1804,20 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
         return keep_waiting(GP::Reason::Rejected);
     }
     call.cb = verdict.cb;
+    // GPU params v2 (mt/gpuparam2.h): single calls whose constant buffer words are exactly the
+    // base vertex/instance draw with the built-ins, without copies; the rest as v1.
+    const bool mt = front_path && split.MtActive();
+    if (GP::V2On(mt)) {
+        ++gs.v2.calls;
+        if (call.kind != GP::Kind::IndexedSingle) {
+            ++gs.v2.fallbacks[static_cast<size_t>(GP::V2Fallback::Kind)];
+        } else if (!GP::BuiltinPlan(call.cb)) {
+            ++gs.v2.fallbacks[static_cast<size_t>(GP::V2Fallback::Plan)];
+        } else {
+            call.builtins = true;
+            ++gs.v2.copy_free;
+        }
+    }
 
     // EDEN_NX2_GPUPARAM_CHECK: the words as the old path reads them (after their writers), and
     // the macro's draws for them against the indirect draw's.
@@ -1804,6 +1842,21 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
                                                     gs.expected, error, cb_same);
             ++gs.stats.check_compared;
             gs.stats.check_draws += gs.expected.size();
+            if (call.builtins) {
+                // v2: what the built-ins give (record words 3/4) against the constant buffer
+                // words the macro writes before its draws for the real words.
+                ++gs.v2.check_compared;
+                if (!gs.classifier.BuiltinsMatch(gs.words)) {
+                    ++gs.v2.check_mismatch;
+                    if (gs.mismatch_logs++ < 16) {
+                        LOG_WARNING(HW_GPU,
+                                    "GPU params check (v2): macro {} at {:#x}: constant buffer "
+                                    "words differ from record words 3/4 ({:#x}, {:#x})",
+                                    index, call.records_addr, gs.words.size() > 3 ? gs.words[3] : 0U,
+                                    gs.words.size() > 4 ? gs.words[4] : 0U);
+                    }
+                }
+            }
             if (!same) {
                 ++gs.stats.check_mismatch;
                 if (gs.mismatch_logs++ < 16) {
@@ -1843,18 +1896,64 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
     // The call with zero GPU words: the registers it leaves, no draw. Then the indirect draw.
     if (fs != nullptr) {
 #ifdef ARCHITECTURE_x86_64
+        // v2 groups (MT back only): the draw is held (GpuSplit front hold) and the next call
+        // joins it when its records follow and nothing was sent in between; a joining call's
+        // zero-word call runs with the hold installed (GpuParamHoldRelease lets its constant
+        // buffer writes pass: with the built-ins the held draws don't read those words, and
+        // the call writes the same values each time).
+        const bool group = mt && call.builtins && GP::GroupCap() > 1;
+        bool join = false;
+        if (void* const held = split.FrontHoldContext(); held != nullptr) {
+            GP::NoJoin no_join = GP::NoJoin::Other;
+            if (held != &gs || !group) {
+                no_join = GP::NoJoin::Other;
+            } else if (!verdict.group_safe) {
+                no_join = GP::NoJoin::Unsafe;
+            } else if (gs.group_macro != macro_method) {
+                no_join = GP::NoJoin::Macro;
+            } else if (gs.group.begin != call.begin) {
+                no_join = GP::NoJoin::Begin;
+            } else if (!GP::SamePlan(gs.group.cb, call.cb)) {
+                no_join = GP::NoJoin::Plan;
+            } else if (call.records_addr !=
+                       gs.group.records_addr + u64{gs.group.max_draws} * GP::RecordBytes) {
+                no_join = GP::NoJoin::Address;
+            } else {
+                join = true;
+            }
+            if (!join) {
+                ++gs.v2.no_join[static_cast<size_t>(no_join)];
+                split.ReleaseFrontHold(VideoCommon::GpuSplit::HoldNonJoinable);
+            }
+        }
         fs->executing_macro = macro_method;
         fs->parameters.resize(1 + words, 0U);
+        gs.tolerant = join;
         FrontRunMacro(system, split, *fs);
-        struct BackDraw {
-            Maxwell3D* self;
-            Core::System* system;
-            GP::Call call;
-            void operator()() const {
-                self->GpuParamDraw(*system, call);
+        gs.tolerant = false;
+        if (join && split.FrontHoldContext() == &gs) {
+            ++gs.group.max_draws;
+            if (gs.group.max_draws >= GP::GroupCap()) {
+                split.ReleaseFrontHold(VideoCommon::GpuSplit::HoldFull);
             }
-        };
-        split.Defer(BackDraw{this, &system, call});
+        } else if (group && verdict.group_safe) {
+            // A new group (the zero call's other emissions, if any, sent the old one first).
+            gs.self = this;
+            gs.system = &system;
+            gs.group = call;
+            gs.group_macro = macro_method;
+            split.SetFrontHold(&Maxwell3D::GpuParamHoldRelease, &gs);
+        } else {
+            struct BackDraw {
+                Maxwell3D* self;
+                Core::System* system;
+                GP::Call call;
+                void operator()() const {
+                    self->GpuParamDraw(*system, call);
+                }
+            };
+            split.Defer(BackDraw{this, &system, call});
+        }
 #endif
     } else {
         ConsumeSink(system);
@@ -1869,7 +1968,7 @@ bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment
     gs.stats.Note(GP::Reason::Deferred);
     ++(call.kind == GP::Kind::IndexedSingle ? gs.stats.single : gs.stats.multi);
     gs.stats.entries += segment_count;
-    gs.stats.MaybeLog();
+    gs.MaybeLog();
     return true;
 }
 
@@ -1882,7 +1981,30 @@ void Maxwell3D::GpuParamDraw(Core::System& system, const GP::Call& call) {
     // 0x640/0x644 for macro 40). The zero-word call wrote them all already, with its final
     // values: put the draw-time values there first (GPU words as GPU copies from the parameter
     // buffer, after its writer in queue order), restore the final ones after the draw.
-    const bool has_cb = call.cb.pre_count != 0 || call.cb.post_count != 0;
+    // v2: the vertex stage reads the words as built-ins (only from bank 0); else v1's copies,
+    // one record at a time for a group.
+    bool builtins = false;
+    if (call.builtins) {
+        const int bank = GpuParamVertexBank();
+        if (bank == 0) {
+            builtins = true;
+            GP::g_v2_builtin_draws.fetch_add(1, std::memory_order_relaxed);
+            GP::g_v2_builtin_records.fetch_add(call.max_draws, std::memory_order_relaxed);
+        } else {
+            (bank < 0 ? GP::g_v2_fallback_no_bank : GP::g_v2_fallback_bank)
+                .fetch_add(1, std::memory_order_relaxed);
+            GP::g_v2_fallback_records.fetch_add(call.max_draws, std::memory_order_relaxed);
+            for (u32 i = 0; i < call.max_draws; ++i) {
+                GP::Call single = call;
+                single.builtins = false;
+                single.max_draws = 1;
+                single.records_addr = call.records_addr + u64{i} * GP::RecordBytes;
+                GpuParamDraw(system, single);
+            }
+            return;
+        }
+    }
+    const bool has_cb = !builtins && (call.cb.pre_count != 0 || call.cb.post_count != 0);
     if (has_cb) {
         // The zero-word call's cached constant buffer writes reach the buffer cache first, so
         // the copy's destination sync uploads them before the copy, never after it.
@@ -1897,11 +2019,22 @@ void Maxwell3D::GpuParamDraw(Core::System& system, const GP::Call& call) {
     params.indirect_start_address = call.records_addr;
     params.buffer_size = size_t{call.max_draws} * 5 * sizeof(u32);
     params.max_draw_counts = call.max_draws;
-    params.stride = call.kind == GP::Kind::IndexedSingle ? 0 : 5 * sizeof(u32);
+    // A group (max_draws > 1, no count word): vkCmdDrawIndexedIndirect drawCount N, stride 20
+    // (multiDrawIndirect is a required device feature).
+    params.stride = call.kind == GP::Kind::IndexedSingle && call.max_draws <= 1 ? 0
+                                                                                 : 5 * sizeof(u32);
     const u32 estimate = static_cast<u32>(EstimateIndexBufferSize());
     dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if (builtins) {
+        engine_state = EngineHint::OnGpuParamDraw;
+        gpuparam_cb_bank = 0;
+    }
     draw_manager.DrawIndexedIndirect(*this, static_cast<Regs::PrimitiveTopology>(call.begin & 0xffff),
                                      0, estimate);
+    if (builtins) {
+        engine_state = EngineHint::None;
+        gpuparam_cb_bank = 0;
+    }
     dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
     // A drawing call leaves no indexed draw pending (DrawEnd clears it).
     draw_manager.draw_state.draw_indexed = false;
@@ -1950,6 +2083,52 @@ void Maxwell3D::GpuParamConstantWords(std::span<const GP::CbWord> cb_words, cons
         }
         i += run;
     }
+}
+
+void Maxwell3D::GpuParamHoldRelease(void* context, u32 why) {
+    auto& gs = *static_cast<GpuParamState*>(context);
+    if (gs.tolerant) {
+        // A joining call's zero-word call: its constant buffer data, const_buffer.offset and
+        // index_buffer.first writes (the same values every call) pass; the hold stays.
+        const u32 kind = why & ~0xffffU;
+        const u32 method = why & 0xffffU;
+        if ((kind == VideoCommon::GpuSplit::HoldStateWrite ||
+             kind == VideoCommon::GpuSplit::HoldMacroWrite) &&
+            (GP::IsCbData(method) || method == GP::RegCbOffset || method == GP::RegIndexFirst)) {
+            VideoCommon::GpuSplit::Get().SetFrontHold(&Maxwell3D::GpuParamHoldRelease, context);
+            return;
+        }
+        ++gs.v2.zero_call_breaks;
+    }
+    gs.self->GpuParamEmitGroup(why);
+}
+
+void Maxwell3D::GpuParamEmitGroup(u32 why) {
+    GpuParamState& gs = *gpuparam;
+    gs.v2.NoteGroup(gs.group.max_draws, why);
+    struct BackDraw {
+        Maxwell3D* self;
+        Core::System* system;
+        GP::Call call;
+        void operator()() const {
+            self->GpuParamDraw(*system, call);
+        }
+    };
+    // The hold is already cleared: Defer does not come back here.
+    VideoCommon::GpuSplit::Get().Defer(BackDraw{this, gs.system, gs.group});
+}
+
+int Maxwell3D::GpuParamVertexBank() const {
+    // The selected constant buffer (where the macro writes the driver constants) as bound to
+    // the vertex stage (shader_stages[0]: VertexA/VertexB).
+    const GPUVAddr address = regs.const_buffer.Address();
+    const auto& banks = state.shader_stages[0].const_buffers;
+    for (size_t i = 0; i < banks.size(); ++i) {
+        if (banks[i].enabled && banks[i].address == address) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
 }
 
 } // namespace Tegra::Engines

@@ -350,6 +350,7 @@ bool GpuSplit::PredictAcquires() {
 }
 
 void GpuSplit::Stop() {
+    TakeFrontHold(); // the held draw's owner may be going away
     if (!back_thread.joinable()) {
         return;
     }
@@ -572,6 +573,7 @@ void GpuSplit::CountWait(DrainReason reason, bool waited, u64 wait_ns) {
 }
 
 void GpuSplit::Drain(DrainReason reason) {
+    ReleaseFrontHold(HoldDrain); // W1 GPUPARAM v2 front hold
     // EDEN_NX2_MT_LITE_DRAIN: the reads after these drains need the sequencer and the committer's
     // guest memory writes only (not its draws, nor both threads quiet: they submit on their own).
     if (MtActive() && LiteDrainReason(reason)) {
@@ -674,6 +676,7 @@ u64 GpuSplit::ReadSettleTarget(u64 target, DrainReason reason) const {
 }
 
 void GpuSplit::DrainForRead(DrainReason reason) {
+    ReleaseFrontHold(HoldDrain); // W1 GPUPARAM v2 front hold
     if (!MtActive() || !VideoCommon::MT::DmaReadConsumed()) {
         Drain(reason);
         return;
@@ -706,6 +709,7 @@ void GpuSplit::DrainToSettleTarget(DrainReason reason) {
 }
 
 bool GpuSplit::WaitForWriters(DrainReason reason) {
+    ReleaseFrontHold(HoldWait); // W1 GPUPARAM v2 front hold
     FlushState();
     const u64 target = std::min(last_writer_position, write_position);
     consumed_cache = consumed.load(std::memory_order_acquire);
@@ -763,6 +767,7 @@ void GpuSplit::FlushMacroList() {
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                            u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+    ReleaseFrontHold(HoldMultiMethod | (method & 0xffff)); // W1 GPUPARAM v2 front hold
     FlushState();
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
@@ -788,6 +793,7 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
+    ReleaseFrontHold(HoldDeferFunction); // W1 GPUPARAM v2 front hold
     auto* const heap = new std::function<void()>(std::move(func));
     Defer([heap] {
         // Under the multithreaded back: after everything before is committed, with the

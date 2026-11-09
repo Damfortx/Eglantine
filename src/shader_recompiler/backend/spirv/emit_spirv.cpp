@@ -489,6 +489,13 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
         ctx.AddCapability(spv::Capability::DrawParameters);
     }
+    // BaseVertex/BaseInstance/DrawIndex built-ins (constant buffer reads replaced by draw
+    // parameters: HLE indirect macros, GPU params v2) need the capability on their own too.
+    if (info.loads[IR::Attribute::BaseVertex] || info.loads[IR::Attribute::BaseInstance] ||
+        info.loads[IR::Attribute::DrawID]) {
+        ctx.AddExtension("SPV_KHR_shader_draw_parameters");
+        ctx.AddCapability(spv::Capability::DrawParameters);
+    }
     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
          info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&
         profile.support_vote && profile.SupportsSubgroupStage(ctx.stage)) {

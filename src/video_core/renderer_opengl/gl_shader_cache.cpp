@@ -385,6 +385,11 @@ GraphicsPipeline* ShaderCache::CurrentGraphicsPipeline() {
         Maxwell::Tessellation::OutputPrimitives::Triangles_CW);
     graphics_key.xfb_enabled.Assign(regs.transform_feedback_enabled != 0 ? 1 : 0);
     graphics_key.app_stage.Assign(maxwell3d->engine_state);
+    if (maxwell3d->engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw) {
+        // GPU params v2: the bank whose words 0x640/0x644 the vertex stage reads as draw
+        // parameters, in the key's unused bits 14-18 (GraphicsPipelineKey has no field for it).
+        graphics_key.raw |= (maxwell3d->gpuparam_cb_bank & 0x1fU) << 14;
+    }
     if (graphics_key.xfb_enabled) {
         SetXfbState(graphics_key.xfb_state, regs);
     }

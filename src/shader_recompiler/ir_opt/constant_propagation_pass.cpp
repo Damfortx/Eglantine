@@ -930,6 +930,49 @@ void FoldConstBuffer(Environment& env, IR::Block& block, IR::Inst& inst) {
     }
 }
 
+// GPU params v2 (Environment::GpuParamDrawBank): the draw's memory holds 0 in the draw parameter
+// words cbuf[bank][0x640..0x648); a read of them the translation keeps (FoldConstBuffer replaced
+// none: a stage without draw parameter built-ins, a sub-word or two-word read) or a read of that
+// bank at a dynamic offset (it may land there) is counted for the pipeline cache's log.
+void NoteGpuParamConstBuffer(Environment& env, const IR::Inst& inst) {
+    const u32 hint_bank = env.GpuParamDrawBank();
+    if (hint_bank == ~0U) {
+        return;
+    }
+    u32 size = 4;
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::GetCbufU8:
+    case IR::Opcode::GetCbufS8:
+        size = 1;
+        break;
+    case IR::Opcode::GetCbufU16:
+    case IR::Opcode::GetCbufS16:
+        size = 2;
+        break;
+    case IR::Opcode::GetCbufU32:
+    case IR::Opcode::GetCbufF32:
+        break;
+    case IR::Opcode::GetCbufU32x2:
+        size = 8;
+        break;
+    default:
+        return; // replaced (Identity) or not a constant buffer read
+    }
+    const IR::Value bank{inst.Arg(0)};
+    const IR::Value offset{inst.Arg(1)};
+    if (bank.IsImmediate() && bank.U32() != hint_bank) {
+        return;
+    }
+    if (!offset.IsImmediate()) {
+        env.NoteGpuParamRead(true);
+        return;
+    }
+    const u32 begin = offset.U32();
+    if (begin < 0x648 && begin + size > 0x640) {
+        env.NoteGpuParamRead(false);
+    }
+}
+
 void FoldDriverConstBuffer(Environment& env, IR::Block& block, IR::Inst& inst, u32 which_bank,
                            u32 offset_start = 0, u32 offset_end = (std::numeric_limits<u16>::max)()) {
     const IR::Value bank{inst.Arg(0)};
@@ -1143,9 +1186,20 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
         if (env.HasHLEMacroState()) {
             FoldConstBuffer(env, block, inst);
         }
+        NoteGpuParamConstBuffer(env, inst);
+        if (inst.GetOpcode() == IR::Opcode::Identity) {
+            break; // replaced by a draw parameter built-in
+        }
         if (env.IsProprietaryDriver()) {
             FoldDriverConstBuffer(env, block, inst, 1);
         }
+        break;
+    case IR::Opcode::GetCbufU8:
+    case IR::Opcode::GetCbufS8:
+    case IR::Opcode::GetCbufU16:
+    case IR::Opcode::GetCbufS16:
+    case IR::Opcode::GetCbufU32x2:
+        NoteGpuParamConstBuffer(env, inst);
         break;
     case IR::Opcode::BindlessImageSampleImplicitLod:
     case IR::Opcode::BoundImageSampleImplicitLod:

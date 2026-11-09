@@ -106,7 +106,7 @@ public:
     void SeedStoragePointers(std::span<const u64> slots);
 
     bool HasHLEMacroState() const override {
-        return has_hle_engine_state;
+        return has_hle_engine_state || gpuparam_draw_bank != ~0U;
     }
 
 protected:
