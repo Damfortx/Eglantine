@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Builds the MT primitive selftests (mt/selftest.h + mt/selftest_phase5.h) outside CMake, with
-# stub common/assert.h and common/logging.h (mt/selftest_stubs), and runs them.
+# Builds the MT primitive selftests (mt/selftest.h and what it includes, mt/selftest_lazy_wake.h)
+# outside CMake, with stub common/assert.h and common/logging.h (mt/selftest_stubs), and runs them.
 #
 #   bash src/video_core/mt/selftest_standalone.sh [tsan|asan|release|all] [test-name-filter]
 #
@@ -48,6 +48,7 @@ echo "== building $MODE with $CXX -> $BIN"
 #include <cstdio>
 #include <cstring>
 #include "video_core/mt/selftest.h"
+#include "video_core/mt/selftest_lazy_wake.h"
 
 int main(int argc, char** argv) {
     using namespace VideoCommon::MT::Selftest;
@@ -73,6 +74,7 @@ int main(int argc, char** argv) {
         {"t8_uniform_ring", UniformRingStressTest},
         {"t9_packet_replica", PacketReplicaStressTest},
         {"t10_replay_arena", ReplayArenaStressTest},
+        {"t11_lazy_wake", LazyWakeStressTest},
     };
     const char* filter = argc > 1 && argv[1][0] != '\0' ? argv[1] : nullptr;
     int failed = 0;

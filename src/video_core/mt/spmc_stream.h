@@ -24,6 +24,9 @@ public:
     static constexpr u32 MaxConsumers = 8;
     static constexpr u8 PadKind = 0;
     static constexpr u32 MaxEntryWords = (1u << 24) - 1;
+    /// Lazy wake: Commit flushes on its own once this many words were published since the last
+    /// flush (32 KiB), so sleeping consumers never lag unboundedly.
+    static constexpr u64 LazyFlushWords = 4096;
 
     explicit SpmcStream(size_t capacity_words)
         : capacity{std::bit_ceil(capacity_words)}, mask{capacity - 1},
@@ -71,6 +74,25 @@ public:
 
     // ---- producer ----
 
+    /// Producer, before it starts producing (or while quiescent). Lazy wake: Commit only
+    /// publishes (a release store) and does not wake sleeping consumers; they are woken at the
+    /// next Flush, at an automatic flush every LazyFlushWords words, or when the producer waits
+    /// for ring space. Consumers that are spinning see entries at once either way. The producer
+    /// must Flush before it waits (by any means other than Reserve) for a consumer to make
+    /// progress — otherwise a sleeping consumer is never woken and the wait never ends — and
+    /// whenever it goes idle with entries pending. Off: every Commit wakes sleepers (Flush is a
+    /// no-op).
+    void SetLazyWake(bool on) {
+        if (lazy_wake && !on) {
+            Flush();
+        }
+        lazy_wake = on;
+    }
+
+    [[nodiscard]] bool LazyWake() const noexcept {
+        return lazy_wake;
+    }
+
     /// Room for an entry of `total_words` (header included); blocks while consumers lag a whole
     /// ring behind. Fill the words (header first word) then Commit.
     [[nodiscard]] u64* Reserve(u32 total_words) {
@@ -91,6 +113,14 @@ public:
     void Commit() {
         write_pos += reserved;
         reserved = 0;
+        published_pos = write_pos;
+        if (lazy_wake) {
+            published.store(write_pos, std::memory_order_release);
+            if (write_pos - last_flush_pos >= LazyFlushWords) {
+                Flush();
+            }
+            return;
+        }
         // seq_cst, not release: WaitForData is a Dekker pair (waiters++ then load `published`;
         // store `published` then load `waiters`). With a release store the waiters load could
         // be satisfied before the store left the store buffer (x86 StoreLoad reordering): the
@@ -102,6 +132,36 @@ public:
             signal.fetch_add(1, std::memory_order_seq_cst);
             signal.notify_all();
         }
+    }
+
+    /// Producer, lazy wake: wakes consumers sleeping in WaitForData if anything was published
+    /// since the last flush. Cheap when nothing was (a compare) and a no-op when not lazy.
+    ///
+    /// Why no wake-up is lost: WaitForData does `waiters++` (seq_cst RMW) then re-loads
+    /// `published` (seq_cst) before sleeping; here the producer re-stores `published` with
+    /// seq_cst (same value; a new modification, an xchg on x86 so the earlier release stores
+    /// drain too) then loads `waiters` (seq_cst). All four are seq_cst, so in the single total
+    /// order either the re-store comes before the consumer's re-load (the consumer sees the
+    /// position and does not sleep) or the consumer's `waiters++` comes before the producer's
+    /// load of `waiters` (the producer sees the waiter and bumps `signal`, which the consumer
+    /// read before `waiters++`, so its futex wait returns). A plain release store + load (the
+    /// lazy Commit) has no such guarantee (x86 StoreLoad reordering), hence the flush points.
+    void Flush() {
+        if (!lazy_wake || published_pos == last_flush_pos) {
+            return;
+        }
+        last_flush_pos = published_pos;
+        published.store(published_pos, std::memory_order_seq_cst);
+        if (waiters.load(std::memory_order_seq_cst) != 0) {
+            signal.fetch_add(1, std::memory_order_seq_cst);
+            signal.notify_all();
+        }
+    }
+
+    /// Producer: the position up to which sleeping consumers are guaranteed to be woken (the
+    /// last flush when lazy, everything published otherwise).
+    [[nodiscard]] u64 FlushedPosition() const noexcept {
+        return lazy_wake ? last_flush_pos : published_pos;
     }
 
     /// Convenience: one entry with a payload copy.
@@ -149,7 +209,10 @@ public:
                               std::memory_order_release);
     }
 
-    /// Blocks until there is something past `consumer`'s cursor or `stop` returns true.
+    /// Blocks until there is something past `consumer`'s cursor or `stop` returns true. With lazy
+    /// wake a sleeping consumer may see new entries only at the producer's next flush. The
+    /// re-load of `published` after `waiters++` must stay seq_cst (Dekker pair with Flush /
+    /// the non-lazy Commit).
     template <typename StopFn>
     void WaitForData(u32 consumer, StopFn&& stop) {
         for (u32 spins = 0;; ++spins) {
@@ -195,6 +258,8 @@ private:
         if (write_pos + total_words - reclaimed <= capacity) {
             return;
         }
+        // Consumers asleep since before unflushed entries would never free the space.
+        Flush();
         std::chrono::steady_clock::time_point begin{};
         for (u32 spins = 0;; ++spins) {
             reclaimed = SlowestCursor();
@@ -240,6 +305,9 @@ private:
     u64 write_pos = 0;
     u64 reclaimed = 0;
     u32 reserved = 0;
+    u64 published_pos = 0;  // last value stored to `published`
+    u64 last_flush_pos = 0; // lazy wake: published_pos at the last flush
+    bool lazy_wake = false;
 
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u32> waiters{0};

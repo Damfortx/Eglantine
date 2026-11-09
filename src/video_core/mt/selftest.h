@@ -21,6 +21,7 @@
 #include "video_core/mt/selftest_phase5.h"
 #include "video_core/mt/selftest_mt8.h"
 #include "video_core/mt/selftest_mt8b.h"
+#include "video_core/mt/selftest_lazy_wake.h"
 #include "video_core/mt/spmc_stream.h"
 #include "video_core/mt/stable_slot_vector.h"
 
@@ -360,6 +361,7 @@ inline void Run() {
         Test{"t8_uniform_ring", UniformRingStressTest},
         Test{"t9_packet_replica", PacketReplicaStressTest},
         Test{"t10_replay_arena", ReplayArenaStressTest},
+        Test{"t11_lazy_wake", LazyWakeStressTest},
     };
     bool all = true;
     for (const Test& test : tests) {
