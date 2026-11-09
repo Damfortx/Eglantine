@@ -61,4 +61,45 @@ namespace LiteDetail {
     return on;
 }
 
+// Iteration 2 (docs/mt-lite-plan2.md): front waits. The tracker and capture pieces have their
+// own headers (lite2_tracker_switches.h, lite2_capture_switches.h).
+
+/// EDEN_NX2_MT_LITE_WRITERS (L6): the front's writer waits (before reading a command list on
+/// pages not known GPU-written, and before an MME DMA read under no write the front noted) wait
+/// for the copy/compute writers on the sequencer, which marks GPU-written pages at capture, and
+/// for the committer only up to its last queued bulk guest write (DMA copies/clears, downloads,
+/// other work; not semaphore/report words nor fences, ~1 every 10 draws), instead of every
+/// committer write (DMA_CONSUMED) or every draw before them.
+[[nodiscard]] inline bool LiteWritersSettle() {
+    static const bool on = LiteDetail::Read("EDEN_NX2_MT_LITE_WRITERS");
+    return on;
+}
+
+/// EDEN_NX2_MT_LITE_DMAPARTIAL (L7): an MME DMA read under noted writes with known positions
+/// (inline uploads, reports) waits for those positions and the writers (EDEN_NX2_DMA_READ_PARTIAL)
+/// instead of everything sent: under the MT back a full drain also idles the sequencer until
+/// the front sends again.
+[[nodiscard]] inline bool LiteDmaPartial() {
+    static const bool on = LiteDetail::Read("EDEN_NX2_MT_LITE_DMAPARTIAL");
+    return on;
+}
+
+/// EDEN_NX2_MT_LITE_RESUME (L8): a suspended semaphore acquire with no queued release for its
+/// address polls memory and the waiter latch without draining, and drains every 8th poll only
+/// (EDEN_NX2_RESUME_LAZY): ~330 drains a second of a busy back in title 1.
+[[nodiscard]] inline bool LiteAcquireNoDrain() {
+    static const bool on = LiteDetail::Read("EDEN_NX2_MT_LITE_RESUME");
+    return on;
+}
+
+/// EDEN_NX2_MT_LITE_WMARK (L9): the sequencer sends a settle mark right after each ring entry
+/// that queued a committer guest write. `settled` only moves at marks, which came every 4096 ring
+/// words or where the sequencer stored `consumed`, so a front wait for the committer's writes
+/// (DMA_CONSUMED, L4, L6) waited for the committer to record everything up to the next of those
+/// anyway, not just up to the write.
+[[nodiscard]] inline bool LiteWriteMark() {
+    static const bool on = LiteDetail::Read("EDEN_NX2_MT_LITE_WMARK");
+    return on;
+}
+
 } // namespace VideoCommon::MT

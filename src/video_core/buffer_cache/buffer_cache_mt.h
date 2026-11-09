@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <optional>
 
 #include "common/scope_exit.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
@@ -203,6 +204,10 @@ u32 BufferCache<P>::MtCommitResolvedBuffers(std::span<const MT::ResolvedBufferRe
     }
     const Ref* index_ref = nullptr;
     std::array<const Ref*, NUM_VERTEX_BUFFERS> vertex_refs{};
+    // EDEN_NX2_MT_LITE_CTRACK: the written storage buffers' tracker halves under one hold,
+    // applied before the vertex bindings below change (their stale marks see the old ones).
+    std::optional<MtWrittenBatch> written_batch;
+    written_batch.emplace(*this);
     for (const Ref& ref : refs) {
         const BufferId id{ref.buffer};
         switch (ref.kind) {
@@ -257,6 +262,7 @@ u32 BufferCache<P>::MtCommitResolvedBuffers(std::span<const MT::ResolvedBufferRe
             break;
         }
     }
+    written_batch.reset();
     const auto binding_of = [](const Ref* ref) {
         if (ref == nullptr || ref->size == 0 || ref->device_addr == 0) {
             return NULL_BINDING;
@@ -419,6 +425,20 @@ void BufferCache<P>::MtCommitDmaCopy(DAddr src, DAddr dst, u64 amount,
 template <class P>
 void BufferCache<P>::MtApplyStaleRanges() {
     if (!mt_stale_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (MT::LiteCommitTracker()) {
+        // EDEN_NX2_MT_LITE_CTRACK: only the swap under the lock. MarkVertexBuffersStale reads and
+        // writes committer state (vertex bindings, stale mask), which the traps never touch.
+        {
+            MT::TrackerScope tracker_scope{tracker_mutex};
+            mt_stale_pending.store(false, std::memory_order_relaxed);
+            mt_stale_scratch.swap(mt_stale_ranges);
+        }
+        for (const auto& [addr, size] : mt_stale_scratch) {
+            MarkVertexBuffersStale(addr, size);
+        }
+        mt_stale_scratch.clear();
         return;
     }
     MT::TrackerScope tracker_scope{tracker_mutex};

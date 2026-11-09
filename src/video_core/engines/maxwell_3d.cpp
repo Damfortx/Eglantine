@@ -1300,12 +1300,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // positions), not for everything sent: title 1's ~235 such reads a second each waited ~1 ms
     // for a full drain. Off by default: no stale read in ~60,000 checked (EDEN_NX2_DMA_READ_CHECK),
     // 2,200 more draws a second, but 1.2 fewer frames (median, 36 windows).
-    // EDEN_NX2_DMA_READ_PARTIAL=1 turns it on (=a alternates).
+    // EDEN_NX2_DMA_READ_PARTIAL=1 turns it on (=a alternates); on by default under
+    // EDEN_NX2_MT_LITE (EDEN_NX2_MT_LITE_DMAPARTIAL): there a full drain also idles the sequencer
+    // until the front sends again, and position waits only go up to the committer's guest writes.
     static const char partial_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_PARTIAL");
     const auto pending = split.PendingWritesFor(source, read_bytes);
     const bool partial = !always_drain && !on_gpu_written && !pending.drain &&
                          (pending.writers || pending.position != 0) &&
-                         Tegra::Nx2Switch(partial_mode, false);
+                         Tegra::Nx2Switch(partial_mode, VideoCommon::MT::LiteDmaPartial());
     const bool plain_skip = !always_drain && !on_gpu_written && !pending.drain &&
                             !pending.writers && pending.position == 0;
     // Title 1's ~230 waiting reads a second (EDEN_NX2_DMA_READ_WHY) cover fence releases still

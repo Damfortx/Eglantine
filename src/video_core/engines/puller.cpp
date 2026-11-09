@@ -276,10 +276,11 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     // the CPU or another channel releases. Without a queued release for the address the back
     // can't meet it soon: check memory and the waiter latch without draining, and drain only
     // every 8th poll (writes nobody noted, e.g. shaders). EDEN_NX2_RESUME_LAZY=0 drains every
-    // poll (=a alternates).
+    // poll (=a alternates). On by default under EDEN_NX2_MT_LITE (EDEN_NX2_MT_LITE_RESUME): each
+    // drain there also idles the sequencer until the front sends again.
     static const char lazy_mode = Tegra::Nx2EnvMode("EDEN_NX2_RESUME_LAZY");
     if (auto& split = VideoCommon::GpuSplit::Get();
-        split.Active() && Tegra::Nx2Switch(lazy_mode, false) &&
+        split.Active() && Tegra::Nx2Switch(lazy_mode, VideoCommon::MT::LiteAcquireNoDrain()) &&
         !split.HasPendingRelease(pending_acquire->address)) {
         // A queued release could still change a word that matches now (equal acquires): only
         // without one is memory the answer.

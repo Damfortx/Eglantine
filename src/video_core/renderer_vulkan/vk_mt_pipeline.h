@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/alignment.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -41,6 +42,8 @@
 #include "video_core/mt/epoch.h"
 #include "video_core/mt/maxwell3d_reg_names.h"
 #include "video_core/mt/lite_switches.h"
+#include "video_core/mt/lite2_capture_switches.h"
+#include "video_core/mt/lite2_tracker_switches.h"
 #include "video_core/mt/mt_switches.h"
 #include "video_core/mt/perf_switches.h"
 #include "video_core/mt/packet_compact.h"
@@ -51,6 +54,7 @@
 #include "video_core/mt/spmc_stream.h"
 #include "video_core/mt/tracker_lock.h"
 #include "video_core/mt/wait_watch.h"
+#include "video_core/mt/xlate_cache.h"
 #include "video_core/cache_types.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2.h"
@@ -147,6 +151,7 @@ struct Counters {
     std::atomic<u64> ubo_full{};
     std::atomic<u64> desc_hits{};
     std::atomic<u64> desc_misses{};
+    std::atomic<u64> overlay_memo_hits{}; ///< EDEN_NX2_MT_LITE_CAPMEMO
     // Stage times (EDEN_NX2_MT_STATS), ns.
     std::atomic<u64> seq_capture_ns{};
     std::atomic<u64> wait_committed_ns{};
@@ -266,7 +271,9 @@ public:
         }
         if (WritesGuestMemory(kind)) {
             // EDEN_NX2_MT_DMA_CONSUMED: front reads after this entry wait for the committer.
-            VideoCommon::GpuSplit::Get().NoteCommitterWrite();
+            // EDEN_NX2_MT_LITE_WRITERS: semaphore/report words and fences are not bulk writes.
+            VideoCommon::GpuSplit::Get().NoteCommitterWrite(kind != MT::Kind::Query &&
+                                                            kind != MT::Kind::Fence);
         }
         Count(counters.commands, kind);
         NoteAsyncWork(kind);
@@ -524,6 +531,18 @@ private:
     void KeepUniformMemos(std::span<const VideoCommon::MT::UboEntry> ubos, const u8* blob);
     /// Copies the CPU-modified parts of a range the draw binds into the packet.
     void SeqTakeUploads(DAddr device_addr, u32 size);
+    /// EDEN_NX2_MT_LITE_SEQLOCK: SeqTakeUploads from here on records its pieces only; their
+    /// bytes are read by SeqReadDeferredUploads, after the tracker lock is released.
+    void SeqDeferUploadReads() {
+        defer_upload_reads = lite_seq_lock;
+        deferred_uploads_first = uploads.size();
+    }
+    void SeqReadDeferredUploads();
+    /// False when no page of the range was ever GPU-written (EDEN_NX2_MT_LITE_SEQLOCK), so
+    /// MtPageHoldsGpuData is false without its lookup; true otherwise.
+    bool SeqPagesMayHoldGpuData(DAddr device_addr, u64 size) const;
+    /// GpuToCpuAddress for captures (EDEN_NX2_MT_LITE_XLATE: through seq_xlate).
+    std::optional<DAddr> SeqTranslate(GPUVAddr gpu_addr);
     /// -1, or why this draw goes as a Serial (MT::ForcedSerialNames).
     int CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed, const IndirectParams* indirect);
     /// The captured reads, sorted and merged, into the overlay (bytes in the blob).
@@ -531,6 +550,8 @@ private:
     /// EDEN_NX2_MT_COMPACT: FinishOverlay, but TIC/TSC entries the replicas hold unchanged
     /// become slot references (desc_refs), and the others replace their slot (desc_inserts).
     void FinishOverlayCompact();
+    /// FinishOverlayCompact once raw_reads are sorted and desc_eligible is set.
+    void FinishOverlayCompactSlots();
     void ClearCapture();
     struct ComputeHeader {
         u64 seq;
@@ -646,6 +667,10 @@ private:
     const bool lite_loop = VideoCommon::MT::LiteCommitLoop();
     const bool lite_quiet = VideoCommon::MT::LiteQuiet();
     const bool lite_no_tic_valid = VideoCommon::MT::LiteNoTicValid();
+    // Iteration 2, capture (lite2_capture_switches.h).
+    const bool lite_seq_lock = VideoCommon::MT::LiteSeqOneLock();
+    const bool lite_cap_memo = VideoCommon::MT::LiteCaptureMemo();
+    const bool lite_xlate = VideoCommon::MT::LiteXlateCache();
 
     // Sequencer-owned.
     std::vector<u64> delta_scratch;
@@ -684,6 +709,18 @@ private:
     std::vector<VideoCommon::MT::UploadEntry> uploads;
     std::vector<u8> blob;
     std::vector<std::pair<DAddr, u32>> taken_ranges;
+    bool defer_upload_reads = false;
+    size_t deferred_uploads_first = 0;
+    VideoCommon::MT::TranslationCache seq_xlate;
+    /// EDEN_NX2_MT_LITE_CAPMEMO: FinishOverlayCompact's structural work for a list of reads (in
+    /// capture order): the sorted list and the slot eligibility of each sorted read.
+    struct OverlayMemo {
+        u64 hash = 0;
+        std::vector<RawRead> reads;
+        std::vector<RawRead> sorted;
+        std::vector<u8> eligible;
+    };
+    std::array<OverlayMemo, 64> overlay_memo{};
     std::vector<u8> dma_scratch;
     struct UniformMemo {
         DAddr device_addr;
@@ -922,9 +959,15 @@ inline void Nx2DrawPipeline::Start() {
              lockstep, verify, VideoCommon::MT::ComputePackets() ? "packet" : "serial",
              resolver_count, shadow);
     LOG_INFO(Render_Vulkan,
-             "MT lite: {} (ubo {}, loop {}, ticvalid {}, drain {}, quiet {}; resolvers {})",
+             "MT lite: {} (ubo {}, loop {}, ticvalid {}, drain {}, quiet {}, writers {}, "
+             "dmapartial {}, resume {}, wmark {}, ctrack {}, seqlock {}, capmemo {}, xlate {}; "
+             "resolvers {})",
              VideoCommon::MT::Lite(), VideoCommon::MT::LiteUboFromCapture(), lite_loop,
-             lite_no_tic_valid, VideoCommon::MT::LiteDrain(), lite_quiet, resolver_count);
+             lite_no_tic_valid, VideoCommon::MT::LiteDrain(), lite_quiet,
+             VideoCommon::MT::LiteWritersSettle(), VideoCommon::MT::LiteDmaPartial(),
+             VideoCommon::MT::LiteAcquireNoDrain(), VideoCommon::MT::LiteWriteMark(),
+             VideoCommon::MT::LiteCommitTracker(), lite_seq_lock, lite_cap_memo, lite_xlate,
+             resolver_count);
 }
 
 inline void Nx2DrawPipeline::Stop() {
@@ -1650,13 +1693,14 @@ inline void Nx2DrawPipeline::LogStats() {
         LOG_INFO(Render_Vulkan,
                  "MT draw packet B: header {:.0f}, overlay {:.0f}, ubo entries {:.0f}, ubo bytes "
                  "{:.0f}, uploads {:.0f}, other {:.0f} | compact {:.0f}/s: ubo same {:.0f}/s, "
-                 "patched {:.0f}/s, full {:.0f}/s, descriptors referenced {:.0f}/s, sent {:.0f}/s",
+                 "patched {:.0f}/s, full {:.0f}/s, descriptors referenced {:.0f}/s, sent {:.0f}/s, "
+                 "overlay memo hits {:.0f}/s",
                  per_draw(counters.pkt_header_bytes), per_draw(counters.pkt_overlay_bytes),
                  per_draw(counters.pkt_ubo_entry_bytes), per_draw(counters.pkt_ubo_data_bytes),
                  per_draw(counters.pkt_upload_bytes), per_draw(counters.pkt_other_bytes),
                  rate(counters.compact_packets), rate(counters.ubo_same),
                  rate(counters.ubo_patched), rate(counters.ubo_full), rate(counters.desc_hits),
-                 rate(counters.desc_misses));
+                 rate(counters.desc_misses), rate(counters.overlay_memo_hits));
     }
 }
 
@@ -1668,12 +1712,34 @@ namespace Vulkan {
 
 template <typename T>
 T Nx2DrawPipeline::SeqRead(u64 gpu_addr) {
-    const T value = rasterizer.gpu_memory->template Read<T>(gpu_addr);
+    T value;
+    const u8* host = nullptr;
+    if constexpr (sizeof(T) != sizeof(u32)) {
+        // EDEN_NX2_MT_LITE_XLATE: MemoryManager::Read without its own walk (only u32 reads may
+        // hit the syncpoint shim; unmapped addresses still go to Read, which reports them).
+        if (lite_xlate) {
+            if (const auto device_addr = SeqTranslate(gpu_addr)) {
+                host = rasterizer.device_memory.GetPointer<u8>(*device_addr);
+            }
+        }
+    }
+    if (host != nullptr) {
+        std::memcpy(&value, host, sizeof(T));
+    } else {
+        value = rasterizer.gpu_memory->template Read<T>(gpu_addr);
+    }
     const u32 offset = static_cast<u32>(raw_bytes.size());
     raw_bytes.resize(raw_bytes.size() + sizeof(T));
     std::memcpy(raw_bytes.data() + offset, &value, sizeof(T));
     raw_reads.push_back({gpu_addr, static_cast<u32>(sizeof(T)), offset, false});
     return value;
+}
+
+inline std::optional<DAddr> Nx2DrawPipeline::SeqTranslate(GPUVAddr gpu_addr) {
+    if (lite_xlate) {
+        return seq_xlate.Translate(*rasterizer.gpu_memory, gpu_addr);
+    }
+    return rasterizer.gpu_memory->GpuToCpuAddress(gpu_addr);
 }
 
 inline void Nx2DrawPipeline::SeqReadDescriptor(u64 gpu_addr) {
@@ -1684,7 +1750,16 @@ inline void Nx2DrawPipeline::SeqReadDescriptor(u64 gpu_addr) {
     u8* const out = raw_bytes.data() + offset;
     const bool one_page =
         (gpu_addr & Core::Memory::YUZU_PAGEMASK) + Size <= Core::Memory::YUZU_PAGESIZE;
-    if (const u8* const host = one_page ? rasterizer.gpu_memory->GetPointer(gpu_addr) : nullptr) {
+    const auto pointer = [&]() -> const u8* {
+        if (!lite_xlate) {
+            return rasterizer.gpu_memory->GetPointer(gpu_addr);
+        }
+        // EDEN_NX2_MT_LITE_XLATE: MemoryManager::GetPointer through the translation cache.
+        const auto device_addr = SeqTranslate(gpu_addr);
+        return device_addr ? rasterizer.device_memory.GetPointer<u8>(*device_addr)
+                           : nullptr;
+    };
+    if (const u8* const host = one_page ? pointer() : nullptr) {
         std::memcpy(out, host, Size);
     } else {
         rasterizer.gpu_memory->ReadBlockUnsafe(gpu_addr, out, Size);
@@ -1712,6 +1787,12 @@ inline void Nx2DrawPipeline::SeqTakeUploads(DAddr device_addr, u32 size) {
             .heap = 0,
             .pad = 0,
         };
+        if (defer_upload_reads) {
+            // EDEN_NX2_MT_LITE_SEQLOCK: the bytes are read once the tracker lock is released
+            // (SeqReadDeferredUploads).
+            uploads.push_back(entry);
+            return;
+        }
         if (length > 64 * 1024 || blob.size() > 1024 * 1024) {
             u8* const heap = new u8[length];
             rasterizer.device_memory.ReadBlockUnsafe(start, heap, length);
@@ -1726,6 +1807,34 @@ inline void Nx2DrawPipeline::SeqTakeUploads(DAddr device_addr, u32 size) {
         }
         uploads.push_back(entry);
     });
+}
+
+inline void Nx2DrawPipeline::SeqReadDeferredUploads() {
+    // The tracker bits were taken under the lock. A guest write since then traps (and marks the
+    // range CPU-modified again) before it lands, so bytes read now are at least as new as at the
+    // take and the next capture takes the range again: as with a read under the lock, which
+    // the trap only waited for.
+    if (!defer_upload_reads) {
+        return;
+    }
+    defer_upload_reads = false;
+    for (size_t index = deferred_uploads_first; index < uploads.size(); ++index) {
+        VideoCommon::MT::UploadEntry& entry = uploads[index];
+        const u64 length = entry.size;
+        if (length > 64 * 1024 || blob.size() > 1024 * 1024) {
+            u8* const heap = new u8[length];
+            rasterizer.device_memory.ReadBlockUnsafe(entry.device_addr, heap, length);
+            entry.data = reinterpret_cast<u64>(heap);
+            entry.heap = 1;
+        } else {
+            const size_t offset = blob.size();
+            blob.resize(offset + length);
+            rasterizer.device_memory.ReadBlockUnsafe(entry.device_addr, blob.data() + offset,
+                                                     length);
+            entry.data = offset;
+            blob_upload_bytes += static_cast<u32>(length);
+        }
+    }
 }
 
 inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed,
@@ -1880,12 +1989,13 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
     }
 
     // Pass 2: the buffer tracker, in the order the committer synchronizes the bindings.
-    MTDetail::SeqTrackerLock lock{rasterizer.buffer_cache};
+    std::optional<MTDetail::SeqTrackerLock> lock{std::in_place, rasterizer.buffer_cache};
+    SeqDeferUploadReads();
     const auto& draw_state = real.draw_manager.draw_state;
     if (indirect != nullptr) {
         // BindHostDrawIndirectBuffers' synchronizations (the count first).
         const auto take = [&](GPUVAddr gpu_addr, u64 size) {
-            if (const auto device_addr = memory.GpuToCpuAddress(gpu_addr); device_addr && size != 0) {
+            if (const auto device_addr = SeqTranslate(gpu_addr); device_addr && size != 0) {
                 SeqTakeUploads(*device_addr, static_cast<u32>(size));
             }
         };
@@ -1901,7 +2011,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         const u32 draw_size = (index_buffer.count + index_buffer.first) *
                               static_cast<u32>(index_buffer.FormatSizeInBytes());
         const u32 size = (std::min)(address_size, draw_size);
-        const auto device_addr = memory.GpuToCpuAddress(begin);
+        const auto device_addr = SeqTranslate(begin);
         geometry_entries.push_back({
             .kind = VideoCommon::MT::GeometryEntry::Index,
             .stream = 0,
@@ -1929,7 +2039,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         const GPUVAddr begin = array.Address();
         const GPUVAddr end = native ? begin + regs.NativeVertexStreamSize(index)
                                     : regs.vertex_stream_limits[index].Address() + 1;
-        const auto device_addr = memory.GpuToCpuAddress(begin);
+        const auto device_addr = SeqTranslate(begin);
         u32 size = static_cast<u32>(end - begin);
         auto& geometry = geometry_entries.emplace_back();
         geometry = VideoCommon::MT::GeometryEntry{
@@ -1963,7 +2073,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
             DAddr device_addr = 0;
             u32 binding_size = 0;
             if (cbuf.enabled) {
-                if (const auto translated = memory.GpuToCpuAddress(cbuf.address)) {
+                if (const auto translated = SeqTranslate(cbuf.address)) {
                     device_addr = *translated;
                     binding_size = cbuf.size;
                 }
@@ -2004,6 +2114,11 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         }
     }
 
+    if (lite_seq_lock) {
+        // EDEN_NX2_MT_LITE_SEQLOCK: the rest (upload bytes, overlay) is the sequencer's own.
+        lock.reset();
+        SeqReadDeferredUploads();
+    }
     // EDEN_NX2_MT_COMPACT: the compact header's narrow counts must hold this draw's (else the
     // old layout, which every reader still parses; it touches no replica).
     compact_packet = compact && ubos.size() <= 0xff && ssbo_entries.size() <= 0xff &&
@@ -2046,6 +2161,37 @@ inline void Nx2DrawPipeline::FinishOverlay() {
 
 inline void Nx2DrawPipeline::FinishOverlayCompact() {
     using Replica = VideoCommon::MT::DescriptorReplica;
+    const size_t count = raw_reads.size();
+    std::vector<u8>& eligible = desc_eligible;
+    // EDEN_NX2_MT_LITE_CAPMEMO: the order and the eligibility depend only on the reads' addresses,
+    // sizes, kinds and offsets, not on their bytes: an identical list (same pipeline and
+    // bindings, the common case) reuses them.
+    OverlayMemo* memo = nullptr;
+    if (lite_cap_memo) {
+        u64 hash = count * 0x9E3779B97F4A7C15ull;
+        for (const RawRead& read : raw_reads) {
+            hash = (hash ^ read.gpu_addr) * 0x100000001B3ull;
+            hash = (hash ^ (u64{read.size} << 33 | u64{read.offset} << 1 | u64{read.descriptor})) *
+                   0x100000001B3ull;
+        }
+        memo = &overlay_memo[(hash >> 40) & (overlay_memo.size() - 1)];
+        const auto same = [](const RawRead& a, const RawRead& b) {
+            return a.gpu_addr == b.gpu_addr && a.size == b.size && a.offset == b.offset &&
+                   a.descriptor == b.descriptor;
+        };
+        if (memo->hash == hash && memo->reads.size() == count &&
+            std::equal(raw_reads.begin(), raw_reads.end(), memo->reads.begin(), same)) {
+            raw_reads.assign(memo->sorted.begin(), memo->sorted.end());
+            eligible.assign(memo->eligible.begin(), memo->eligible.end());
+            if (VideoCommon::MT::Stats()) {
+                counters.overlay_memo_hits.fetch_add(1, std::memory_order_relaxed);
+            }
+            FinishOverlayCompactSlots();
+            return;
+        }
+        memo->hash = hash;
+        memo->reads.assign(raw_reads.begin(), raw_reads.end());
+    }
     // Same order as FinishOverlay (address), ties broken so duplicates are adjacent.
     std::sort(raw_reads.begin(), raw_reads.end(), [](const RawRead& a, const RawRead& b) {
         return a.gpu_addr != b.gpu_addr ? a.gpu_addr < b.gpu_addr : a.size < b.size;
@@ -2054,8 +2200,6 @@ inline void Nx2DrawPipeline::FinishOverlayCompact() {
     // no other read overlaps it, and no other kind of read touches it (FinishOverlay merges
     // touching reads, and a reader could read across them). Descriptor reads are exactly the
     // 32-byte entries the readers ask for, so touching ones may stay separate entries.
-    const size_t count = raw_reads.size();
-    std::vector<u8>& eligible = desc_eligible;
     eligible.assign(count, 0);
     u64 max_end_plain = 0; // end of the reads before, by kind
     u64 max_end_desc = 0;
@@ -2088,6 +2232,17 @@ inline void Nx2DrawPipeline::FinishOverlayCompact() {
             max_end_plain = (std::max)(max_end_plain, end);
         }
     }
+    if (memo != nullptr) {
+        memo->sorted.assign(raw_reads.begin(), raw_reads.end());
+        memo->eligible.assign(eligible.begin(), eligible.end());
+    }
+    FinishOverlayCompactSlots();
+}
+
+inline void Nx2DrawPipeline::FinishOverlayCompactSlots() {
+    using Replica = VideoCommon::MT::DescriptorReplica;
+    const size_t count = raw_reads.size();
+    const std::vector<u8>& eligible = desc_eligible;
     // Pass 1, against the table as the readers have it before this packet: references.
     // Pass 2: the misses replace their slots (in this order on every reader).
     desc_refs.clear();
@@ -2925,6 +3080,27 @@ inline bool Nx2DrawPipeline::SeqInlineToMemory(GPUVAddr address, std::optional<D
 
 namespace Vulkan {
 
+inline bool Nx2DrawPipeline::SeqPagesMayHoldGpuData(DAddr device_addr, u64 size) const {
+    if (!lite_seq_lock || size == 0 || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    // EDEN_NX2_MT_LITE_SEQLOCK: MtPageHoldsGpuData asks whether GPU-modified ranges touch the
+    // range's pages. Those ranges only lie on pages marked GPU-written (never cleared; the test
+    // IsRegionGpuModified and SeqMayHoldGpuBufferData make with EDEN_NX2_GPU_MODIFIED_FAST).
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_GPU_MODIFIED_FAST");
+    if (!Tegra::Nx2Switch(mode, true)) {
+        return true;
+    }
+    const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+    for (DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE); page < end;
+         page += u64{1} << Tegra::Nx2WrittenPageBits) {
+        if (Tegra::Nx2IsGpuWritten(page)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline void Nx2DrawPipeline::SeqInvalidateBuffers(
     std::span<const std::pair<DAddr, std::size_t>> regions) {
     RasterizerVulkan& r = rasterizer;
@@ -2938,12 +3114,16 @@ inline void Nx2DrawPipeline::SeqInvalidateBuffers(
         {
             // EDEN_NX2_MT_INVAL_ONELOCK: one hold of the (recursive) tracker lock for all the
             // ranges; the calls below take it again cheaply. Nothing here takes a cache mutex.
+            // EDEN_NX2_MT_LITE_SEQLOCK: one hold for a single range too (MtPageHoldsGpuData and
+            // MtTrapWrite took it twice, the first often contended with the committer).
             std::optional<VideoCommon::MT::TrackerScope> one_lock;
-            if (regions.size() > 1 && VideoCommon::MT::InvalOneLock()) {
+            if ((regions.size() > 1 || (lite_seq_lock && !regions.empty())) &&
+                VideoCommon::MT::InvalOneLock()) {
                 one_lock.emplace(r.buffer_cache.MtTrackerMutex());
             }
             for (const auto& [addr, size] : regions) {
-                if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
+                if (SeqPagesMayHoldGpuData(addr, size) &&
+                    r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
                     owner_ranges.emplace_back(addr, size);
                 } else if (r.buffer_cache.MtTrapWrite(addr, size, false) == Result::NeedsMutex) {
                     mutex_ranges.emplace_back(addr, size);
@@ -3005,6 +3185,7 @@ namespace Vulkan {
 
 inline void Nx2DrawPipeline::ClearCapture() {
     compact_packet = false;
+    defer_upload_reads = false;
     desc_refs.clear();
     desc_inserts.clear();
     blob_ubo_bytes = 0;
@@ -3215,7 +3396,8 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
         }
     }
 
-    MTDetail::SeqTrackerLock lock{rasterizer.buffer_cache};
+    std::optional<MTDetail::SeqTrackerLock> lock{std::in_place, rasterizer.buffer_cache};
+    SeqDeferUploadReads();
     const u32 alignment = rasterizer.buffer_cache.MtUniformBufferAlignment();
     const u32 skip_size = rasterizer.buffer_cache.MtSkipCacheSize();
     const auto& sizes = pipeline->UniformSizes();
@@ -3226,7 +3408,7 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
         DAddr device_addr = 0;
         u32 binding_size = 0;
         if (enabled(index)) {
-            if (const auto translated = memory.GpuToCpuAddress(cbufs[index].Address())) {
+            if (const auto translated = SeqTranslate(cbufs[index].Address())) {
                 device_addr = *translated;
                 binding_size = cbufs[index].size;
             }
@@ -3268,6 +3450,11 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
     }
     if (indirect_device_addr != 0) {
         SeqTakeUploads(indirect_device_addr, 12);
+    }
+    if (lite_seq_lock) {
+        // EDEN_NX2_MT_LITE_SEQLOCK: as CaptureDraw.
+        lock.reset();
+        SeqReadDeferredUploads();
     }
     FinishOverlay();
     return -1;

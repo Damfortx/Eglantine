@@ -235,7 +235,12 @@ bool DmaPusher::Step() {
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
             !IsKnownCpuCommandList(dma_state.dma_get, size_t{header.size} * sizeof(u32)) &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            // EDEN_NX2_MT_LITE_WRITERS: the committer only up to its queued guest writes (the
+            // sequencer marks what the writers write at capture; GPU-written lists wait below).
+            VideoCommon::GpuSplit::Get().WaitForWriters(
+                VideoCommon::MT::LiteWritersSettle()
+                    ? VideoCommon::GpuSplit::DrainReason::WritersCpuCommands
+                    : VideoCommon::GpuSplit::DrainReason::WritersCommands)) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             // EDEN_NX2_GPU_PROFILE: how often waiting for the writers found a GPU-written list.

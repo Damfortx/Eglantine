@@ -44,6 +44,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/mt/capture.h"
+#include "video_core/mt/lite2_tracker_switches.h"
 #include "video_core/mt/lite_switches.h"
 #include "video_core/mt/resolve_packet.h"
 #include "video_core/mt/role.h"
@@ -351,6 +352,30 @@ public:
         return tracker_mutex;
     }
 
+    /// EDEN_NX2_MT_LITE_CTRACK: while one is open on the committer recording a packet
+    /// (MT::t_capture set), MarkWrittenBuffer queues its tracker half; the outermost one applies
+    /// the queue under a single tracker_mutex hold when it closes. Nests (bind passes open their
+    /// own; a caller may wrap a whole draw). Inert with the switch off or outside a packet.
+    class MtWrittenBatch {
+    public:
+        explicit MtWrittenBatch(BufferCache& cache_)
+            : cache{MT::t_capture != nullptr && MT::LiteCommitTracker() ? &cache_ : nullptr} {
+            if (cache != nullptr) {
+                ++cache->mt_written_batch_depth;
+            }
+        }
+        ~MtWrittenBatch() {
+            if (cache != nullptr && --cache->mt_written_batch_depth == 0) {
+                cache->MtFlushWrittenBatch();
+            }
+        }
+        MtWrittenBatch(const MtWrittenBatch&) = delete;
+        MtWrittenBatch& operator=(const MtWrittenBatch&) = delete;
+
+    private:
+        BufferCache* cache;
+    };
+
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);
@@ -581,6 +606,12 @@ private:
 
     void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
 
+    /// MarkWrittenBuffer's tracker half (tracker_mutex held).
+    void MarkWrittenTracked(BufferId buffer_id, DAddr device_addr, u32 size);
+
+    /// EDEN_NX2_MT_LITE_CTRACK: applies the written ranges queued by MtWrittenBatch.
+    void MtFlushWrittenBatch();
+
     /// Counts a GPU write to the command list pages in the range (invalidating their copies) and,
     /// while collecting, asks for new copies.
     void Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64 size);
@@ -730,6 +761,18 @@ private:
     /// by the next RefreshRepackedVertexBuffers. Guarded by tracker_mutex.
     std::vector<std::pair<DAddr, u64>> mt_stale_ranges;
     std::atomic<bool> mt_stale_pending{};
+    /// EDEN_NX2_MT_LITE_CTRACK: mt_stale_ranges swapped out under the lock, applied after it
+    /// (committer only).
+    std::vector<std::pair<DAddr, u64>> mt_stale_scratch;
+    /// EDEN_NX2_MT_LITE_CTRACK: MarkWrittenBuffer's tracker halves deferred by an open
+    /// MtWrittenBatch (committer only, like the bind passes that fill it).
+    struct MtWrittenRange {
+        BufferId buffer_id;
+        DAddr device_addr;
+        u32 size;
+    };
+    boost::container::small_vector<MtWrittenRange, 16> mt_written_batch;
+    u32 mt_written_batch_depth = 0;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
     /// Set (by the GPU thread) whenever downloads are queued for the next fence; cleared once a
     /// commit leaves none. Fences check it before taking the contended cache lock.

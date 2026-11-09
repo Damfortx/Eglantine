@@ -479,6 +479,16 @@ void GpuSplit::WaitSettled(u64 target) {
     front_waiting.store(false, std::memory_order_relaxed);
 }
 
+void GpuSplit::TimedWaitSettled(u64 target) {
+    if (!Nx2Profile::Enabled()) {
+        WaitSettled(target);
+        return;
+    }
+    const u64 begin = Nx2Profile::Now();
+    WaitSettled(target);
+    settle_wait_ns += Nx2Profile::Now() - begin;
+}
+
 void GpuSplit::StoreSettled(u64 position) {
     u64 current = settled.load(std::memory_order_relaxed);
     while (current < position &&
@@ -518,6 +528,8 @@ void GpuSplit::CountWait(DrainReason reason, bool waited, u64 wait_ns) {
     ++stat_calls[index];
     stat_waits[index] += waited ? 1 : 0;
     stat_wait_ns[index] += wait_ns;
+    stat_settle_ns[index] += settle_wait_ns;
+    settle_wait_ns = 0;
     if (!Nx2Profile::Enabled()) {
         return;
     }
@@ -532,15 +544,20 @@ void GpuSplit::CountWait(DrainReason reason, bool waited, u64 wait_ns) {
     static constexpr std::array<const char*, static_cast<size_t>(DrainReason::Count)> names{
         "other",   "sync",   "gpu-written commands", "front state",       "dma read",
         "verify",  "puller", "writers (commands)",   "writers (dma read)", "position",
-        "ring full"};
+        "ring full", "writers (cpu lists)"};
     const double seconds = static_cast<double>(now - stat_window_start) / 1e9;
     std::string line;
     for (size_t i = 0; i < names.size(); ++i) {
         if (stat_calls[i] != 0) {
-            line += fmt::format(" | {} {:.0f}/s ({:.0f} waited, {:.1f} ms)", names[i],
+            line += fmt::format(" | {} {:.0f}/s ({:.0f} waited, {:.1f} ms", names[i],
                                 static_cast<double>(stat_calls[i]) / seconds,
                                 static_cast<double>(stat_waits[i]) / seconds,
                                 static_cast<double>(stat_wait_ns[i]) / 1e6 / seconds);
+            // Under the MT back: the part spent waiting for the committer (settled).
+            line += stat_settle_ns[i] != 0
+                        ? fmt::format(", {:.1f} ms committer)",
+                                      static_cast<double>(stat_settle_ns[i]) / 1e6 / seconds)
+                        : std::string{")"};
         }
     }
     line += fmt::format(" | predicted acquires {:.0f}/s",
@@ -550,6 +567,7 @@ void GpuSplit::CountWait(DrainReason reason, bool waited, u64 wait_ns) {
     stat_waits = {};
     stat_wait_ns = {};
     stat_calls = {};
+    stat_settle_ns = {};
     stat_window_start = now;
 }
 
@@ -574,7 +592,7 @@ void GpuSplit::Drain(DrainReason reason) {
     const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     WaitConsumed(write_position);
     if (MtActive()) {
-        WaitSettled(write_position);
+        TimedWaitSettled(write_position);
     }
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
@@ -610,13 +628,20 @@ void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
     Publish();
     WaitConsumed(position);
     if (MtActive()) {
-        WaitSettled(lite ? ReadSettleTarget(position, reason) : position);
+        TimedWaitSettled(lite ? ReadSettleTarget(position, reason) : position);
     }
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
 
 u64 GpuSplit::ReadSettleTarget(u64 target, DrainReason reason) const {
+    // EDEN_NX2_MT_LITE_WRITERS: a command list on pages no GPU work wrote, or an MME DMA read
+    // under no write the front noted (it notes every release and report it sends, with its
+    // position or value), can only see a committer write that is not a semaphore/report word nor
+    // a fence: a DMA copy, a download (whose pages the sequencer marked GPU-written already)...
+    if (LiteWritersReason(reason)) {
+        return std::min(target, committer_bulk_write_position.load(std::memory_order_acquire));
+    }
     // EDEN_NX2_MT_DMA_CONSUMED (alternates): an MME DMA read of pages the GPU has not written
     // needs the sequencer past `target` (engines write guest memory there and mark GPU-written
     // ranges at capture) and only the committer's own guest writes queued before it, not the
@@ -656,7 +681,7 @@ void GpuSplit::DrainToSettleTarget(DrainReason reason) {
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     WaitConsumed(target);
-    WaitSettled(ReadSettleTarget(target, reason));
+    TimedWaitSettled(ReadSettleTarget(target, reason));
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     publish_every = 8;
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
@@ -678,7 +703,7 @@ bool GpuSplit::WaitForWriters(DrainReason reason) {
     Publish();
     WaitConsumed(target);
     if (MtActive()) {
-        WaitSettled(ReadSettleTarget(target, reason));
+        TimedWaitSettled(ReadSettleTarget(target, reason));
     }
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
@@ -947,6 +972,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             back_exec_position = read_position;
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
+            if (exec_wrote_committer) [[unlikely]] {
+                exec_wrote_committer = false;
+                // EDEN_NX2_MT_LITE_WMARK: settled can reach the write without the rest.
+                if (mt && VideoCommon::MT::LiteWriteMark() && read_position != available) {
+                    mt_back->SeqMark(read_position);
+                }
+            }
             if (hook_requested.load(std::memory_order_relaxed) && idle_hook != nullptr &&
                 !mt) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);

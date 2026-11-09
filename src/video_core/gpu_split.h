@@ -111,8 +111,15 @@ public:
     void StoreSettled(u64 position);
     /// Sequencer (EDEN_NX2_MT_DMA_CONSUMED): the entry it runs queued a Command that writes guest
     /// memory on the committer (fence/semaphore releases, query reports, downloads, DMA...).
-    void NoteCommitterWrite() {
+    /// `bulk`: not a semaphore/report word nor a fence (a DMA copy or clear, a download, other
+    /// work): what a command list or an MME DMA read the front noted no write for may still wait
+    /// for (EDEN_NX2_MT_LITE_WRITERS).
+    void NoteCommitterWrite(bool bulk = true) {
         const u64 position = back_exec_position + 1;
+        exec_wrote_committer = true;
+        if (bulk && committer_bulk_write_position.load(std::memory_order_relaxed) < position) {
+            committer_bulk_write_position.store(position, std::memory_order_release);
+        }
         if (committer_write_position.load(std::memory_order_relaxed) < position) {
             committer_write_position.store(position, std::memory_order_release);
         }
@@ -334,6 +341,8 @@ public:
         WritersDmaRead,      ///< WaitForWriters before an MME DMA read
         Position,            ///< WaitForPosition
         RingFull,            ///< the ring has no room (WaitForSpace)
+        WritersCpuCommands,  ///< WaitForWriters before a command list not known GPU-written
+                             ///< (EDEN_NX2_MT_LITE_WRITERS; else WritersCommands)
         Count,
     };
     void Drain(DrainReason reason = DrainReason::Other);
@@ -603,7 +612,12 @@ private:
     /// the counts by reason every 10 s ("GPU split drains per second:").
     void CountWait(DrainReason reason, bool waited, u64 wait_ns);
     std::array<u64, static_cast<size_t>(DrainReason::Count)> stat_waits{}, stat_wait_ns{},
-        stat_calls{};
+        stat_calls{}, stat_settle_ns{};
+    /// EDEN_NX2_GPU_PROFILE: time the current wait spent in WaitSettled (the committer's part),
+    /// added to its reason by CountWait.
+    u64 settle_wait_ns{};
+    /// WaitSettled, timed for the drain report.
+    void TimedWaitSettled(u64 target);
     u64 stat_window_start{};
 
     enum class Kind : u64 {
@@ -739,8 +753,13 @@ private:
     /// EDEN_NX2_MT_DMA_CONSUMED: 1 + the ring position of the last entry that queued a committer
     /// guest write (sequencer stores it before it stores `consumed` past that entry).
     alignas(128) std::atomic<u64> committer_write_position{};
+    /// EDEN_NX2_MT_LITE_WRITERS: as committer_write_position, for the bulk writes only (no
+    /// semaphore/report words, no fences). Stored before committer_write_position.
+    std::atomic<u64> committer_bulk_write_position{};
     /// Sequencer-owned: ring position of the entry Execute runs.
     u64 back_exec_position{};
+    /// Sequencer-owned: the entry Execute runs queued a committer guest write (NoteCommitterWrite).
+    bool exec_wrote_committer{};
     /// The `settled` position a front read must wait for once `consumed` reached `target`.
     [[nodiscard]] u64 ReadSettleTarget(u64 target, DrainReason reason) const;
     /// EDEN_NX2_MT_LITE_DRAIN: the reasons whose waits only need the sequencer and the
@@ -749,6 +768,13 @@ private:
         return VideoCommon::MT::LiteDrain() &&
                (reason == DrainReason::Puller || reason == DrainReason::Sync ||
                 reason == DrainReason::Position);
+    }
+    /// EDEN_NX2_MT_LITE_WRITERS: the writer waits whose reads the front noted no write for: they
+    /// only need the committer's bulk writes (committer_bulk_write_position).
+    [[nodiscard]] static bool LiteWritersReason(DrainReason reason) {
+        return VideoCommon::MT::LiteWritersSettle() &&
+               (reason == DrainReason::WritersCpuCommands ||
+                reason == DrainReason::WritersDmaRead);
     }
     /// DrainForRead's wait: `consumed` past everything sent, `settled` past ReadSettleTarget.
     void DrainToSettleTarget(DrainReason reason);

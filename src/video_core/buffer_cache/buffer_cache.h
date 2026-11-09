@@ -516,6 +516,7 @@ void BufferCache<P>::UpdateComputeBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
+    MtWrittenBatch written_batch{*this}; // EDEN_NX2_MT_LITE_CTRACK (transform feedback)
     if (is_indexed) {
         BindHostIndexBuffer();
     } else if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
@@ -535,6 +536,8 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::BindHostStageBuffers(size_t stage) {
+    // EDEN_NX2_MT_LITE_CTRACK: one tracker hold for the stage's written storage/texture buffers.
+    MtWrittenBatch written_batch{*this};
     BindHostGraphicsUniformBuffers(stage);
     if (channel_state->enabled_storage_buffers[stage] != 0) {
         BindHostGraphicsStorageBuffers(stage);
@@ -546,6 +549,9 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
 
 template <class P>
 void BufferCache<P>::BindHostComputeBuffers() {
+    // EDEN_NX2_MT_LITE_CTRACK: one tracker hold for the dispatch's written storage/texture
+    // buffers.
+    MtWrittenBatch written_batch{*this};
     BindHostComputeUniformBuffers();
     if (channel_state->enabled_compute_storage_buffers != 0) {
         BindHostComputeStorageBuffers();
@@ -1987,7 +1993,21 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     for (auto& ranges : pending_download_ranges) {
         ranges.Subtract(device_addr, size);
     }
+    if (mt_written_batch_depth != 0) [[unlikely]] {
+        // EDEN_NX2_MT_LITE_CTRACK: the committer recording a packet. The sequencer already made
+        // these marks at capture (MtCaptureWrittenRange), so traps and captures see the range
+        // GPU-modified meanwhile; nothing this bind pass does on the committer reads the tracker
+        // (SynchronizeBuffer returns at once under t_capture; VERIFY's check reads CPU bits,
+        // which these marks don't touch), and the batch is applied before the draw is recorded.
+        mt_written_batch.push_back(MtWrittenRange{buffer_id, device_addr, size});
+        return;
+    }
     MT::TrackerScope tracker_scope{tracker_mutex};
+    MarkWrittenTracked(buffer_id, device_addr, size);
+}
+
+template <class P>
+void BufferCache<P>::MarkWrittenTracked(BufferId buffer_id, DAddr device_addr, u32 size) {
     MT::BumpWriteGeneration(device_addr, size);
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
@@ -1997,6 +2017,21 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
         Tegra::Nx2MarkGpuWritten(device_addr, size);
         Nx2NoteListWrite(buffer_id, device_addr, size);
     }
+}
+
+template <class P>
+void BufferCache<P>::MtFlushWrittenBatch() {
+    if (mt_written_batch.empty()) {
+        return;
+    }
+    // One hold for the pass; QueueFenceDownload/ArmReadTraps inside re-enter it (recursive, the
+    // owner check only). The marks are still made again here, as MarkWrittenBuffer does: a flush
+    // or download between capture and commit may have cleared the capture's.
+    MT::TrackerScope tracker_scope{tracker_mutex};
+    for (const MtWrittenRange& range : mt_written_batch) {
+        MarkWrittenTracked(range.buffer_id, range.device_addr, range.size);
+    }
+    mt_written_batch.clear();
 }
 
 template <class P>
