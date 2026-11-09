@@ -20,3 +20,9 @@ B (mkw-mt-lite ef10090), 2x attract demo, idle PC:
 - Puller waits in 10 s: acquire drain 1641, acquire fences 1039, resume poll 16404 (1004 behind).
 - Acquire drains in 10 s: site1 op41 pending unmet 315, site1 op41 pending met 85, site2 op40 none unmet 693, site2 op41 none unmet 30, site2 op43 none met 518; top addresses 0x2105037010 (496), 0x21f6297000 (355), 0x21f6297100 (338), 0x21f6297040 (236), 0x21f6297140 (194).
 => The front now mostly waits on the SEQUENCER (committer share small).
+
+# Iteration 4 (7a77643) measured
+- fps 2x: MT lite 62.5 / 58.5 / 66.0 (mean 62.3) vs MT unset 46.0 / 59.1 / 58.1 (mean 54.4): +15%; absolute similar to iteration 3 (66.1), within noise. VERIFY no mismatches, 0 "waits on semaphore", watchdog 0.
+- Drains/s (EDEN_NX2_PULLER_STATS run): puller 415 (139 waited, 40.4 ms; was 98), writers(commands) 11.7k (408 waited, 147.7 ms, committer 32.7 ms; was 83.5), writers(dma read) 53 (5 waited, 10.8 ms; was 46), position 53 (48 waited, 50.3 ms; was 84), other 23 (5.1 ms). Total ~254 ms/s (was 324).
+- Puller waits in 10 s: acquire drain 571, acquire fences 545 (0 behind), resume poll 3367 (405 behind), acquire nodrain 416, acquire ledger 473, acquire seq wait 473.
+=> Next limiter: writers(commands) waits before reading command lists (147.7 ms/s, ~0.36 ms each).
