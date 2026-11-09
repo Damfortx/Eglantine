@@ -41,6 +41,7 @@
 #include "video_core/mt/epoch.h"
 #include "video_core/mt/maxwell3d_reg_names.h"
 #include "video_core/mt/mt_switches.h"
+#include "video_core/mt/perf_switches.h"
 #include "video_core/mt/packet_compact.h"
 #include "video_core/mt/reg_delta.h"
 #include "video_core/mt/resolve_packet.h"
@@ -572,6 +573,10 @@ private:
     /// (LRU touch, blacklist rating, storage writes) applied.
     void PrepareResolvedTextures(const MT::ResolvedDraw& res,
                                  GraphicsPipeline::MtResolvedTextures& out);
+    /// Committer (EDEN_NX2_MT_RALIAS, vk_mt_resolve.h): before Validate, SynchronizeAliases for
+    /// the result's views marked `alias` (texture mutex held inside). A rescale it causes bumps
+    /// the image version, so Validate then sends the draw down the slow path.
+    void SyncResolvedAliases(const MT::ResolvedDraw& res);
     /// Committer (EDEN_NX2_MT_RBUF), inside ConfigureResolved: the buffer intents of a result.
     void ApplyResolvedBuffers(const MT::ResolvedDraw& res, bool is_indexed);
     void RunEntry(const u64* entry);
