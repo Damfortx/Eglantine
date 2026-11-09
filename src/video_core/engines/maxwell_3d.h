@@ -10,6 +10,7 @@
 #include <bitset>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -41,6 +42,11 @@ class MemoryManager;
 namespace VideoCommon {
 class GpuSplit;
 }
+
+namespace VideoCommon::MT::GpuParam {
+struct Segment;
+struct Call;
+} // namespace VideoCommon::MT::GpuParam
 
 namespace VideoCore {
 class RasterizerInterface;
@@ -3256,6 +3262,19 @@ public:
     void FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                        const u32* words, u32 count, bool ends_method);
 
+    /// Reads `count` words at a GPU address the way a GPU-written command list is read (waiting
+    /// for its writers): EDEN_NX2_GPUPARAM_CHECK.
+    using GpuParamReader = std::function<bool(u64 gpu_addr, u32 count, u32* out)>;
+    /// EDEN_NX2_MT_LITE_GPUPARAM / EDEN_NX2_GPUPARAM (video_core/mt/gpuparam.h): the rest of the
+    /// parameters of macro call `method` (whose CPU-written parameters this engine, or the split
+    /// front, already holds) are the GPU-written words of `segments` (they end the call). When
+    /// the macro is an indexed (multi-)draw whose parameters an indirect draw can take from GPU
+    /// memory, the call runs with zero words in their place and the back draws indirectly from
+    /// the segments: true, the words are never read. False: nothing done, read them as before.
+    bool GpuParamCall(Core::System& system, u32 method,
+                      const VideoCommon::MT::GpuParam::Segment* segments, size_t segment_count,
+                      const GpuParamReader* check_reader);
+
     bool ShouldExecute() const {
         return execute_on;
     }
@@ -3440,6 +3459,10 @@ private:
                          bool sent);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// GpuParamCall's indirect draw (on the back with the split, else inline).
+    void GpuParamDraw(Core::System& system, const VideoCommon::MT::GpuParam::Call& call);
+    struct GpuParamState;
+    std::unique_ptr<GpuParamState> gpuparam;
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,

@@ -23,6 +23,8 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/mt/gpuparam.h"
+#include <fmt/ranges.h>
 #include "video_core/nx2.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_profile.h"
@@ -1651,6 +1653,239 @@ void Maxwell3D::FinishFrontMacro(Core::System& system) {
     // What ProcessMacro and CallMacroMethod do around the macro.
     ConsumeSink(system);
     draw_manager.DrawDeferred(*this);
+}
+
+// ---- GPU-written macro parameters (video_core/mt/gpuparam.h, docs/gpuparam-plan.md) ----
+
+namespace GP = VideoCommon::MT::GpuParam;
+static_assert(MAXWELL3D_REG_INDEX(draw.end) == GP::RegDrawEnd);
+static_assert(MAXWELL3D_REG_INDEX(draw.begin) == GP::RegDrawBegin);
+static_assert(MAXWELL3D_REG_INDEX(index_buffer.format) == GP::RegIndexFormat);
+static_assert(MAXWELL3D_REG_INDEX(index_buffer.first) == GP::RegIndexFirst);
+static_assert(MAXWELL3D_REG_INDEX(index_buffer.count) == GP::RegIndexCount);
+static_assert(MAXWELL3D_REG_INDEX(vertex_id_base) == GP::RegVertexIdBase);
+static_assert(MAXWELL3D_REG_INDEX(global_base_vertex_index) == GP::RegBaseVertex);
+static_assert(MAXWELL3D_REG_INDEX(global_base_instance_index) == GP::RegBaseInstance);
+static_assert(Maxwell3D::Regs::MeshControl == GP::RegMeshControl);
+static_assert(MacroRegistersStart == GP::MacroRegistersStart);
+static_assert(static_cast<u32>(Maxwell3D::Regs::IndexFormat::UnsignedByte) == 0);
+
+struct Maxwell3D::GpuParamState {
+    GP::Classifier classifier;
+    GP::Stats stats;
+    std::vector<u32> words;  ///< EDEN_NX2_GPUPARAM_CHECK: the words read as before
+    std::vector<u32> params; ///< the zero-parameter call without the split front
+    std::vector<GP::DrawRecord> actual;
+    std::vector<GP::DrawRecord> expected;
+    u32 mismatch_logs{};
+};
+
+bool Maxwell3D::GpuParamCall(Core::System& system, u32 method, const GP::Segment* segments,
+                             size_t segment_count, const GpuParamReader* check_reader) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    const bool front_path = split.Active() && split.FrontMacros();
+#ifndef ARCHITECTURE_x86_64
+    if (front_path) {
+        return false; // FrontRunMacro needs the macro JIT
+    }
+#endif
+    if (segment_count == 0 || !GP::On(front_path && split.MtActive())) {
+        return false;
+    }
+    auto& engine = GetNativeMacroEngine();
+    if (!gpuparam) {
+        gpuparam = std::make_unique<GpuParamState>();
+    }
+    GpuParamState& gs = *gpuparam;
+    const auto keep_waiting = [&gs](GP::Reason reason) {
+        gs.stats.Note(reason);
+        gs.stats.MaybeLog();
+        return false;
+    };
+    if (!engine.native_turing) {
+        return keep_waiting(GP::Reason::NoCode);
+    }
+    FrontState* const fs = front_path ? &Front(system, split) : nullptr;
+    const u32 current = fs != nullptr ? fs->executing_macro : executing_macro;
+    const u32 macro_method = current != 0 ? current : (method & ~1U);
+    const std::vector<u32>& cpu = fs != nullptr ? fs->parameters : macro_params;
+    const u32* const reg_file = fs != nullptr ? fs->regs.data() : regs.reg_array.data();
+    const auto control = fs != nullptr ? fs->control : shadow_state.shadow_ram_control;
+
+    // The layout: p0 from the CPU, then 5 words, or a draw count and N records of 5 words (in
+    // one entry, or a 1-word entry and an entry of records).
+    if (cpu.size() != 1) {
+        return keep_waiting(GP::Reason::CpuParams);
+    }
+    u64 words = 0;
+    for (size_t i = 0; i < segment_count; ++i) {
+        words += segments[i].words;
+    }
+    GP::Call call{};
+    call.begin = cpu[0];
+    if (words == 5 && segment_count == 1) {
+        call.kind = GP::Kind::IndexedSingle;
+        call.records_addr = segments[0].gpu_addr;
+        call.max_draws = 1;
+    } else if (words >= 6 && (words - 1) % 5 == 0 && words <= 1 + 5 * 4096) {
+        call.kind = GP::Kind::IndexedMulti;
+        call.max_draws = static_cast<u32>((words - 1) / 5);
+        if (segment_count == 1) {
+            call.count_addr = segments[0].gpu_addr;
+            call.records_addr = segments[0].gpu_addr + sizeof(u32);
+        } else if (segment_count == 2 && segments[0].words == 1) {
+            call.count_addr = segments[0].gpu_addr;
+            call.records_addr = segments[1].gpu_addr;
+        } else {
+            return keep_waiting(GP::Reason::Layout);
+        }
+    } else {
+        return keep_waiting(GP::Reason::Layout);
+    }
+    if (((call.begin >> 26) & 3) != 0) {
+        return keep_waiting(GP::Reason::InstanceBits);
+    }
+    if (!GP::IsTopologySafe(call.begin & 0xffff)) {
+        return keep_waiting(GP::Reason::Topology);
+    }
+    if (control == Regs::ShadowRamControl::Replay) {
+        return keep_waiting(GP::Reason::ShadowReplay);
+    }
+    if ((reg_file[GP::RegMeshControl] & 1) != 0) {
+        return keep_waiting(GP::Reason::Mesh);
+    }
+    if (reg_file[GP::RegIndexFormat] == 0) {
+        return keep_waiting(GP::Reason::IndexU8);
+    }
+
+    // The macro's code against the reference model (cached unless it reads state).
+    const auto positions = GetNativeMacroPositions();
+    const u32 index = (macro_method - MacroRegistersStart) >> 1;
+    const std::span<const u32> code_ram{engine.native_code};
+    const std::span<const u32> reg_span{reg_file, Regs::NUM_REGS};
+    const auto executable = [this](u32 m) {
+        return m < execution_mask.size() && execution_mask[m];
+    };
+    const auto verdict = gs.classifier.Verify(code_ram, positions, index,
+                                              engine.native_code_generation, call.kind, call.begin,
+                                              call.max_draws, reg_span, native_data_ram, executable);
+    gs.stats.verified += verdict.cached ? 0 : 1;
+    if (!verdict.ok) {
+        ++gs.stats.rejects[static_cast<size_t>(verdict.reject)];
+        return keep_waiting(GP::Reason::Rejected);
+    }
+
+    // EDEN_NX2_GPUPARAM_CHECK: the words as the old path reads them (after their writers), and
+    // the macro's draws for them against the indirect draw's.
+    if (check_reader != nullptr && *check_reader) {
+        gs.words.resize(words);
+        bool read = true;
+        size_t offset = 0;
+        for (size_t i = 0; i < segment_count && read; ++i) {
+            read = (*check_reader)(segments[i].gpu_addr, segments[i].words,
+                                   gs.words.data() + offset);
+            offset += segments[i].words;
+        }
+        if (!read) {
+            ++gs.stats.check_unreadable;
+        } else {
+            std::string_view error;
+            const u32 start = positions[index % positions.size()];
+            const bool same = gs.classifier.Compare(code_ram, start, call.kind, call.begin,
+                                                    call.max_draws, gs.words, reg_span,
+                                                    native_data_ram, executable, gs.actual,
+                                                    gs.expected, error);
+            ++gs.stats.check_compared;
+            gs.stats.check_draws += gs.expected.size();
+            if (!same) {
+                ++gs.stats.check_mismatch;
+                if (gs.mismatch_logs++ < 16) {
+                    size_t first_difference = 0;
+                    while (first_difference < gs.actual.size() &&
+                           first_difference < gs.expected.size() &&
+                           gs.actual[first_difference] == gs.expected[first_difference]) {
+                        ++first_difference;
+                    }
+                    const auto describe = [](const std::vector<GP::DrawRecord>& draws, size_t i) {
+                        if (i >= draws.size()) {
+                            return std::string{"none"};
+                        }
+                        const auto& d = draws[i];
+                        return fmt::format("begin {:#x} count {} first {} base vertex {:#x} "
+                                           "base instance {} indexed {}",
+                                           d.begin, d.count, d.first, d.base_vertex,
+                                           d.base_instance, d.indexed);
+                    };
+                    LOG_WARNING(HW_GPU,
+                                "GPU params check: macro {} at {:#x} ({} words): macro draws {}, "
+                                "indirect draws {}{}{}; first difference #{}: macro {} / "
+                                "indirect {}; words {:x}",
+                                index, call.records_addr, words, gs.actual.size(),
+                                gs.expected.size(), error.empty() ? "" : ", error ", error,
+                                first_difference, describe(gs.actual, first_difference),
+                                describe(gs.expected, first_difference),
+                                fmt::join(std::span<const u32>{gs.words}.first(
+                                              std::min<size_t>(gs.words.size(), 16)),
+                                          ","));
+                }
+            }
+        }
+    }
+
+    // The call with zero GPU words: the registers it leaves, no draw. Then the indirect draw.
+    if (fs != nullptr) {
+#ifdef ARCHITECTURE_x86_64
+        fs->executing_macro = macro_method;
+        fs->parameters.resize(1 + words, 0U);
+        FrontRunMacro(system, split, *fs);
+        struct BackDraw {
+            Maxwell3D* self;
+            Core::System* system;
+            GP::Call call;
+            void operator()() const {
+                self->GpuParamDraw(*system, call);
+            }
+        };
+        split.Defer(BackDraw{this, &system, call});
+#endif
+    } else {
+        ConsumeSink(system);
+        gs.params.assign(macro_params.begin(), macro_params.end());
+        gs.params.resize(1 + words, 0U);
+        CallMacroMethod(system, macro_method, gs.params);
+        macro_params.clear();
+        macro_segments.clear();
+        current_macro_dirty = false;
+        GpuParamDraw(system, call);
+    }
+    gs.stats.Note(GP::Reason::Deferred);
+    ++(call.kind == GP::Kind::IndexedSingle ? gs.stats.single : gs.stats.multi);
+    gs.stats.entries += segment_count;
+    gs.stats.MaybeLog();
+    return true;
+}
+
+void Maxwell3D::GpuParamDraw(Core::System& system, const GP::Call& call) {
+    // As CallMacroMethod/FinishFrontMacro before the macro's draw: pending state, then a pending
+    // instanced draw. Then HLE_DrawIndexedIndirect's draw with the words in GPU memory.
+    ConsumeSink(system);
+    draw_manager.DrawDeferred(*this);
+    auto& params = draw_manager.indirect_state;
+    params.is_byte_count = false;
+    params.is_indexed = true;
+    params.include_count = call.count_addr != 0;
+    params.count_start_address = call.count_addr;
+    params.indirect_start_address = call.records_addr;
+    params.buffer_size = size_t{call.max_draws} * 5 * sizeof(u32);
+    params.max_draw_counts = call.max_draws;
+    params.stride = call.kind == GP::Kind::IndexedSingle ? 0 : 5 * sizeof(u32);
+    const u32 estimate = static_cast<u32>(EstimateIndexBufferSize());
+    dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    draw_manager.DrawIndexedIndirect(*this, static_cast<Regs::PrimitiveTopology>(call.begin & 0xffff),
+                                     0, estimate);
+    dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    // A drawing call leaves no indexed draw pending (DrawEnd clears it).
+    draw_manager.draw_state.draw_indexed = false;
 }
 
 } // namespace Tegra::Engines

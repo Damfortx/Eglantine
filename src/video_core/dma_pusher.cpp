@@ -24,6 +24,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/mt/gpuparam.h"
 #include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -277,6 +278,13 @@ bool DmaPusher::Step() {
         // safe read below would flush (with the split, the front can't tell: it reads memory
         // unflushed anyway). Entries on pages the GPU writes (culling) always take the flushing
         // read: their words at submit time are an older frame's.
+        // EDEN_NX2_MT_LITE_GPUPARAM / EDEN_NX2_GPUPARAM (mt/gpuparam.h): a GPU-written entry that
+        // only carries the rest of a draw macro's parameters (NVN's indexed indirect draws) is
+        // not read: the back draws indirectly from it. Entries it consumed after this one.
+        int gpuparam_extra = -1;
+        if (gpu_written && command_resume_offset == 0) {
+            gpuparam_extra = TryGpuParamCall(command_list, header);
+        }
         const bool submitted = command_resume_offset == 0 &&
                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
                                (command_list.snapshot_suspensions & 1) == 0 &&
@@ -285,7 +293,9 @@ bool DmaPusher::Step() {
                                !gpu_written &&
                                !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                                           header.size * sizeof(u32)));
-        if (submitted) {
+        if (gpuparam_extra >= 0) {
+            dma_pushbuffer_subindex += static_cast<size_t>(gpuparam_extra);
+        } else if (submitted) {
             const std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +
                     command_list.submitted_offsets[dma_pushbuffer_subindex],
@@ -1075,7 +1085,8 @@ void DmaPusher::RecordListDump(const CommandListHeader& header,
         entry.carry_subchannel = dma_state.subchannel;
         entry.carry_count = dma_state.method_count;
         entry.carry_mode =
-            dma_increment_once ? 'O' : dma_state.non_incrementing ? 'N' : 'I';
+            // 'O' only before its first word (after it the method no longer increments).
+            dma_state.non_incrementing ? 'N' : dma_increment_once ? 'O' : 'I';
     }
     // Diagnostic read of the native (Turing) macro code: the macro index's start and the words
     // up to the next macro's start (at most 256 instructions).
@@ -1278,6 +1289,72 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
 
 void DmaPusher::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
+}
+
+int DmaPusher::TryGpuParamCall(const CommandList& command_list, const CommandListHeader& header) {
+    namespace GpuParam = VideoCommon::MT::GpuParam;
+    if (dma_state.method_count == 0 || !dma_state.non_incrementing ||
+        dma_state.method < MacroRegistersStart || header.size == 0 ||
+        header.size > dma_state.method_count || dma_state.subchannel >= max_subchannels) {
+        return -1;
+    }
+    auto* const subchannel = subchannels[dma_state.subchannel];
+    if (subchannel == nullptr ||
+        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D) {
+        return -1;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!GpuParam::On(split.Active() && split.FrontMacros() && split.MtActive())) {
+        return -1;
+    }
+    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
+    if (!maxwell3d->GetNativeMacroEngine().native_turing) {
+        return -1;
+    }
+    // This entry and the next ones of the submission until the call's last word, all of them
+    // parameters only and on GPU-written pages (a draw count entry, then the records).
+    std::array<GpuParam::Segment, 4> segments{};
+    size_t count = 0;
+    segments[count++] = {GPUVAddr{header.addr}, static_cast<u32>(header.size)};
+    u32 remaining = dma_state.method_count - static_cast<u32>(header.size);
+    size_t next = dma_pushbuffer_subindex + 1;
+    while (remaining != 0) {
+        if (count == segments.size() || next >= command_list.command_lists.size()) {
+            return -1;
+        }
+        const CommandListHeader& entry = command_list.command_lists[next];
+        const u32 size = static_cast<u32>(entry.size);
+        if (size == 0 || size > remaining || entry.sync ||
+            !IsGpuWrittenCommands(entry.addr, size_t{size} * sizeof(u32))) {
+            return -1;
+        }
+        segments[count++] = {GPUVAddr{entry.addr}, size};
+        remaining -= size;
+        ++next;
+    }
+    Engines::Maxwell3D::GpuParamReader reader;
+    if (GpuParam::CheckOn()) {
+        reader = [this](u64 address, u32 words, u32* out) {
+            return ReadGpuWrittenWords(address, words, out);
+        };
+    }
+    if (!maxwell3d->GpuParamCall(system, dma_state.method, segments.data(), count,
+                                 GpuParam::CheckOn() ? &reader : nullptr)) {
+        return -1;
+    }
+    dma_state.method_count = 0;
+    return static_cast<int>(count - 1);
+}
+
+bool DmaPusher::ReadGpuWrittenWords(GPUVAddr address, u32 count, u32* out) {
+    // As Step reads a GPU-written entry: the copy/guest read after the writer wait, else a flush.
+    if (ReadGpuWrittenCommands(address, count)) {
+        std::memcpy(out, command_headers.data(), size_t{count} * sizeof(u32));
+        return true;
+    }
+    FlushGpuWrittenCommands(address, size_t{count} * sizeof(u32));
+    memory_manager.ReadBlockUnsafe(address, out, size_t{count} * sizeof(u32));
+    return true;
 }
 
 } // namespace Tegra

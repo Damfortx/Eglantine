@@ -241,6 +241,13 @@ public:
     Common::ScratchBuffer<CommandHeader> check_headers;
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// EDEN_NX2_MT_LITE_GPUPARAM (mt/gpuparam.h): when the current entry (and the next ones of
+    /// `command_list` it needs) are the GPU-written rest of a 3D macro call's parameters and the
+    /// engine takes the call without them (Maxwell3D::GpuParamCall), how many entries after this
+    /// one it consumed; -1: read the entry as before.
+    int TryGpuParamCall(const CommandList& command_list, const CommandListHeader& header);
+    /// EDEN_NX2_GPUPARAM_CHECK: `count` words at `address` read as Step reads a GPU-written entry.
+    bool ReadGpuWrittenWords(GPUVAddr address, u32 count, u32* out);
 
 private:
 
