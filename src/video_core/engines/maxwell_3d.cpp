@@ -34,6 +34,7 @@
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
+#include "video_core/mt/lite8_macro.h" // Batch 8 U3 (FrontRunMacro)
 
 namespace Tegra::Engines {
 
@@ -1394,11 +1395,14 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
 #ifdef ARCHITECTURE_x86_64
+    namespace L8 = VideoCommon::MT::Lite8Macro;
     const u32 method = fs.executing_macro;
     fs.executing_macro = 0;
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
-    const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    const u32 macro_index =
+        ((method - MacroRegistersStart) >> 1) % static_cast<u32>(positions.size());
+    const u32 start = positions[macro_index];
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1415,45 +1419,138 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         // (counted for the profile as FrontWrite would).
         if (regdedup_front.latch == nullptr) [[unlikely]] {
             RegDedupArm();
+            L8::LogOnce();
         }
         const bool dedup = regdedup_front.Armed() && VideoCommon::MT::RegDedup::Active();
+        // EDEN_NX2_MT_LITE8_MEMIT (mt/lite8_macro.h): FrontWrite's state write branch inline
+        // (the conditions under which FrontWrite takes it, as FrontWriteRun's FBATCH path).
+        const bool fast_emit = L8::Detail::On(L8::EmitMode()) && fs.skip_same &&
+                               !FrontVerifyEnabled() && split.StateBlocks() &&
+                               !VideoCommon::MT::RegDedup::Check();
         u32 dedup_dropped = 0;
-        const auto result = engine.native_jit->Execute(
-            start, fs.parameters, std::span<u32>{native_data_ram},
-            [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
-            [&](u32 address, u32 value) {
-                if (address >= MacroRegistersStart) {
-                    return false;
+        u32 emitted = 0;
+        u32 fast_emitted = 0;
+        const auto emit = [&](u32 address, u32 value) {
+            if (address >= MacroRegistersStart) {
+                return false;
+            }
+            ++emitted;
+            if (dedup && regdedup_front.Drops(address, value)) {
+                ++dedup_dropped;
+                return true;
+            }
+            // FrontWrite's same-value return, by shadow RAM mode (Replay writes the shadow
+            // word). Executable methods never skip, nor the MME DMA reads below (0x157 and
+            // 0x158 are not in execution_mask: a read repeating the last count must run).
+            if (fast_same && !execution_mask[address] && address != 0x157 &&
+                address != 0x158) {
+                bool same;
+                if (fs.control == Regs::ShadowRamControl::Track ||
+                    fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+                    same = fs.shadow[address] == value && fs.regs[address] == value;
+                } else if (fs.control == Regs::ShadowRamControl::Replay) {
+                    same = fs.regs[address] == fs.shadow[address];
+                } else {
+                    same = fs.regs[address] == value;
                 }
-                if (dedup && regdedup_front.Drops(address, value)) {
-                    ++dedup_dropped;
+                if (same) {
                     return true;
                 }
-                // FrontWrite's same-value return, by shadow RAM mode (Replay writes the shadow
-                // word). Executable methods never skip, nor the MME DMA reads below (0x157 and
-                // 0x158 are not in execution_mask: a read repeating the last count must run).
-                if (fast_same && !execution_mask[address] && address != 0x157 &&
-                    address != 0x158) {
-                    bool same;
-                    if (fs.control == Regs::ShadowRamControl::Track ||
-                        fs.control == Regs::ShadowRamControl::TrackWithFilter) {
-                        same = fs.shadow[address] == value && fs.regs[address] == value;
-                    } else if (fs.control == Regs::ShadowRamControl::Replay) {
-                        same = fs.regs[address] == fs.shadow[address];
-                    } else {
-                        same = fs.regs[address] == value;
-                    }
-                    if (same) {
-                        return true;
-                    }
+            }
+            if (fast_emit && !execution_mask[address] && address != 0x157 && address != 0x158 &&
+                fs.control != Regs::ShadowRamControl::Replay &&
+                !DrawManager::IsInstanceLoopMethod(address)) {
+                namespace Profile = VideoCommon::Nx2Profile;
+                const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                                     fs.control == Regs::ShadowRamControl::TrackWithFilter;
+                bool kept = true;
+                if (tracked) {
+                    kept = fs.shadow[address] == value;
+                    fs.shadow[address] = value;
                 }
-                FrontWrite(split, fs, address, value, true, true);
-                // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
-                if (address == 0x157 || address == 0x158) {
-                    FrontDmaRead(split, fs, address, value);
+                if (Profile::Enabled()) [[unlikely]] {
+                    Profile::Add(Profile::Counter::MethodWrites, 1);
                 }
+                if (fs.regs[address] == value && kept) {
+                    if (Profile::Enabled()) [[unlikely]] {
+                        Profile::Add(Profile::Counter::SameValueWrites, 1);
+                    }
+                    return true;
+                }
+                fs.regs[address] = value;
+                ++fast_emitted;
+                split.StateWrite(this, address, value, tracked);
                 return true;
-            });
+            }
+            FrontWrite(split, fs, address, value, true, true);
+            // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+            if (address == 0x157 || address == 0x158) {
+                FrontDmaRead(split, fs, address, value);
+            }
+            return true;
+        };
+        const auto read = [&fs](u32 address) {
+            return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
+        };
+        // EDEN_NX2_MT_LITE8_MHLE: a recognised macro (by its code words) runs as C++ through
+        // the same emit callback; CHECK runs it into a recorder and compares with the JIT.
+        L8::Kind kind = L8::Kind::None;
+        if (L8::HleMode() != '0') {
+            thread_local L8::KindCache kinds;
+            kind = kinds.Get(&engine, macro_index, start, engine.native_code_generation,
+                             engine.native_code);
+            if (kind != L8::Kind::None && !L8::Detail::On(L8::HleMode())) {
+                kind = L8::Kind::None;
+            }
+        }
+        TuringMacroJit::Result result{true, start, 0, {}};
+        L8::Kind taken = L8::Kind::None;
+        bool not_handled = false;
+        bool ran = false;
+        if (kind != L8::Kind::None && !L8::Check()) {
+            const auto outcome = L8::Run(kind, fs.parameters, native_data_ram.data(), emit);
+            if (outcome != L8::Outcome::NotHandled) {
+                ran = true;
+                taken = kind;
+                if (outcome == L8::Outcome::EmitFailed) {
+                    result = {false, start, 0, TuringMacroJit::ErrorText(TuringMacroJit::UnsupportedEmit)};
+                }
+            } else {
+                not_handled = true;
+            }
+        } else if (kind != L8::Kind::None) [[unlikely]] {
+            thread_local std::vector<std::pair<u32, u32>> hle_writes, jit_writes;
+            thread_local std::vector<u32> parameters_before;
+            hle_writes.clear();
+            jit_writes.clear();
+            parameters_before = fs.parameters;
+            auto data_ram = native_data_ram;
+            const auto outcome = L8::Run(kind, parameters_before, data_ram.data(),
+                                         [](u32 address, u32 value) {
+                                             hle_writes.emplace_back(address, value);
+                                             return address < MacroRegistersStart;
+                                         });
+            result = engine.native_jit->Execute(start, fs.parameters,
+                                                std::span<u32>{native_data_ram}, read,
+                                                [&emit](u32 address, u32 value) {
+                                                    jit_writes.emplace_back(address, value);
+                                                    return emit(address, value);
+                                                });
+            ran = true;
+            if (outcome != L8::Outcome::NotHandled) {
+                const bool dram_equal = data_ram == native_data_ram;
+                const bool equal = dram_equal && hle_writes == jit_writes &&
+                                   (outcome == L8::Outcome::Done) == result.success;
+                L8::Checked(equal, macro_index, start, kind, parameters_before, hle_writes,
+                            jit_writes, dram_equal, outcome, result.success);
+            } else {
+                not_handled = true;
+            }
+        }
+        if (!ran) {
+            result = engine.native_jit->Execute(start, fs.parameters,
+                                                std::span<u32>{native_data_ram}, read, emit);
+        }
         if (dedup_dropped != 0) {
             VideoCommon::MT::RegDedup::Dropped(VideoCommon::MT::RegDedup::Site::Macro,
                                                dedup_dropped, true);
@@ -1462,6 +1559,28 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             engine.native_execution_failed = true;
             LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}",
                       start, result.consumed, parameter_count, result.error);
+        }
+        if (L8::StatsOn()) [[unlikely]] {
+            L8::Note(macro_index, emitted, taken, not_handled, fast_emitted,
+                     [&engine, positions](u32 index) {
+                         // As the list dump's M lines: code up to the next macro's start.
+                         const u32 first = positions[index % positions.size()];
+                         u32 end = first + 256;
+                         for (const u32 position : positions) {
+                             if (position > first && position < end) {
+                                 end = position;
+                             }
+                         }
+                         const size_t from = std::min<size_t>(size_t{first} * 3,
+                                                              engine.native_code.size());
+                         const size_t to = std::min<size_t>(size_t{end} * 3,
+                                                            engine.native_code.size());
+                         u64 hash = 0xcbf29ce484222325ULL;
+                         for (size_t i = from; i < to; ++i) {
+                             hash = (hash ^ engine.native_code[i]) * 0x100000001b3ULL;
+                         }
+                         return std::pair<u32, u64>{first, hash};
+                     });
         }
     }
     fs.parameters.clear();
