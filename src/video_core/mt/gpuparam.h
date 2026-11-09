@@ -44,11 +44,12 @@ namespace VideoCommon::MT::GpuParam {
 
 // ---------------------------------------------------------------------------------- switches
 
-/// EDEN_NX2_MT_LITE_GPUPARAM (=0/1/a): on by default under EDEN_NX2_MT_LITE=1 (with the split
+/// EDEN_NX2_MT_LITE_GPUPARAM (=0/1/a): off by default (randomized A/B with MT lite: -8.6 +/- 4.7 fps;
+/// each deferred call's constant-buffer GPU copy is a Serial at ~10k calls/s). Was on under EDEN_NX2_MT_LITE=1 (with the split
 /// front running macros). Read for every call ('a' alternates).
 [[nodiscard]] inline bool MtSwitch() {
     static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_LITE_GPUPARAM");
-    return Enabled() && Tegra::Nx2Switch(mode, Lite());
+    return Enabled() && Tegra::Nx2Switch(mode, false);
 }
 /// EDEN_NX2_GPUPARAM (=0/1/a, default off): the same without the MT back (single GPU thread or
 /// the split without EDEN_NX2_MT).
