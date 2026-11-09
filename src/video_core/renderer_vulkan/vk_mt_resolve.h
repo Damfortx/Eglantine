@@ -1223,7 +1223,13 @@ inline void Nx2DrawPipeline::ShadowCompare(const MT::ResolvedDraw& res, const Dr
                 }
             }
             if (std::memcmp(&a, &b, sizeof(a)) != 0) {
-                mismatch(12, fmt::format("payload entry {} differs", i));
+                u64 wa[3];
+                u64 wb[3];
+                std::memcpy(wa, &a, sizeof(wa));
+                std::memcpy(wb, &b, sizeof(wb));
+                mismatch(12, fmt::format("payload entry {} differs: resolver {:#x} {:#x} {:#x} "
+                                         "committer {:#x} {:#x} {:#x}",
+                                         i, wa[0], wa[1], wa[2], wb[0], wb[1], wb[2]));
                 return;
             }
         }

@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstring>
+
 #include <algorithm>
 #include <memory>
 #include <variant>
@@ -25,15 +28,29 @@ struct DescriptorAddress {
 
 union DescriptorUpdateEntry {
     DescriptorUpdateEntry() = default;
-    DescriptorUpdateEntry(VkDescriptorImageInfo image_) : image{image_} {}
+    // The bytes past the member's fields are zeroed: entries are compared and hashed as raw
+    // bytes (EDEN_NX2_MT_SHADOW compares the resolver's payload with the committer's; with
+    // stale bytes there a texel buffer or an image entry differed while its fields matched).
+    DescriptorUpdateEntry(VkDescriptorImageInfo image_) : image{image_} {
+        ZeroFrom(offsetof(VkDescriptorImageInfo, imageLayout) + sizeof(VkImageLayout));
+    }
     DescriptorUpdateEntry(VkDescriptorBufferInfo buffer_) : buffer{buffer_} {}
-    DescriptorUpdateEntry(VkBufferView texel_buffer_) : texel_buffer{texel_buffer_} {}
-    DescriptorUpdateEntry(DescriptorAddress address_) : address{address_} {}
+    DescriptorUpdateEntry(VkBufferView texel_buffer_) : texel_buffer{texel_buffer_} {
+        ZeroFrom(sizeof(VkBufferView));
+    }
+    DescriptorUpdateEntry(DescriptorAddress address_) : address{address_} {
+        ZeroFrom(offsetof(DescriptorAddress, format) + sizeof(VkFormat));
+    }
     std::monostate empty{};
     VkDescriptorImageInfo image;
     VkDescriptorBufferInfo buffer;
     VkBufferView texel_buffer;
     DescriptorAddress address;
+
+private:
+    void ZeroFrom(size_t offset) noexcept {
+        std::memset(reinterpret_cast<char*>(this) + offset, 0, sizeof(*this) - offset);
+    }
 };
 
 class UpdateDescriptorQueue final {
