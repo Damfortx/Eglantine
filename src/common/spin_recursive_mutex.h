@@ -74,6 +74,11 @@ public:
         return true;
     }
 
+    /// Whether the calling thread holds it (diagnostics: EDEN_NX2_MT_LITE7_CAPTURE_CHECK).
+    [[nodiscard]] bool HeldByCurrentThread() const noexcept {
+        return owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
+    }
+
     void unlock() {
         if (--depth != 0) {
             return;

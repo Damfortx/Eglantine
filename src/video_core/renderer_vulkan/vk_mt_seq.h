@@ -82,31 +82,55 @@ inline void Nx2DrawPipeline::ApplyHeapUploads(HeapUploads* heap_uploads) {
 // ---- Uniform buffer write generations (EDEN_NX2_MT_UBO_GEN) ----
 
 inline void Nx2DrawPipeline::SeqStageUniform(VideoCommon::MT::UboEntry& entry) {
+    u64 generation = 0;
+    if (!SeqStageUniformGen(entry, generation)) {
+        SeqStageUniformBytes(entry, generation);
+    }
+}
+
+inline bool Nx2DrawPipeline::SeqStageUniformGen(VideoCommon::MT::UboEntry& entry,
+                                                u64& generation) {
     using View = VideoCommon::MT::CaptureView;
     const DAddr device_addr = entry.device_addr;
     const u32 size = entry.size;
-    if (compact && size != 0 && size <= View::UboMemoBytes && entry.stage < View::UboMemoStages &&
-        entry.index < View::UboMemoSlots) {
+    generation = 0;
+    if (!VideoCommon::MT::UboGen() || size == 0 || size > View::UboMemoBytes ||
+        entry.stage >= View::UboMemoStages || entry.index >= View::UboMemoSlots) {
+        return false;
+    }
+    // EDEN_NX2_MT_UBO_GEN skips reading the bytes while the generations allow (compact or not).
+    // Guest CPU writes reach the generations only through write traps: the pages must be
+    // protected (not CPU-modified in the buffer tracker) now and when the memo was taken
+    // (dropping the protection bumps them). Query reports write guest memory directly.
+    const UniformMemo& memo = seq_ubo_memo[entry.stage][entry.index];
+    const bool protected_pages =
+        !rasterizer.buffer_cache.IsRegionCpuModified(device_addr, size) &&
+        !Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, device_addr, size);
+    // Read before the bytes: a write in between only makes the next capture miss.
+    generation =
+        protected_pages ? VideoCommon::MT::UboWriteGenerations().Read(device_addr, size) : 0;
+    if (generation != 0 && memo.generation == generation && memo.device_addr == device_addr &&
+        memo.size == size) {
+        entry.staged = 2;
+        counters.ubo_gen_hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+inline void Nx2DrawPipeline::SeqStageUniformBytes(VideoCommon::MT::UboEntry& entry,
+                                                  u64 generation) {
+    using View = VideoCommon::MT::CaptureView;
+    const DAddr device_addr = entry.device_addr;
+    const u32 size = entry.size;
+    const bool memo_slot = size != 0 && size <= View::UboMemoBytes &&
+                           entry.stage < View::UboMemoStages && entry.index < View::UboMemoSlots;
+    if (compact && memo_slot) {
         // EDEN_NX2_MT_COMPACT: the committer keeps every slot's last streamed bytes (each
         // staged == 1 entry here has `memo`), and seq_ubo_bytes holds the same bytes as of the
         // end of the stream. Unchanged bytes go as staged == 2, a few changed chunks as a
-        // patch (staged == 3); both are read from the committer's copy. EDEN_NX2_MT_UBO_GEN
-        // still skips reading the bytes while the generations allow.
+        // patch (staged == 3); both are read from the committer's copy.
         UniformMemo& memo = seq_ubo_memo[entry.stage][entry.index];
-        u64 generation = 0;
-        if (VideoCommon::MT::UboGen()) {
-            const bool protected_pages =
-                !rasterizer.buffer_cache.IsRegionCpuModified(device_addr, size) &&
-                !Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, device_addr, size);
-            generation =
-                protected_pages ? VideoCommon::MT::UboWriteGenerations().Read(device_addr, size) : 0;
-            if (generation != 0 && memo.generation == generation &&
-                memo.device_addr == device_addr && memo.size == size) {
-                entry.staged = 2;
-                counters.ubo_gen_hits.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
         u8* const kept = seq_ubo_bytes.get() +
                          (size_t{entry.stage} * View::UboMemoSlots + entry.index) *
                              View::UboMemoBytes;
@@ -141,24 +165,8 @@ inline void Nx2DrawPipeline::SeqStageUniform(VideoCommon::MT::UboEntry& entry) {
         std::memcpy(kept, now, size);
         return;
     }
-    if (VideoCommon::MT::UboGen() && size != 0 && size <= View::UboMemoBytes &&
-        entry.stage < View::UboMemoStages && entry.index < View::UboMemoSlots) {
+    if (VideoCommon::MT::UboGen() && memo_slot) {
         UniformMemo& memo = seq_ubo_memo[entry.stage][entry.index];
-        // Guest CPU writes reach the generations only through write traps: the pages must be
-        // protected (not CPU-modified in the buffer tracker) now and when the memo was taken
-        // (dropping the protection bumps them). Query reports write guest memory directly.
-        const bool protected_pages =
-            !rasterizer.buffer_cache.IsRegionCpuModified(device_addr, size) &&
-            !Tegra::Nx2AnyPage(Tegra::g_nx2_query_pages, device_addr, size);
-        // Read before the bytes: a write in between only makes the next capture miss.
-        const u64 generation =
-            protected_pages ? VideoCommon::MT::UboWriteGenerations().Read(device_addr, size) : 0;
-        if (generation != 0 && memo.generation == generation && memo.device_addr == device_addr &&
-            memo.size == size) {
-            entry.staged = 2;
-            counters.ubo_gen_hits.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
         memo = UniformMemo{device_addr, size, generation};
         if (generation != 0) {
             entry.memo = 1;

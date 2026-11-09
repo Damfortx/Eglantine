@@ -44,6 +44,7 @@
 #include "video_core/mt/lite_switches.h"
 #include "video_core/mt/lite2_capture_switches.h"
 #include "video_core/mt/lite2_tracker_switches.h"
+#include "video_core/mt/lite7_capture_switches.h"
 #include "video_core/mt/mt_switches.h"
 #include "video_core/mt/perf_switches.h"
 #include "video_core/mt/packet_compact.h"
@@ -152,6 +153,14 @@ struct Counters {
     std::atomic<u64> desc_hits{};
     std::atomic<u64> desc_misses{};
     std::atomic<u64> overlay_memo_hits{}; ///< EDEN_NX2_MT_LITE_CAPMEMO
+    // Batch 7 R2 (lite7_capture_switches.h, EDEN_NX2_MT_STATS).
+    std::atomic<u64> lite7_desc_reads{};      ///< C1: descriptor reads asked for
+    std::atomic<u64> lite7_desc_dedup{};      ///< C1: of those, served from this capture
+    std::atomic<u64> lite7_desc_mismatch{};   ///< C1 CHECK: re-read bytes differed
+    std::atomic<u64> lite7_ubo_late{};        ///< C2: staged uniform reads after the lock
+    std::atomic<u64> lite7_ubo_changed{};     ///< C2 CHECK: bytes changed after the lock
+    std::atomic<u64> lite7_slot_inserts{};    ///< C4: inserts copied by their noted offset
+    std::atomic<u64> lite7_slot_mismatch{};   ///< C4 CHECK: noted offset != searched one
     // Stage times (EDEN_NX2_MT_STATS), ns.
     std::atomic<u64> seq_capture_ns{};
     std::atomic<u64> wait_committed_ns{};
@@ -523,10 +532,17 @@ private:
             return self->SeqRead<T>(gpu_addr);
         }
     };
-    void SeqReadDescriptor(u64 gpu_addr);
+    /// Returns the offset of the entry's bytes in raw_bytes (EDEN_NX2_MT_LITE7_DESCDEDUP: an
+    /// entry this capture already read is not read or recorded again).
+    u32 SeqReadDescriptor(u64 gpu_addr);
     /// A streamed uniform buffer's bytes into the blob, or (EDEN_NX2_MT_UBO_GEN) a reference to
     /// the committer's copy while its pages are unchanged (vk_mt_seq.h). Tracker lock held.
     void SeqStageUniform(VideoCommon::MT::UboEntry& entry);
+    /// SeqStageUniform's decision half (tracker lock held): true when it is done (a UBO_GEN hit,
+    /// staged == 2), else `generation` is what SeqStageUniformBytes keeps.
+    bool SeqStageUniformGen(VideoCommon::MT::UboEntry& entry, u64& generation);
+    /// SeqStageUniform's byte half (EDEN_NX2_MT_LITE7_UBOLOCK: after the lock is released).
+    void SeqStageUniformBytes(VideoCommon::MT::UboEntry& entry, u64 generation);
     /// Committer: keeps the bytes of memo entries before anything else reads the packet.
     void KeepUniformMemos(std::span<const VideoCommon::MT::UboEntry> ubos, const u8* blob);
     /// Copies the CPU-modified parts of a range the draw binds into the packet.
@@ -671,6 +687,31 @@ private:
     const bool lite_seq_lock = VideoCommon::MT::LiteSeqOneLock();
     const bool lite_cap_memo = VideoCommon::MT::LiteCaptureMemo();
     const bool lite_xlate = VideoCommon::MT::LiteXlateCache();
+    // Batch 7 R2, capture (lite7_capture_switches.h): modes ('0', '1', 'a'), decided per capture.
+    const char lite7_desc_dedup_mode = VideoCommon::MT::Lite7DescDedupMode();
+    const char lite7_ubo_lock_mode = VideoCommon::MT::Lite7UboLockMode();
+    const char lite7_overlay_mode = VideoCommon::MT::Lite7OverlayMode();
+    const bool lite7_check = VideoCommon::MT::Lite7CaptureCheck();
+    /// C1: this capture's descriptor reads (address -> raw_bytes offset), valid while `stamp`
+    /// is the capture's (ClearCapture bumps lite7_desc_stamp; 0 never matches).
+    struct DescSeen {
+        u64 gpu_addr = 0;
+        u32 offset = 0;
+        u32 stamp = 0;
+    };
+    std::array<DescSeen, 64> lite7_desc_seen{};
+    u32 lite7_desc_stamp = 1;
+    bool lite7_desc_dedup = false; ///< C1 on for this capture
+    /// C2: staged uniform buffers whose bytes are read after the lock (ubos index, generation).
+    struct LateUniform {
+        size_t index;
+        u64 generation;
+        u32 check_offset; ///< CHECK: the bytes read under the lock, in lite7_ubo_check
+    };
+    std::vector<LateUniform> lite7_late_ubos;
+    std::vector<u8> lite7_ubo_check;
+    /// C4: per desc_inserts entry, the raw_bytes offset of the read kept for it.
+    std::vector<u32> lite7_insert_offsets;
 
     // Sequencer-owned.
     std::vector<u64> delta_scratch;
@@ -867,8 +908,14 @@ public:
         : mutex{VideoCommon::MT::TrapLock() ? &buffer_cache.MtTrackerMutex()
                                             : &buffer_cache.mutex} {
         mutex->lock();
+        // EDEN_NX2_MT_LITE7_LOCKSKIP: the TrackerScopes of the calls below skip the relock.
+        static const char skip_mode = VideoCommon::MT::Lite7LockSkipMode();
+        if (VideoCommon::MT::Lite7Detail::On(skip_mode)) {
+            note.emplace(mutex);
+        }
     }
     ~SeqTrackerLock() {
+        note.reset();
         mutex->unlock();
     }
     SeqTrackerLock(const SeqTrackerLock&) = delete;
@@ -876,6 +923,7 @@ public:
 
 private:
     Common::SpinRecursiveMutex* mutex;
+    std::optional<VideoCommon::MT::HeldTrackerNote> note;
 };
 
 inline void Pause() {
@@ -976,6 +1024,13 @@ inline void Nx2DrawPipeline::Start() {
     LOG_INFO(Render_Vulkan, "MT lite 5: listpos {}, listknown {}, listcheck {}",
              VideoCommon::MT::LiteListPos(), VideoCommon::MT::LiteListKnown(),
              VideoCommon::MT::LiteListCheck());
+    LOG_INFO(Render_Vulkan,
+             "MT lite 7 capture: descdedup {}, ubolock {}{}, lockskip {}, overlay {}, check {}",
+             VideoCommon::MT::Lite7Detail::Name(lite7_desc_dedup_mode),
+             VideoCommon::MT::Lite7Detail::Name(lite7_ubo_lock_mode),
+             lite_seq_lock ? "" : " (inert: needs EDEN_NX2_MT_LITE_SEQLOCK)",
+             VideoCommon::MT::Lite7Detail::Name(VideoCommon::MT::Lite7LockSkipMode()),
+             VideoCommon::MT::Lite7Detail::Name(lite7_overlay_mode), lite7_check);
 }
 
 inline void Nx2DrawPipeline::Stop() {
@@ -1710,6 +1765,24 @@ inline void Nx2DrawPipeline::LogStats() {
                  rate(counters.ubo_patched), rate(counters.ubo_full), rate(counters.desc_hits),
                  rate(counters.desc_misses), rate(counters.overlay_memo_hits));
     }
+    {
+        // Batch 7 R2 (lite7_capture_switches.h): per piece, per second.
+        const auto rate = [&](std::atomic<u64>& value) {
+            return static_cast<double>(take(value)) / seconds;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "MT lite 7 capture/s: descdedup {:.0f} of {:.0f} descriptor reads | ubolock "
+                 "{:.0f} uniform reads after the lock | lockskip {:.0f} nested tracker locks "
+                 "skipped | overlay {:.0f} inserts by offset | check: desc changed {:.0f}, ubo "
+                 "changed {:.0f}, lock not held {:.0f}, slot offset {:.0f}",
+                 rate(counters.lite7_desc_dedup), rate(counters.lite7_desc_reads),
+                 rate(counters.lite7_ubo_late),
+                 rate(VideoCommon::MT::g_lite7_lock_skips),
+                 rate(counters.lite7_slot_inserts), rate(counters.lite7_desc_mismatch),
+                 rate(counters.lite7_ubo_changed),
+                 rate(VideoCommon::MT::g_lite7_lock_skip_mismatches),
+                 rate(counters.lite7_slot_mismatch));
+    }
 }
 
 } // namespace Vulkan
@@ -1750,12 +1823,9 @@ inline std::optional<DAddr> Nx2DrawPipeline::SeqTranslate(GPUVAddr gpu_addr) {
     return rasterizer.gpu_memory->GpuToCpuAddress(gpu_addr);
 }
 
-inline void Nx2DrawPipeline::SeqReadDescriptor(u64 gpu_addr) {
+inline u32 Nx2DrawPipeline::SeqReadDescriptor(u64 gpu_addr) {
     // DescriptorTable::Read's read of a TIC or TSC entry.
     constexpr u32 Size = 32;
-    const u32 offset = static_cast<u32>(raw_bytes.size());
-    raw_bytes.resize(raw_bytes.size() + Size);
-    u8* const out = raw_bytes.data() + offset;
     const bool one_page =
         (gpu_addr & Core::Memory::YUZU_PAGEMASK) + Size <= Core::Memory::YUZU_PAGESIZE;
     const auto pointer = [&]() -> const u8* {
@@ -1767,12 +1837,45 @@ inline void Nx2DrawPipeline::SeqReadDescriptor(u64 gpu_addr) {
         return device_addr ? rasterizer.device_memory.GetPointer<u8>(*device_addr)
                            : nullptr;
     };
-    if (const u8* const host = one_page ? pointer() : nullptr) {
-        std::memcpy(out, host, Size);
-    } else {
-        rasterizer.gpu_memory->ReadBlockUnsafe(gpu_addr, out, Size);
+    const auto read_into = [&](u8* out) {
+        if (const u8* const host = one_page ? pointer() : nullptr) {
+            std::memcpy(out, host, Size);
+        } else {
+            rasterizer.gpu_memory->ReadBlockUnsafe(gpu_addr, out, Size);
+        }
+    };
+    // EDEN_NX2_MT_LITE7_DESCDEDUP: an entry this capture already read adds nothing to the
+    // overlay (the union of the reads); its first read's bytes stand for both.
+    DescSeen* seen = nullptr;
+    if (lite7_desc_dedup) {
+        const bool stats = VideoCommon::MT::Stats();
+        if (stats) {
+            counters.lite7_desc_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+        const u64 key = gpu_addr >> 5;
+        seen = &lite7_desc_seen[(key ^ (key >> 6) ^ (key >> 12)) & (lite7_desc_seen.size() - 1)];
+        if (seen->stamp == lite7_desc_stamp && seen->gpu_addr == gpu_addr) {
+            if (stats) {
+                counters.lite7_desc_dedup.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (lite7_check) {
+                std::array<u8, Size> again;
+                read_into(again.data());
+                if (std::memcmp(again.data(), raw_bytes.data() + seen->offset, Size) != 0) {
+                    counters.lite7_desc_mismatch.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            return seen->offset;
+        }
     }
+    const u32 offset = static_cast<u32>(raw_bytes.size());
+    raw_bytes.resize(raw_bytes.size() + Size);
+    read_into(raw_bytes.data() + offset);
     raw_reads.push_back({gpu_addr, Size, offset, true});
+    if (seen != nullptr) {
+        *seen = DescSeen{gpu_addr, offset, lite7_desc_stamp};
+    }
+    return offset;
 }
 
 inline void Nx2DrawPipeline::SeqTakeUploads(DAddr device_addr, u32 size) {
@@ -1973,8 +2076,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
                 tic_valid.push_back(0);
             }
             if (index <= tic_limit) {
-                const size_t offset = raw_bytes.size();
-                SeqReadDescriptor(regs.tex_header.Address() + u64{index} * 32);
+                const u32 offset = SeqReadDescriptor(regs.tex_header.Address() + u64{index} * 32);
                 if (SeqTicValid(raw_bytes.data() + offset)) {
                     tic_valid[bit / 64] |= u64{1} << (bit % 64);
                 }
@@ -2071,6 +2173,8 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
     const u32 skip_size = rasterizer.buffer_cache.MtSkipCacheSize();
     const auto& sizes = pipeline->UniformSizes();
     size_t ssbo_cursor = 0;
+    // EDEN_NX2_MT_LITE7_UBOLOCK: staged uniform bytes are read once the lock is released.
+    const bool late_ubos = lite_seq_lock && VideoCommon::MT::Lite7Detail::On(lite7_ubo_lock_mode);
     for (size_t stage = 0; stage < infos.size(); ++stage) {
         const auto& cbufs = real.state.shader_stages[stage].const_buffers;
         u32 mask = pipeline->EnabledUniformBufferMasks()[stage];
@@ -2105,7 +2209,20 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
                 .offset = 0,
                 .pad2 = 0,
             };
-            if (fast) {
+            if (fast && late_ubos) {
+                // The decision (and a UBO_GEN hit) under the lock, the bytes after it.
+                u64 generation = 0;
+                if (!SeqStageUniformGen(entry, generation)) {
+                    u32 check_offset = 0;
+                    if (lite7_check && size != 0) {
+                        check_offset = static_cast<u32>(lite7_ubo_check.size());
+                        lite7_ubo_check.resize(lite7_ubo_check.size() + size);
+                        rasterizer.device_memory.ReadBlockUnsafe(
+                            device_addr, lite7_ubo_check.data() + check_offset, size);
+                    }
+                    lite7_late_ubos.push_back({ubos.size(), generation, check_offset});
+                }
+            } else if (fast) {
                 SeqStageUniform(entry);
             } else {
                 SeqTakeUploads(device_addr, size);
@@ -2126,6 +2243,25 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         // EDEN_NX2_MT_LITE_SEQLOCK: the rest (upload bytes, overlay) is the sequencer's own.
         lock.reset();
         SeqReadDeferredUploads();
+        // EDEN_NX2_MT_LITE7_UBOLOCK: the staged uniform bytes, in capture order.
+        for (const LateUniform& late : lite7_late_ubos) {
+            VideoCommon::MT::UboEntry& entry = ubos[late.index];
+            if (lite7_check && entry.size != 0) {
+                std::array<u8, VideoCommon::MT::CaptureView::UboMemoBytes> now_bytes;
+                const u32 check_size = (std::min)(
+                    entry.size, static_cast<u32>(now_bytes.size()));
+                rasterizer.device_memory.ReadBlockUnsafe(entry.device_addr, now_bytes.data(),
+                                                         check_size);
+                if (std::memcmp(now_bytes.data(), lite7_ubo_check.data() + late.check_offset,
+                                check_size) != 0) {
+                    counters.lite7_ubo_changed.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            SeqStageUniformBytes(entry, late.generation);
+        }
+        if (VideoCommon::MT::Stats() && late_ubos) {
+            counters.lite7_ubo_late.fetch_add(lite7_late_ubos.size(), std::memory_order_relaxed);
+        }
     }
     // EDEN_NX2_MT_COMPACT: the compact header's narrow counts must hold this draw's (else the
     // old layout, which every reader still parses; it touches no replica).
@@ -2255,6 +2391,9 @@ inline void Nx2DrawPipeline::FinishOverlayCompactSlots() {
     // Pass 2: the misses replace their slots (in this order on every reader).
     desc_refs.clear();
     desc_inserts.clear();
+    // EDEN_NX2_MT_LITE7_OVERLAY: each insert's bytes are those of the read kept for it.
+    const bool noted_offsets = VideoCommon::MT::Lite7Detail::On(lite7_overlay_mode);
+    lite7_insert_offsets.clear();
     size_t kept = 0;
     for (size_t i = 0; i < count; ++i) {
         const RawRead read = raw_reads[i];
@@ -2271,15 +2410,36 @@ inline void Nx2DrawPipeline::FinishOverlayCompactSlots() {
                 continue;
             }
             desc_inserts.push_back(read.gpu_addr);
+            if (noted_offsets) {
+                lite7_insert_offsets.push_back(read.offset);
+            }
         }
         raw_reads[kept++] = read;
     }
     raw_reads.resize(kept);
-    for (const u64 gpu_addr : desc_inserts) {
+    if (noted_offsets && !lite7_check) {
+        for (size_t i = 0; i < desc_inserts.size(); ++i) {
+            const u64 gpu_addr = desc_inserts[i];
+            Replica::Slot& entry = seq_desc.slots[Replica::SlotOf(gpu_addr)];
+            entry.gpu_addr = gpu_addr;
+            std::memcpy(entry.bytes.data(), raw_bytes.data() + lite7_insert_offsets[i],
+                        Replica::EntryBytes);
+        }
+        if (VideoCommon::MT::Stats()) {
+            counters.lite7_slot_inserts.fetch_add(desc_inserts.size(),
+                                                  std::memory_order_relaxed);
+        }
+    }
+    for (size_t i = 0; i < desc_inserts.size() && (!noted_offsets || lite7_check); ++i) {
+        const u64 gpu_addr = desc_inserts[i];
         Replica::Slot& entry = seq_desc.slots[Replica::SlotOf(gpu_addr)];
         // The bytes this packet carries for it (its read is among the kept ones).
         for (const RawRead& read : raw_reads) {
             if (read.descriptor && read.gpu_addr == gpu_addr) {
+                if (noted_offsets && lite7_insert_offsets[i] != read.offset) {
+                    // EDEN_NX2_MT_LITE7_CAPTURE_CHECK: must never happen.
+                    counters.lite7_slot_mismatch.fetch_add(1, std::memory_order_relaxed);
+                }
                 entry.gpu_addr = gpu_addr;
                 std::memcpy(entry.bytes.data(), raw_bytes.data() + read.offset,
                             Replica::EntryBytes);
@@ -3209,6 +3369,14 @@ inline void Nx2DrawPipeline::ClearCapture() {
     geometry_entries.clear();
     tic_valid.clear();
     tic_valid_count = 0;
+    // EDEN_NX2_MT_LITE7_DESCDEDUP: a new capture forgets the reads of the last one.
+    if (++lite7_desc_stamp == 0) {
+        lite7_desc_seen = {};
+        lite7_desc_stamp = 1;
+    }
+    lite7_desc_dedup = VideoCommon::MT::Lite7Detail::On(lite7_desc_dedup_mode);
+    lite7_late_ubos.clear();
+    lite7_ubo_check.clear();
 }
 
 inline bool Nx2DrawPipeline::SeqTicValid(const u8* tic_bytes) {
