@@ -248,7 +248,8 @@ public:
         // A uniform bind only records the binding in the committer's channel state (no cache
         // structure, no wait on the GPU or the front): it may sit inside a batch. Closing on it
         // too made batches 1.1 draws long in MKW (a bind before nearly every draw).
-        if (kind != MT::Kind::Uniform) {
+        const bool in_batch = StaysInBatch(kind);
+        if (!in_batch) {
             CloseBatch();
         }
         EmitDeltas();
@@ -259,10 +260,30 @@ public:
         out[2] = 0;
         std::memcpy(out + 3, &func, sizeof(Func));
         stream.Commit();
+        if (!in_batch) {
+            stream.Flush(); // EDEN_NX2_MT_LAZY_WAKE: a sleeping committer runs it now
+        }
         Count(counters.commands, kind);
         NoteAsyncWork(kind);
         if (lockstep) {
             WaitCommitted();
+        }
+    }
+
+    /// Commands that may sit inside an open batch: they only record a binding or work the
+    /// committer runs in stream order anyway (EDEN_NX2_MT_CMD_IN_BATCH for the latter).
+    [[nodiscard]] static bool StaysInBatch(MT::Kind kind) {
+        switch (kind) {
+        case MT::Kind::Uniform:
+            return true;
+        case MT::Kind::Query:
+        case MT::Kind::Fence:
+        case MT::Kind::Barrier:
+        case MT::Kind::Clear:
+        case MT::Kind::ConditionalRendering:
+            return VideoCommon::MT::CommandsInBatch();
+        default:
+            return false;
         }
     }
 
@@ -580,6 +601,8 @@ private:
     /// Committer (EDEN_NX2_MT_RBUF), inside ConfigureResolved: the buffer intents of a result.
     void ApplyResolvedBuffers(const MT::ResolvedDraw& res, bool is_indexed);
     void RunEntry(const u64* entry);
+    /// Committer (EDEN_NX2_MT_UBIND_FOLD): a CbBind entry's binds into the buffer cache.
+    void ApplyUniformBinds(const u64* binds, u32 count);
     void RunSerial(const u64* entry);
     void Idle(std::stop_token& stop);
 
@@ -613,10 +636,22 @@ private:
     struct TicValidMemo {
         std::array<u64, 4> raw{};
         u64 layout_gen = 0;
+        const Tegra::MemoryManager* manager = nullptr; ///< channels have their own generations
         bool valid = false;
     };
     std::array<TicValidMemo, 256> tic_valid_memo{};
     bool SeqTicValid(const u8* tic_bytes);
+    /// EDEN_NX2_MT_CONT_MEMO: MemoryManager::IsContinuousRange memo by (address, size) and GPU
+    /// page table layout generation.
+    struct ContinuousMemo {
+        u64 gpu_addr = 0;
+        u64 size = 0;
+        u64 layout_gen = 0;
+        const Tegra::MemoryManager* manager = nullptr; ///< channels have their own generations
+        bool continuous = false;
+    };
+    std::array<ContinuousMemo, 128> continuous_memo{};
+    bool SeqIsContinuous(u64 gpu_addr, u64 size);
     std::vector<RawRead> raw_reads;
     std::vector<u8> raw_bytes;
     std::vector<VideoCommon::MT::OverlayEntry> overlay;
@@ -691,7 +726,10 @@ private:
     void AttachEpochs(bool attach);
     /// Committer: run reclaim callbacks whose grace period passed.
     void CollectEpochs() {
-        if (epochs_attached) {
+        // EDEN_NX2_MT_EBR_LAZY: nothing retired, no locks (a retire racing with this check,
+        // e.g. a resolver's sampler map growth, is collected at the next call).
+        if (epochs_attached &&
+            (!VideoCommon::MT::LazyEpochCollect() || epochs.MaybePending())) {
             std::scoped_lock lock{rasterizer.buffer_cache.mutex, rasterizer.texture_cache.mutex};
             epochs.Collect();
         }
@@ -792,6 +830,7 @@ inline void Nx2DrawPipeline::Start() {
         return;
     }
     consumer = stream.AddConsumer();
+    stream.SetLazyWake(VideoCommon::MT::LazyWake());
     auto& hooks = VideoCommon::MT::g_hooks;
     hooks.context = this;
     hooks.run_serial = [](void* context, void (*fn)(void*), void* arg) {
@@ -866,6 +905,7 @@ inline void Nx2DrawPipeline::Stop() {
     // The sequencer is stopped: this thread may produce. A batch left open would keep the
     // committer waiting for its resolver.
     CloseBatch();
+    stream.Flush();
     // The committer drains first (it needs the resolvers' last batches), then the resolvers.
     committer.request_stop();
     stream.WakeAll();
@@ -918,6 +958,8 @@ inline void Nx2DrawPipeline::SeqMark(u64 position) {
     }
     const u64 payload = position;
     stream.Push(static_cast<u8>(MT::StreamEntry::Mark), 0, &payload, 1);
+    // The front may wait for this position, the sequencer may go idle: wake the consumers.
+    stream.Flush();
     counters.marks.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -975,6 +1017,8 @@ inline void Nx2DrawPipeline::CloseBatch() {
     }
     const u64 payload[2]{batch_id, batch_draws};
     stream.Push(static_cast<u8>(MT::StreamEntry::BatchEnd), 0, payload, 2);
+    // The batch's resolver (and a committer waiting for it) may sleep.
+    stream.Flush();
     ++batch_id;
     open_batch.store(batch_id, std::memory_order_relaxed);
     batch_draws = 0;
@@ -996,6 +1040,7 @@ inline void Nx2DrawPipeline::SerialRaw(MT::Kind kind, void (*fn)(void*), void* a
     out[3] = reinterpret_cast<u64>(&done);
     out[4] = barrier ? reinterpret_cast<u64>(&acks) : 0;
     stream.Commit();
+    stream.Flush();
     Count(counters.serials, kind);
     const bool timed = VideoCommon::MT::Stats();
     const auto begin = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1040,6 +1085,7 @@ inline void Nx2DrawPipeline::SerialRaw(MT::Kind kind, void (*fn)(void*), void* a
 
 inline void Nx2DrawPipeline::WaitCommitted() {
     CloseBatch();
+    stream.Flush();
     const u64 target = stream.WritePosition();
     if (stream.ConsumerPosition(consumer) >= target) {
         return;
@@ -1329,10 +1375,19 @@ inline void Nx2DrawPipeline::RunEntry(const u64* entry) {
     switch (static_cast<MT::StreamEntry>(SpmcStream::HeaderKind(head))) {
     case MT::StreamEntry::Deltas:
     case MT::StreamEntry::ComputeDeltas:
-    case MT::StreamEntry::CbBind:
     case MT::StreamEntry::RootTable:
         if (current != nullptr) {
             ApplyMirrorEntry(current->mirror3d.get(), current->mirror_compute.get(), entry);
+        }
+        break;
+    case MT::StreamEntry::CbBind:
+        if (current != nullptr) {
+            ApplyMirrorEntry(current->mirror3d.get(), current->mirror_compute.get(), entry);
+            if (VideoCommon::MT::UniformBindFold()) {
+                // EDEN_NX2_MT_UBIND_FOLD: what the "uniform" Command did per bind (the
+                // sequencer skipped it for binds its engine recorded).
+                ApplyUniformBinds(entry + 1, aux);
+            }
         }
         break;
     case MT::StreamEntry::Command: {
@@ -1370,6 +1425,19 @@ inline void Nx2DrawPipeline::RunEntry(const u64* entry) {
         break;
     default:
         break;
+    }
+}
+
+inline void Nx2DrawPipeline::ApplyUniformBinds(const u64* binds, u32 count) {
+    for (u32 i = 0; i < count; ++i) {
+        VideoCommon::MT::CbBindDelta bind;
+        std::memcpy(&bind, binds + i * 2, sizeof(bind));
+        if (bind.enabled != 0) {
+            rasterizer.buffer_cache.BindGraphicsUniformBuffer(bind.stage, bind.slot, bind.gpu_addr,
+                                                              bind.size);
+        } else {
+            rasterizer.buffer_cache.DisableGraphicsUniformBuffer(bind.stage, bind.slot);
+        }
     }
 }
 
@@ -1659,7 +1727,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
             }
             ssbo_entry.skipped = 0;
             if ((!desc.is_written || prefers_sparse) &&
-                !memory.IsContinuousRange(binding.gpu_addr, binding.size)) {
+                !SeqIsContinuous(binding.gpu_addr, binding.size)) {
                 return 4;
             }
             ssbos.push_back({binding.device_addr, binding.size, desc.is_written, stage});
@@ -2146,8 +2214,11 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
             counters.compact_packets.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    // EDEN_NX2_MT_BATCH_MIN: a waiting committer gets the batch once it holds a few draws (a
+    // close after every draw made 1.4-draw batches, each a BatchEnd, a resolver wake-up and an
+    // epoch collection).
     if (Batching() && (++batch_draws >= VideoCommon::MT::BatchSize() ||
-                       (adaptive_batches &&
+                       (adaptive_batches && batch_draws >= VideoCommon::MT::AdaptiveBatchMin() &&
                         wanted_batch.load(std::memory_order_relaxed) == batch_id + 1))) {
         CloseBatch();
     }
@@ -2421,6 +2492,13 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         // they joined fails here).
         MT::ValidateFail fail = MT::FailNone;
         if (res != nullptr && res->status == MT::ResolveStatus::Ok) {
+            // EDEN_NX2_MT_RALIAS: PrepareImage's alias copies first; a rescale they cause
+            // fails the validation below.
+            try {
+                SyncResolvedAliases(*res);
+            } catch (const std::exception& e) {
+                LOG_ERROR(Render_Vulkan, "MT: alias synchronization threw: {}", e.what());
+            }
             fail = Validate(*res, header);
             counters.validate_fail[fail].fetch_add(1, std::memory_order_relaxed);
             if (fail == MT::FailNone) {
@@ -2668,7 +2746,9 @@ inline void Nx2DrawPipeline::SeqInnerInvalidation(
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
-    const bool fast = Tegra::Nx2InvalFast();
+    // EDEN_NX2_MT_INVAL_TEXFILTER: the texture mutex (contended with the committer) only for
+    // ranges that may hold an image; I5's BeforeWrite already trusts Nx2MayHoldTexture.
+    const bool fast = Tegra::Nx2InvalFast() || VideoCommon::MT::InvalTextureFilter();
     const auto may_hold_texture = [fast](DAddr addr, u64 size) {
         return !fast || Tegra::Nx2MayHoldTexture(addr, size);
     };
@@ -2765,11 +2845,19 @@ inline void Nx2DrawPipeline::SeqInvalidateBuffers(
         // The tracker only; ranges with GPU-written data need the buffer cache mutex.
         using Result = BufferCache::MtTrapResult;
         boost::container::small_vector<std::pair<DAddr, std::size_t>, 8> mutex_ranges;
-        for (const auto& [addr, size] : regions) {
-            if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
-                owner_ranges.emplace_back(addr, size);
-            } else if (r.buffer_cache.MtTrapWrite(addr, size, false) == Result::NeedsMutex) {
-                mutex_ranges.emplace_back(addr, size);
+        {
+            // EDEN_NX2_MT_INVAL_ONELOCK: one hold of the (recursive) tracker lock for all the
+            // ranges; the calls below take it again cheaply. Nothing here takes a cache mutex.
+            std::optional<VideoCommon::MT::TrackerScope> one_lock;
+            if (regions.size() > 1 && VideoCommon::MT::InvalOneLock()) {
+                one_lock.emplace(r.buffer_cache.MtTrackerMutex());
+            }
+            for (const auto& [addr, size] : regions) {
+                if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
+                    owner_ranges.emplace_back(addr, size);
+                } else if (r.buffer_cache.MtTrapWrite(addr, size, false) == Result::NeedsMutex) {
+                    mutex_ranges.emplace_back(addr, size);
+                }
             }
         }
         if (!mutex_ranges.empty()) {
@@ -2848,13 +2936,15 @@ inline bool Nx2DrawPipeline::SeqTicValid(const u8* tic_bytes) {
     TicValidMemo key{};
     std::memcpy(key.raw.data(), tic_bytes, 32);
     key.layout_gen = rasterizer.gpu_memory->LayoutGeneration();
+    key.manager = rasterizer.gpu_memory;
     u64 hash = key.layout_gen * 0x9E3779B97F4A7C15ull;
     for (const u64 word : key.raw) {
         hash = (hash ^ word) * 0x100000001B3ull;
     }
     TicValidMemo& memo = tic_valid_memo[(hash >> 32) & (tic_valid_memo.size() - 1)];
     // Only an odd (stable) layout generation is memoized.
-    if ((key.layout_gen & 1) != 0 && memo.layout_gen == key.layout_gen && memo.raw == key.raw) {
+    if ((key.layout_gen & 1) != 0 && memo.layout_gen == key.layout_gen && memo.raw == key.raw &&
+        memo.manager == key.manager) {
         return memo.valid;
     }
     Tegra::Texture::TICEntry entry;
@@ -2862,6 +2952,25 @@ inline bool Nx2DrawPipeline::SeqTicValid(const u8* tic_bytes) {
     key.valid = VideoCommon::IsValidEntry(*rasterizer.gpu_memory, entry);
     memo = key;
     return key.valid;
+}
+
+inline bool Nx2DrawPipeline::SeqIsContinuous(u64 gpu_addr, u64 size) {
+    Tegra::MemoryManager& memory = *rasterizer.gpu_memory;
+    if (!VideoCommon::MT::ContinuousMemo()) {
+        return memory.IsContinuousRange(gpu_addr, size);
+    }
+    // As SeqTicValid: only an odd (stable) generation read before the walk is memoized; a layout
+    // change during the walk leaves an entry no later lookup matches.
+    const u64 layout_gen = memory.LayoutGeneration();
+    const u64 hash = ((gpu_addr >> 8) ^ (size * 0x9E3779B97F4A7C15ull)) * 0x100000001B3ull;
+    ContinuousMemo& memo = continuous_memo[(hash >> 40) & (continuous_memo.size() - 1)];
+    if ((layout_gen & 1) != 0 && memo.layout_gen == layout_gen && memo.gpu_addr == gpu_addr &&
+        memo.size == size && memo.manager == &memory) {
+        return memo.continuous;
+    }
+    const bool continuous = memory.IsContinuousRange(gpu_addr, size);
+    memo = ContinuousMemo{gpu_addr, size, layout_gen, &memory, continuous};
+    return continuous;
 }
 
 inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
@@ -2914,7 +3023,7 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
             continue;
         }
         if ((!desc.is_written || prefers_sparse) &&
-            !memory.IsContinuousRange(binding.gpu_addr, binding.size)) {
+            !SeqIsContinuous(binding.gpu_addr, binding.size)) {
             return 4;
         }
         ssbos.push_back({binding.device_addr, binding.size, desc.is_written});

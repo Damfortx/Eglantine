@@ -1356,8 +1356,29 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 
+namespace {
+/// EDEN_NX2_MT_UBIND_FOLD: the sequencer's engine recorded this uniform bind as a CbBind delta
+/// (Maxwell3D::ProcessCBBind records it, when the engine records, right before it calls the
+/// rasterizer), which the committer applies to its buffer cache in stream order.
+bool MtBindRecorded(const Tegra::Engines::Maxwell3D* real, size_t stage, u32 index) {
+    if (!VideoCommon::MT::OnSequencer() || !VideoCommon::MT::UniformBindFold()) {
+        return false;
+    }
+    if (real == nullptr || !real->mt_record || real->mt_cb_binds.empty()) {
+        return false;
+    }
+    const auto& last = real->mt_cb_binds.back();
+    return last.stage == stage && last.slot == index;
+}
+} // namespace
+
 void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                  u32 size) {
+    // EDEN_NX2_MT_UBIND_FOLD: the engine recorded this bind as a CbBind pseudo-delta, which the
+    // committer applies to its buffer cache in stream order (no Command per bind).
+    if (MtBindRecorded(maxwell3d.Real(), stage, index)) {
+        return;
+    }
     MT_COMMAND(Uniform, [this, stage, index, gpu_addr, size] {
         BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
     })
@@ -1365,6 +1386,9 @@ void RasterizerVulkan::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAd
 }
 
 void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
+    if (MtBindRecorded(maxwell3d.Real(), stage, index)) {
+        return;
+    }
     MT_COMMAND(Uniform, [this, stage, index] { DisableGraphicsUniformBuffer(stage, index); })
     buffer_cache.DisableGraphicsUniformBuffer(stage, index);
 }
