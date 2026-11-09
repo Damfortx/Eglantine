@@ -1115,8 +1115,43 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
 void Maxwell3D::FrontWriteRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* words, u32 count, bool ends_method) {
     auto& fs = Front(system, split);
+    if (!VideoCommon::MT::LiteFrontBatch()) {
+        for (u32 i = 0; i < count; ++i) {
+            FrontWrite(split, fs, method + i, words[i], ends_method && i + 1 == count, false);
+        }
+        return;
+    }
+    // EDEN_NX2_MT_LITE_FBATCH: a plain state write is FrontWrite's non-executable branch inline
+    // (shadow RAM, same-value skip, state block). Anything else takes FrontWrite, which may change
+    // fs.control, so the mode is read again for every word.
+    namespace Profile = VideoCommon::Nx2Profile;
+    const bool general = !fs.skip_same || FrontVerifyEnabled(); // Fixed for the FrontState.
     for (u32 i = 0; i < count; ++i) {
-        FrontWrite(split, fs, method + i, words[i], ends_method && i + 1 == count, false);
+        const u32 m = method + i;
+        const u32 arg = words[i];
+        if (general || execution_mask[m] || !split.StateBlocks() ||
+            fs.control == Regs::ShadowRamControl::Replay || DrawManager::IsInstanceLoopMethod(m)) {
+            FrontWrite(split, fs, m, arg, ends_method && i + 1 == count, false);
+            continue;
+        }
+        const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                             fs.control == Regs::ShadowRamControl::TrackWithFilter;
+        bool kept = true;
+        if (tracked) {
+            kept = fs.shadow[m] == arg;
+            fs.shadow[m] = arg;
+        }
+        if (Profile::Enabled()) [[unlikely]] {
+            Profile::Add(Profile::Counter::MethodWrites, 1);
+        }
+        if (fs.regs[m] == arg && kept) {
+            if (Profile::Enabled()) [[unlikely]] {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+            continue;
+        }
+        fs.regs[m] = arg;
+        split.StateWrite(this, m, arg, tracked);
     }
 }
 
@@ -1226,12 +1261,32 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         }
         engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
         const size_t parameter_count = fs.parameters.size();
+        // EDEN_NX2_MT_LITE_FCALL: a same-value state write FrontWrite would drop returns in the
+        // emit callback (no profile counters or verify records to keep then).
+        const bool fast_same = VideoCommon::MT::LiteFrontCalls() && fs.skip_same &&
+                               !VideoCommon::Nx2Profile::Enabled() && !FrontVerifyEnabled();
         const auto result = engine.native_jit->Execute(
             start, fs.parameters, std::span<u32>{native_data_ram},
             [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
             [&](u32 address, u32 value) {
                 if (address >= MacroRegistersStart) {
                     return false;
+                }
+                // FrontWrite's same-value return, by shadow RAM mode (Replay writes the shadow
+                // word). Executable methods (the DMA reads below among them) never skip.
+                if (fast_same && !execution_mask[address]) {
+                    bool same;
+                    if (fs.control == Regs::ShadowRamControl::Track ||
+                        fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+                        same = fs.shadow[address] == value && fs.regs[address] == value;
+                    } else if (fs.control == Regs::ShadowRamControl::Replay) {
+                        same = fs.regs[address] == fs.shadow[address];
+                    } else {
+                        same = fs.regs[address] == value;
+                    }
+                    if (same) {
+                        return true;
+                    }
                 }
                 FrontWrite(split, fs, address, value, true, true);
                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
@@ -1372,7 +1427,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // pages a read found unwritten by the GPU after such a wait skip it next time; a page the
     // back has since marked GPU-written drains above (marks are never cleared). The risk is a
     // dispatch still queued writing such a page for the first time. EDEN_NX2_DMA_READ_KNOWN=1
-    // skips (=a alternates; off by default).
+    // skips (=a alternates); on by default under EDEN_NX2_MT_LITE (EDEN_NX2_MT_LITE_DMAKNOWN):
+    // under the MT back each writer wait waits for the sequencer to run everything up to the
+    // last writer (~900/s, ~45 ms/s in title 1).
     static const char known_mode = Tegra::Nx2EnvMode("EDEN_NX2_DMA_READ_KNOWN");
     static std::vector<u64> known_source_pages; // Front thread only; one bit a device page.
     const auto known_source = [&](bool note) {
@@ -1403,7 +1460,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             split.Drain(VideoCommon::GpuSplit::DrainReason::DmaRead);
         }
     } else if (skipped) {
-        if (!(Tegra::Nx2Switch(known_mode, false) && known_source(false))) {
+        if (!(Tegra::Nx2Switch(known_mode, VideoCommon::MT::LiteDmaKnown()) &&
+              known_source(false))) {
             split.WaitForWriters(VideoCommon::GpuSplit::DrainReason::WritersDmaRead);
             // Still not GPU-written with the writers run: a CPU-written page (so far).
             bool written = false;

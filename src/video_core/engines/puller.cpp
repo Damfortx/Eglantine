@@ -620,8 +620,11 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     // only made it wait for the back (and the back submit) at every acquire no queued release
     // predicts. EDEN_NX2_SEM_EXECUTE_NODRAIN=1 goes on without them (=a alternates; off by
     // default). The back still runs every release in order, before anything sent after this.
+    // On by default under EDEN_NX2_MT_LITE (EDEN_NX2_MT_LITE_EXECNODRAIN): there each drain also
+    // idles the sequencer until the front sends again.
     static const char nodrain_mode = Tegra::Nx2EnvMode("EDEN_NX2_SEM_EXECUTE_NODRAIN");
-    if (VideoCommon::GpuSplit::Get().Active() && Tegra::Nx2Switch(nodrain_mode, false)) {
+    if (VideoCommon::GpuSplit::Get().Active() &&
+        Tegra::Nx2Switch(nodrain_mode, VideoCommon::MT::LiteExecNoDrain())) {
         NotePullerSite(PullerSite::ExecSkipped);
         return;
     }

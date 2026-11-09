@@ -19,6 +19,7 @@
 #include "common/common_types.h"
 #include "video_core/nx2.h"
 #include "video_core/mt/lite_switches.h"
+#include "video_core/mt/lite3_front_switches.h"
 #include "video_core/mt/seq_diet.h"
 
 namespace Core {

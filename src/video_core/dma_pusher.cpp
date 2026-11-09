@@ -233,14 +233,27 @@ bool DmaPusher::Step() {
         // billions of instances and lost the device loading a race).
         bool gpu_written =
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        bool writers_waited = false;
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            !IsKnownCpuCommandList(dma_state.dma_get, size_t{header.size} * sizeof(u32)) &&
+            !IsKnownCpuCommandList(dma_state.dma_get, size_t{header.size} * sizeof(u32))) {
             // EDEN_NX2_MT_LITE_WRITERS: the committer only up to its queued guest writes (the
             // sequencer marks what the writers write at capture; GPU-written lists wait below).
-            VideoCommon::GpuSplit::Get().WaitForWriters(
+            writers_waited = VideoCommon::GpuSplit::Get().WaitForWriters(
                 VideoCommon::MT::LiteWritersSettle()
                     ? VideoCommon::GpuSplit::DrainReason::WritersCpuCommands
-                    : VideoCommon::GpuSplit::DrainReason::WritersCommands)) {
+                    : VideoCommon::GpuSplit::DrainReason::WritersCommands);
+            // EDEN_NX2_MT_LITE_KNOWNLIST: the writers were already done, which tells as much as
+            // a wait for them: note the pages too (checked again, a writer may have been
+            // captured since the first check), or no page is ever noted once waits stop waiting.
+            if (!writers_waited && VideoCommon::MT::LiteKnownCpuLists()) {
+                gpu_written =
+                    IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+                if (!gpu_written) {
+                    NoteCpuCommandList(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+                }
+            }
+        }
+        if (writers_waited) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             // EDEN_NX2_GPU_PROFILE: how often waiting for the writers found a GPU-written list.
@@ -352,10 +365,20 @@ static const u32 g_semaphore_watch = [] {
     return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
 }();
 
-// LOCAL TEST (Zelda): EDEN_NX2_FRONT_BATCH=1 (see ProcessCommands).
+// LOCAL TEST (Zelda): EDEN_NX2_FRONT_BATCH=1 (see ProcessCommands). On by default under
+// EDEN_NX2_MT_LITE (EDEN_NX2_MT_LITE_FBATCH), which also sends single words this way.
 static bool FrontBatchEnabled() {
-    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_FRONT_BATCH");
-    return Tegra::Nx2Switch(mode, false);
+    static const bool on = [] {
+        const char mode = Tegra::Nx2EnvMode("EDEN_NX2_FRONT_BATCH");
+        return mode != '0' && (Tegra::Nx2Switch(mode, false) || VideoCommon::MT::LiteFrontBatch());
+    }();
+    return on;
+}
+// The shortest run FrontWriteRun takes: one word under EDEN_NX2_MT_LITE_FBATCH (CallMethod's
+// per-word dispatch costs more than the run call), else two as before.
+static size_t FrontBatchMinimum() {
+    static const size_t minimum = VideoCommon::MT::LiteFrontBatch() ? 1 : 2;
+    return minimum;
 }
 
 // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
@@ -392,7 +415,8 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                     const size_t available =
                         (std::min)({size_t{dma_state.method_count}, commands.size() - index,
                                     size_t{MacroRegistersStart - dma_state.method}});
-                    if (maxwell3d->GetNativeMacroEngine().native_turing && available > 1) {
+                    if (maxwell3d->GetNativeMacroEngine().native_turing &&
+                        available >= FrontBatchMinimum()) {
                         const u32 count = static_cast<u32>(available);
                         const bool ends = count == dma_state.method_count;
                         dma_state.dma_word_offset = u64((word_offset + index + count - 1) * sizeof(u32));
@@ -565,6 +589,19 @@ void DmaPusher::CallMethod(u32 argument) {
             ReportUnboundSubchannel();
             return;
         }
+        // EDEN_NX2_MT_LITE_FCALL: the 3D front first (WritesMemory is false for Maxwell3D, so
+        // nothing below applies to it but this call).
+        if (VideoCommon::MT::LiteFrontCalls() &&
+            subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+            split.Active() && split.FrontMacros()) {
+            auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
+            if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                VideoCommon::Nx2Profile::Scope front_scope{VideoCommon::Nx2Profile::Zone::FrontMethod};
+                maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
+                                           dma_state.is_last_call);
+                return;
+            }
+        }
         const bool writer = split.Active() &&
                             WritesMemory(subchannel, subchannel_type[dma_state.subchannel],
                                          dma_state.method, 1);
@@ -624,6 +661,18 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         if (subchannel == nullptr) {
             ReportUnboundSubchannel();
             return;
+        }
+        // EDEN_NX2_MT_LITE_FCALL: as in CallMethod.
+        if (VideoCommon::MT::LiteFrontCalls() &&
+            subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+            split.Active() && split.FrontMacros()) {
+            auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
+            if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                VideoCommon::Nx2Profile::Scope front_scope{VideoCommon::Nx2Profile::Zone::FrontMethod};
+                maxwell3d->FrontCallMultiMethod(system, split, dma_state.method, base_start,
+                                                num_methods, dma_state.method_count);
+                return;
+            }
         }
         const bool writer = split.Active() &&
                             WritesMemory(subchannel, subchannel_type[dma_state.subchannel],
