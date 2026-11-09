@@ -149,3 +149,55 @@ BIN=<mkw-mt build>/build/pgo/bin/eden-cli, from /home/appo/src/eglantine-builden
 3. Hangs: 1 with `EDEN_NX2_MT_WATCHDOG=1` must log no "MT wait > 2 s"; if anything hangs, first `EDEN_NX2_MT_LAZY_WAKE=0` (a missed flush point leaves a consumer asleep with entries pending; the 32 KiB auto-flush bounds it, so a hang means a wait without Flush).
 4. Bisect only if 1-3 show a loss or a problem, one switch at 0 per run (tags perf-lazy0, perf-fold0, perf-cmdb0, perf-bmin1 (EDEN_NX2_MT_BATCH_MIN=1), perf-cont0, perf-texf0, perf-onelock0, perf-ebr0, perf-ralias0, perf-dmac0). Wrong uniforms/geometry: UBIND_FOLD first; stale or flickering textures on aliased render targets: RALIAS; missed texture updates after CPU writes: INVAL_TEXFILTER; wrong indirect draw counts / culling after MME DMA reads: DMA_CONSUMED (also run 1 once with EDEN_NX2_DMA_READ_CHECK=1: "0 stale" expected).
 5. A/B of the "alt" ones in one run: e.g. `EDEN_NX2_ALT_RANDOM=1 EDEN_NX2_ALT_SECONDS=2 EDEN_NX2_MT_RALIAS=a` (3 runs, tools/alt.py).
+
+## Round 6 (branch mkw-mt-lite, commits 6171e38..5e5a574, docs/mt-lite-plan6.md): one test round
+Compiled only (build/pgo rc=0); nothing below has run. BIN=/home/appo/src/Eglantine-mtB/build/pgo/bin/eden-cli,
+from /home/appo/src/eglantine-buildenv/tools, 2x attract demo (`./demo.sh $BIN 120 <tag>`; results in
+runs/cli-<tag>.out, runs/log-<tag>.txt). L = `EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1` (now includes
+GPUPARAM2, REGDEDUP and the W3 switches REPORTSIZE/OVERLAY64/SEQPOS/I2MPOS/PENDACQ/PENDPOLL by default).
+Note: REGDEDUP's commit also fixes a real bug (FrontRunMacro skipped repeated MME DMA reads 0x157/0x158
+under MT lite since iteration 3, unconditionally fixed): MT lite numbers may shift because of it.
+1. Startup lines: `grep "MT lite 6:\|Register dedup: .* latch-only\|GPU params v2: pipeline" runs/log-r6-stats.txt`
+   from run 3: regdedup on; reportsize..pendpoll true, pendcheck false; INFO "built with draw parameter
+   built-ins (cb0)". Any WARNING "reads the draw parameter words from memory" = those draws see 0
+   (wrong geometry): note hash/stage.
+2. fps pairs vs MT unset, alternating, >= 3 each:
+   `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 ./demo.sh $BIN 120 r6-off<i>` and
+   `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 ./demo.sh $BIN 120 r6-lite<i>`
+   + one portal screenshot of an r6-lite run (missing/exploded track or kart geometry = wrong
+   base vertex/instance from GPUPARAM2: rerun with EDEN_NX2_MT_LITE_GPUPARAM2=0).
+3. Stats run: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 L EDEN_NX2_GPU_PROFILE=1 EDEN_NX2_PULLER_STATS=1 EDEN_NX2_ACQUIRE_STATS=1 EDEN_NX2_GPUPARAM_STATS=1 ./demo.sh $BIN 120 r6-stats`:
+   - `grep "GPU params in 10 s"`: "v2: N calls" ~10k/s*10, copy-free ~all, "built-in draws" > 0, fallbacks ~0;
+     group size histogram (expected mostly 4), "released by"/"methods" = what sits between calls.
+   - "GPU split drains per second": writers (commands) ~108 -> ~0-10 ms/s; position (was ~109) down;
+     puller down. `grep "MT lite 6 position waits"`: sequencer-only > 0, less ms/wait than settle.
+     PULLER_STATS: "pendacq nodrain", "pendpoll lazy" > 0; ACQUIRE_STATS site 4 met ~0.
+   - `grep "Register dedup:"`: dma+macro dropped/s in the millions; front zones "front method"/"macro"/"push" down.
+     "writers (dma read)" may rise (0x157 fix).
+4. Randomized in-run A/Bs (3 runs each, `./alt.py runs/log-<tag>.txt`):
+   `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 L EDEN_NX2_ALT_RANDOM=1 EDEN_NX2_ALT_SECONDS=2 EDEN_NX2_MT_LITE_GPUPARAM2=a ./demo.sh $BIN 120 r6-ab-gp2-<i>`
+   `... EDEN_NX2_MT_LITE_REGDEDUP=a ... r6-ab-dedup-<i>`
+   Grouping on/off (no 'a'): separate runs with `EDEN_NX2_GPUPARAM2_GROUP=1` vs default (r6-grp1-<i>).
+   W3 switches have no 'a' mode: if 2/3 show a loss, one run each with EDEN_NX2_MT_LITE_<X>=0 for
+   SEQPOS, OVERLAY64, PENDACQ (tags r6-<x>0).
+5. GPUPARAM_CHECK: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 L EDEN_NX2_GPUPARAM_CHECK=1 ./demo.sh $BIN 120 r6-gpcheck`:
+   "check ... mismatched 0", "v2 check N compared, 0 mismatched", no "GPU params check" warnings
+   (groups are size 1 in this mode). Also once `EDEN_NX2_SPLIT_VERIFY=1` (r6-splitverify): no new register differences.
+6. REGDEDUP CHECK: `... L EDEN_NX2_MT_LITE_REGDEDUP_CHECK=1 EDEN_NX2_GPU_PROFILE=1 ... r6-dedupcheck`:
+   "would have emitted (total)" 0. Without MT: `EDEN_NX2_MT_LITE_REGDEDUP=1 EDEN_NX2_MT_LITE_REGDEDUP_CHECK=1 EDEN_NX2_GPU_PROFILE=1` (r6-dedup-nomt): "(sink)" > 0 in a normal =1 run, 0 violations in CHECK.
+7. VERIFY: `... L EDEN_NX2_MT_VERIFY=1 EDEN_NX2_MT_STATS=1 ... r6-verify`: 0 mismatches (besides classified concurrent guest writes).
+8. DMA_READ_CHECK: `... L EDEN_NX2_DMA_READ_CHECK=1 ... r6-dmacheck`: "without a drain (0 stale)". If stale: bisect
+   I2MPOS=0, SEQPOS=0, OVERLAY64=0, REPORTSIZE=0. PENDCHECK: `... L EDEN_NX2_MT_LITE_PENDCHECK=1 EDEN_NX2_PULLER_STATS=1 ... r6-pendcheck`: "pendacq would meet" ~0.
+9. Watchdog: `... L EDEN_NX2_MT_WATCHDOG=1 ... r6-watchdog`: no "MT wait > 2 s"; no new "Channel X waits on
+   semaphore" lines (else PENDACQ=0, then PENDPOLL=0). No device loss in any run.
+10. Without MT: `EDEN_NX2_GPUPARAM2=1` (MT unset, r6-gp2-nomt): copy-free inline, picture correct; MT unset with
+    nothing set must match r6-off (no "GPU params v2" lines, disk pipeline cache loads unchanged).
+11. FRONT2 census (go/no-go for a two-stage front): `... L EDEN_NX2_FRONT2_STATS=1 EDEN_NX2_GPU_PROFILE=1 ... r6-front2`
+    (not an fps run): `grep "FRONT2 census"`: close FRONT2 if dry decode < ~40 ms/s or barriers > ~5k/s.
+12. Split screen (needs ONE manual calibration first, user at the PC; tools/splitscreen/README.md):
+    `INPUT=record ./splitscreen/splitscreen.sh $BIN 600 cal` (drive menus: P1 a/f+h/arrows, P2 o/e+r/F5-F8, F12 at "GO"),
+    `./splitscreen/rec2timeline.py splitscreen/rec/keys-rec-cal.txt 100 > splitscreen/timeline.txt`, then
+    `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 ./splitscreen/splitscreen.sh $BIN 240 ss-off` and
+    `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 ./splitscreen/splitscreen.sh $BIN 240 ss-lite`
+    (alternate, >= 2 each): `cat runs/fps-<tag>.txt`; marker `grep "Key script: press key 69" runs/log-<tag>.txt`;
+    screenshot during the race to confirm split screen.
