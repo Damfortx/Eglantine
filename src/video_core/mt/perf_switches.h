@@ -88,4 +88,13 @@ namespace PerfDetail {
     return PerfDetail::Read(mode);
 }
 
+/// EDEN_NX2_MT_DMA_CONSUMED (P10, alternates): an MME DMA read of pages the GPU has not written
+/// (GpuSplit::WaitForWriters / DrainForRead) waits for the sequencer (`consumed`) and only for
+/// the committer's guest memory writes queued before it (GpuSplit::NoteCommitterWrite), not for
+/// `settled` of everything sent. =0: they wait for `settled` (full round trip).
+[[nodiscard]] inline bool DmaReadConsumed() {
+    static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_DMA_CONSUMED");
+    return PerfDetail::Read(mode);
+}
+
 } // namespace VideoCommon::MT

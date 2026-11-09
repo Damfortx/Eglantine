@@ -1422,6 +1422,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             apply_known(before.data(), checked);
             split.Drain(VideoCommon::GpuSplit::DrainReason::DmaRead);
         }
+    } else if (!on_gpu_written) {
+        // EDEN_NX2_MT_DMA_CONSUMED: no GPU data to download here; under the multithreaded back
+        // the committer's queued guest writes are all the read needs past the sequencer.
+        split.DrainForRead(VideoCommon::GpuSplit::DrainReason::DmaRead);
     } else {
         split.Drain(VideoCommon::GpuSplit::DrainReason::DmaRead);
     }

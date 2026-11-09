@@ -263,6 +263,10 @@ public:
         if (!in_batch) {
             stream.Flush(); // EDEN_NX2_MT_LAZY_WAKE: a sleeping committer runs it now
         }
+        if (WritesGuestMemory(kind)) {
+            // EDEN_NX2_MT_DMA_CONSUMED: front reads after this entry wait for the committer.
+            VideoCommon::GpuSplit::Get().NoteCommitterWrite();
+        }
         Count(counters.commands, kind);
         NoteAsyncWork(kind);
         if (lockstep) {
@@ -284,6 +288,22 @@ public:
             return VideoCommon::MT::CommandsInBatch();
         default:
             return false;
+        }
+    }
+
+    /// Commands whose committer side may write guest memory the front reads (conservative: all
+    /// but those that only record or invalidate).
+    [[nodiscard]] static bool WritesGuestMemory(MT::Kind kind) {
+        switch (kind) {
+        case MT::Kind::Uniform:
+        case MT::Kind::Barrier:
+        case MT::Kind::Clear:
+        case MT::Kind::ConditionalRendering:
+        case MT::Kind::InvalidateRegion:
+        case MT::Kind::InvalidateGPUCache:
+            return false;
+        default:
+            return true;
         }
     }
 

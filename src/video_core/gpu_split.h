@@ -108,6 +108,15 @@ public:
     }
     /// Committer: everything before `position` is committed.
     void StoreSettled(u64 position);
+    /// Sequencer (EDEN_NX2_MT_DMA_CONSUMED): the entry it runs queued a Command that writes guest
+    /// memory on the committer (fence/semaphore releases, query reports, downloads, DMA...).
+    void NoteCommitterWrite() {
+        const u64 position = back_exec_position + 1;
+        if (committer_write_position.load(std::memory_order_relaxed) < position) {
+            committer_write_position.store(position, std::memory_order_release);
+        }
+    }
+
     /// Committer thread start/stop (the scheduler owner under the multithreaded back).
     static void MarkCommitterThread(bool on) {
         on_committer_thread = on;
@@ -321,6 +330,10 @@ public:
         Count,
     };
     void Drain(DrainReason reason = DrainReason::Other);
+    /// Front, before an MME DMA read of pages the GPU has not written: everything sent has run
+    /// on the sequencer, and the committer has run every guest memory write queued so far.
+    /// Without the multithreaded back (or EDEN_NX2_MT_DMA_CONSUMED=0) a Drain.
+    void DrainForRead(DrainReason reason);
 
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
@@ -716,6 +729,13 @@ private:
     MtBackInterface* mt_back{};
     std::atomic<bool> mt_active{};
     alignas(128) std::atomic<u64> settled{};
+    /// EDEN_NX2_MT_DMA_CONSUMED: 1 + the ring position of the last entry that queued a committer
+    /// guest write (sequencer stores it before it stores `consumed` past that entry).
+    alignas(128) std::atomic<u64> committer_write_position{};
+    /// Sequencer-owned: ring position of the entry Execute runs.
+    u64 back_exec_position{};
+    /// The `settled` position a front read must wait for once `consumed` reached `target`.
+    [[nodiscard]] u64 ReadSettleTarget(u64 target, DrainReason reason) const;
 
 public:
     /// Set by the committer while its thread runs.

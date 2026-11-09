@@ -30,6 +30,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/mt/thread_exit.h"
+#include "video_core/mt/perf_switches.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
 #include "video_core/mt/mt_switches.h"
@@ -605,11 +606,54 @@ void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
 
+u64 GpuSplit::ReadSettleTarget(u64 target, DrainReason reason) const {
+    // EDEN_NX2_MT_DMA_CONSUMED (alternates): an MME DMA read of pages the GPU has not written
+    // needs the sequencer past `target` (engines write guest memory there and mark GPU-written
+    // ranges at capture) and only the committer's own guest writes queued before it, not the
+    // whole sequencer -> resolver -> committer round trip. Read after `consumed` reached
+    // `target`: the sequencer stored the write position before it stored `consumed`.
+    if ((reason == DrainReason::WritersDmaRead || reason == DrainReason::DmaRead) &&
+        VideoCommon::MT::DmaReadConsumed()) {
+        return std::min(target, committer_write_position.load(std::memory_order_acquire));
+    }
+    return target;
+}
+
+void GpuSplit::DrainForRead(DrainReason reason) {
+    if (!MtActive() || !VideoCommon::MT::DmaReadConsumed()) {
+        Drain(reason);
+        return;
+    }
+    FlushState();
+    // Everything sent so far has run once this returns: so have the writes it noted (those the
+    // committer makes are inside the settle target).
+    pending_write_count = 0;
+    pending_write_overflow = false;
+    const u64 target = write_position;
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    if (consumed_cache >= target &&
+        settled.load(std::memory_order_acquire) >= ReadSettleTarget(target, reason)) {
+        CountWait(reason, false, 0);
+        return;
+    }
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
+    wait_target.store(target, std::memory_order_seq_cst);
+    Publish();
+    WaitConsumed(target);
+    WaitSettled(ReadSettleTarget(target, reason));
+    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    publish_every = 8;
+    CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
+}
+
 bool GpuSplit::WaitForWriters(DrainReason reason) {
     FlushState();
     const u64 target = std::min(last_writer_position, write_position);
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache >= target && SettledPosition() >= target) {
+    if (consumed_cache >= target &&
+        (MtActive() ? settled.load(std::memory_order_acquire) >= ReadSettleTarget(target, reason)
+                    : true)) {
         CountWait(reason, false, 0);
         return false;
     }
@@ -619,7 +663,7 @@ bool GpuSplit::WaitForWriters(DrainReason reason) {
     Publish();
     WaitConsumed(target);
     if (MtActive()) {
-        WaitSettled(target);
+        WaitSettled(ReadSettleTarget(target, reason));
     }
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
@@ -877,6 +921,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                                           : std::chrono::steady_clock::time_point{};
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            back_exec_position = read_position;
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) && idle_hook != nullptr &&
