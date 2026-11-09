@@ -40,6 +40,7 @@
 #include "video_core/mt/engine_ptr.h"
 #include "video_core/mt/epoch.h"
 #include "video_core/mt/maxwell3d_reg_names.h"
+#include "video_core/mt/lite_switches.h"
 #include "video_core/mt/mt_switches.h"
 #include "video_core/mt/perf_switches.h"
 #include "video_core/mt/packet_compact.h"
@@ -641,6 +642,10 @@ private:
     bool running = false;
     const bool lockstep = VideoCommon::MT::Lockstep() || VideoCommon::MT::Verify();
     const bool verify = VideoCommon::MT::Verify();
+    // EDEN_NX2_MT_LITE pieces (lite_switches.h, docs/mt-lite-plan.md).
+    const bool lite_loop = VideoCommon::MT::LiteCommitLoop();
+    const bool lite_quiet = VideoCommon::MT::LiteQuiet();
+    const bool lite_no_tic_valid = VideoCommon::MT::LiteNoTicValid();
 
     // Sequencer-owned.
     std::vector<u64> delta_scratch;
@@ -916,6 +921,10 @@ inline void Nx2DrawPipeline::Start() {
              "MT: committer started (lockstep {}, verify {}, compute {}, resolvers {}, shadow {})",
              lockstep, verify, VideoCommon::MT::ComputePackets() ? "packet" : "serial",
              resolver_count, shadow);
+    LOG_INFO(Render_Vulkan,
+             "MT lite: {} (ubo {}, loop {}, ticvalid {}, drain {}, quiet {}; resolvers {})",
+             VideoCommon::MT::Lite(), VideoCommon::MT::LiteUboFromCapture(), lite_loop,
+             lite_no_tic_valid, VideoCommon::MT::LiteDrain(), lite_quiet, resolver_count);
 }
 
 inline void Nx2DrawPipeline::Stop() {
@@ -1132,6 +1141,20 @@ inline void Nx2DrawPipeline::WaitCommitted() {
                                                   target};
     commit_waiting.store(true, std::memory_order_seq_cst);
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (lite_loop) {
+        // EDEN_NX2_MT_LITE_LOOP: the committer checks commit_waiting without a fence while it
+        // runs entries (it may miss this store until its Idle): poll with short sleeps instead
+        // of a futex wait that only its notify could end.
+        for (u32 rounds = 0; stream.ConsumerPosition(consumer) < target; ++rounds) {
+            if (rounds < 64) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds{20});
+            }
+        }
+        commit_waiting.store(false, std::memory_order_relaxed);
+        return;
+    }
     while (true) {
         const u32 seen = commit_word.load(std::memory_order_seq_cst);
         if (stream.ConsumerPosition(consumer) >= target) {
@@ -1282,13 +1305,28 @@ inline void Nx2DrawPipeline::CommitterLoop(std::stop_token stop) {
             Idle(stop);
             continue;
         }
-        committer_quiet.store(false, std::memory_order_seq_cst);
-        RunEntry(entry);
-        stream.Advance(consumer, entry);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (commit_waiting.load(std::memory_order_relaxed)) {
-            commit_word.fetch_add(1, std::memory_order_seq_cst);
-            commit_word.notify_all();
+        if (lite_loop) {
+            // EDEN_NX2_MT_LITE_LOOP: no locked instruction per entry. `committer_quiet` only
+            // changes here when Idle set it; a WaitCommitted is answered in Idle (where this
+            // thread goes once the waiting sequencer stops producing) or by its own timed polls.
+            if (committer_quiet.load(std::memory_order_relaxed)) {
+                committer_quiet.store(false, std::memory_order_seq_cst);
+            }
+            RunEntry(entry);
+            stream.Advance(consumer, entry);
+            if (commit_waiting.load(std::memory_order_relaxed)) {
+                commit_word.fetch_add(1, std::memory_order_seq_cst);
+                commit_word.notify_all();
+            }
+        } else {
+            committer_quiet.store(false, std::memory_order_seq_cst);
+            RunEntry(entry);
+            stream.Advance(consumer, entry);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (commit_waiting.load(std::memory_order_relaxed)) {
+                commit_word.fetch_add(1, std::memory_order_seq_cst);
+                commit_word.notify_all();
+            }
         }
         if (hook_requested.load(std::memory_order_relaxed)) [[unlikely]] {
             hook_requested.store(false, std::memory_order_seq_cst);
@@ -1335,9 +1373,24 @@ inline void Nx2DrawPipeline::Idle(std::stop_token& stop) {
                 std::memory_order_relaxed);
         }
     };
+    if (lite_loop) {
+        // EDEN_NX2_MT_LITE_LOOP: the Dekker half the entry loop leaves out (a sequencer in
+        // WaitCommitted stops producing, so this thread gets here once it passed the target).
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (commit_waiting.load(std::memory_order_relaxed)) {
+            commit_word.fetch_add(1, std::memory_order_seq_cst);
+            commit_word.notify_all();
+        }
+    }
+    bool hook_break = false;
     for (u32 spins = 0; spins < 4096; ++spins) {
         if (stream.Peek(consumer) != nullptr || stop.stop_requested()) {
             return;
+        }
+        // EDEN_NX2_MT_LITE_QUIET: a front Drain waits for this thread to go quiet: do it now.
+        if (lite_quiet && hook_requested.load(std::memory_order_relaxed)) {
+            hook_break = true;
+            break;
         }
         MTDetail::Pause();
     }
@@ -1350,6 +1403,16 @@ inline void Nx2DrawPipeline::Idle(std::stop_token& stop) {
         CollectEpochs();
         rasterizer.scheduler.FlushDeferred();
         committer_quiet.store(true, std::memory_order_seq_cst);
+    }
+    if (hook_break) {
+        // Quiet now; spin the rest of the usual time for the next entry before sleeping.
+        for (u32 spins = 0; spins < 4096; ++spins) {
+            if (stream.Peek(consumer) != nullptr || stop.stop_requested() ||
+                hook_requested.load(std::memory_order_relaxed)) {
+                return;
+            }
+            MTDetail::Pause();
+        }
     }
     stream.WaitForData(consumer, [&] {
         return stop.stop_requested() || hook_requested.load(std::memory_order_seq_cst);
@@ -1781,6 +1844,13 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         };
         const auto capture_view = [&](u32 handle) {
             const u32 index = Tegra::Texture::TextureHeaderIndex(handle, tic_limit, native_tiling);
+            if (lite_no_tic_valid && resolver_count == 0) {
+                // EDEN_NX2_MT_LITE_TICVALID: the validity bits are for resolvers only.
+                if (index <= tic_limit) {
+                    SeqReadDescriptor(regs.tex_header.Address() + u64{index} * 32);
+                }
+                return;
+            }
             const u32 bit = tic_valid_count++;
             if (bit / 64 >= tic_valid.size()) {
                 tic_valid.push_back(0);

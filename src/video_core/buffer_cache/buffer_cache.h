@@ -1226,9 +1226,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
+    // EDEN_NX2_MT_LITE_UBO: the committer recording a packet takes the decision the sequencer
+    // made at capture (below) without asking the tracker again under tracker_mutex.
+    const bool mt_decided = MT::t_capture != nullptr && !MT::t_capture->verify &&
+                            MT::LiteUboFromCapture() &&
+                            MT::t_capture->FindUbo(static_cast<u32>(stage), index) != nullptr;
     bool use_fast_buffer = needs_alignment_stream
         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
-            && !MtIsRegionGpuModified(device_addr, size));
+            && !mt_decided && !MtIsRegionGpuModified(device_addr, size));
     // The multithreaded back's committer: the sequencer decided and, if streamed, read the bytes.
     const MT::UboEntry* captured = nullptr;
     if (const MT::CaptureView* const capture = MT::t_capture) [[unlikely]] {
@@ -1516,10 +1521,14 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
         // Small buffers the GPU has not written are streamed, as graphics ones are: synchronizing
         // them made every dispatch re-protect pages an inline upload had just unprotected (two
         // VirtualProtect calls per dispatch, ~4,000 dispatches a second in title 1).
+        // EDEN_NX2_MT_LITE_UBO: as for graphics, the capture's decision (stage 5).
+        const bool mt_decided = MT::t_capture != nullptr && !MT::t_capture->verify &&
+                                MT::LiteUboFromCapture() &&
+                                MT::t_capture->FindUbo(5, index) != nullptr;
         bool use_fast_buffer =
             needs_alignment_stream ||
             (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
-             !MtIsRegionGpuModified(binding.device_addr, size));
+             !mt_decided && !MtIsRegionGpuModified(binding.device_addr, size));
         // The multithreaded back's committer (compute packets: stage 5).
         const MT::UboEntry* captured = nullptr;
         if (const MT::CaptureView* const capture = MT::t_capture) [[unlikely]] {

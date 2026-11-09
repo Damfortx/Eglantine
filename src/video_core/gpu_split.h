@@ -18,6 +18,7 @@
 
 #include "common/common_types.h"
 #include "video_core/nx2.h"
+#include "video_core/mt/lite_switches.h"
 #include "video_core/mt/seq_diet.h"
 
 namespace Core {
@@ -177,6 +178,12 @@ public:
     void RequestIdleHook() {
         if (MtActive()) {
             mt_back->RequestHook();
+            // EDEN_NX2_MT_LITE_QUIET: the sequencer's idle spin also ends on the request (it
+            // stores back_quiet after it; it runs no hook of its own under the MT back). A
+            // sleeping sequencer is quiet already: no wake.
+            if (VideoCommon::MT::LiteQuiet()) {
+                hook_requested.store(true, std::memory_order_seq_cst);
+            }
             return;
         }
         hook_requested.store(true, std::memory_order_seq_cst);
@@ -736,6 +743,15 @@ private:
     u64 back_exec_position{};
     /// The `settled` position a front read must wait for once `consumed` reached `target`.
     [[nodiscard]] u64 ReadSettleTarget(u64 target, DrainReason reason) const;
+    /// EDEN_NX2_MT_LITE_DRAIN: the reasons whose waits only need the sequencer and the
+    /// committer's guest memory writes (semaphore/syncpoint reads, fence signals, reports).
+    [[nodiscard]] static bool LiteDrainReason(DrainReason reason) {
+        return VideoCommon::MT::LiteDrain() &&
+               (reason == DrainReason::Puller || reason == DrainReason::Sync ||
+                reason == DrainReason::Position);
+    }
+    /// DrainForRead's wait: `consumed` past everything sent, `settled` past ReadSettleTarget.
+    void DrainToSettleTarget(DrainReason reason);
 
 public:
     /// Set by the committer while its thread runs.

@@ -27,6 +27,17 @@ namespace VideoCommon::MT {
     return Tegra::Nx2Switch(mode, false);
 }
 
+/// EDEN_NX2_MT_LITE=1 (with EDEN_NX2_MT=1): the lightest pipeline, sequencer + committer without
+/// resolvers (docs/mt-lite-plan.md, lite_switches.h): EDEN_NX2_MT_RESOLVERS defaults to 0 and the
+/// EDEN_NX2_MT_LITE_* pieces default to on.
+[[nodiscard]] inline bool Lite() {
+    static const bool on = [] {
+        const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_LITE");
+        return Enabled() && Tegra::Nx2Switch(mode, false);
+    }();
+    return on;
+}
+
 /// EDEN_NX2_MT_SELFTEST=1: stress the primitives at startup and log PASS/FAIL.
 [[nodiscard]] inline bool SelftestEnabled() {
     static const char mode = Tegra::Nx2EnvMode("EDEN_NX2_MT_SELFTEST");
@@ -40,9 +51,9 @@ namespace VideoCommon::MT {
     return interval;
 }
 
-/// EDEN_NX2_MT_RESOLVERS: resolver threads (phase 5).
+/// EDEN_NX2_MT_RESOLVERS: resolver threads (phase 5; default 2, 0 with EDEN_NX2_MT_LITE).
 [[nodiscard]] inline u32 Resolvers() {
-    static const u32 count = EnvNumber("EDEN_NX2_MT_RESOLVERS", 2);
+    static const u32 count = EnvNumber("EDEN_NX2_MT_RESOLVERS", Lite() ? 0 : 2);
     return count;
 }
 

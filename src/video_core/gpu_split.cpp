@@ -554,6 +554,12 @@ void GpuSplit::CountWait(DrainReason reason, bool waited, u64 wait_ns) {
 }
 
 void GpuSplit::Drain(DrainReason reason) {
+    // EDEN_NX2_MT_LITE_DRAIN: the reads after these drains need the sequencer and the committer's
+    // guest memory writes only (not its draws, nor both threads quiet: they submit on their own).
+    if (MtActive() && LiteDrainReason(reason)) {
+        DrainToSettleTarget(reason);
+        return;
+    }
     FlushState();
     // Everything sent so far has run once this returns: so have the writes it noted.
     pending_write_count = 0;
@@ -590,7 +596,11 @@ void GpuSplit::Drain(DrainReason reason) {
 void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
     FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache >= position && SettledPosition() >= position) {
+    // EDEN_NX2_MT_LITE_DRAIN: the committer only up to its guest writes queued before `position`
+    // (ReadSettleTarget, read once `consumed` passed it).
+    const bool lite = MtActive() && LiteDrainReason(reason);
+    if (consumed_cache >= position &&
+        SettledPosition() >= (lite ? ReadSettleTarget(position, reason) : position)) {
         CountWait(reason, false, 0);
         return;
     }
@@ -600,7 +610,7 @@ void GpuSplit::WaitForPosition(u64 position, DrainReason reason) {
     Publish();
     WaitConsumed(position);
     if (MtActive()) {
-        WaitSettled(position);
+        WaitSettled(lite ? ReadSettleTarget(position, reason) : position);
     }
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
@@ -612,8 +622,9 @@ u64 GpuSplit::ReadSettleTarget(u64 target, DrainReason reason) const {
     // ranges at capture) and only the committer's own guest writes queued before it, not the
     // whole sequencer -> resolver -> committer round trip. Read after `consumed` reached
     // `target`: the sequencer stored the write position before it stored `consumed`.
-    if ((reason == DrainReason::WritersDmaRead || reason == DrainReason::DmaRead) &&
-        VideoCommon::MT::DmaReadConsumed()) {
+    if (((reason == DrainReason::WritersDmaRead || reason == DrainReason::DmaRead) &&
+         VideoCommon::MT::DmaReadConsumed()) ||
+        LiteDrainReason(reason)) {
         return std::min(target, committer_write_position.load(std::memory_order_acquire));
     }
     return target;
@@ -624,6 +635,10 @@ void GpuSplit::DrainForRead(DrainReason reason) {
         Drain(reason);
         return;
     }
+    DrainToSettleTarget(reason);
+}
+
+void GpuSplit::DrainToSettleTarget(DrainReason reason) {
     FlushState();
     // Everything sent so far has run once this returns: so have the writes it noted (those the
     // committer makes are inside the settle target).
@@ -883,6 +898,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
+            // EDEN_NX2_MT_LITE_QUIET: a request under the MT back only wants back_quiet; once
+            // stored, spin again for the front's next work instead of going to sleep.
+            const bool lite_hook = mt && available == read_position &&
+                                   VideoCommon::MT::LiteQuiet() &&
+                                   hook_requested.load(std::memory_order_relaxed);
             if (available == read_position) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 // The front may already see everything consumed: Drain() waits for back_quiet
@@ -895,6 +915,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     back_quiet.store(true, std::memory_order_release);
                 }
                 available = published.load(std::memory_order_acquire);
+                if (lite_hook && available == read_position && !stop_token.stop_requested()) {
+                    continue;
+                }
             }
             if (available == read_position) {
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
