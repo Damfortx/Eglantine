@@ -12,3 +12,11 @@ B (mkw-mt-lite ef10090), 2x attract demo, idle PC:
 - top: GPU (front) 81%, GPUCommit 79%, GPUBack 71%.
 - perf flat: GPUBack BackLoop 12.5%, CaptureDraw 7.1%, SpinRecursiveMutex::lock 6.1%, CallMethod 4.9%, Execute 4.6%, FinishOverlayCompact 3.0%, SerialRaw 2.5%, SeqReadDescriptor 2.1%, WriteBlockCached 2.1%. GPU front: WaitConsumed 19.7%, sched_yield 16.1%, FrontCallMethod 10.1%, DmaPusher CallMethod 7.6%, ProcessCommands 6.5%, FrontWrite 5.4%, TimedWaitSettled 5.1%, MacroWrite 4.4%, macro JIT 4.1%. GPUCommit: Idle 17%, TrackerScope 6.7%, DoUpdateGraphicsBuffers 4.2%.
 - EDEN_NX2_GPU_PROFILE front per second: push 368 ms, front method 219 ms, macro 153 ms, split drain 188 ms, idle 54 ms => FRONT IS NOW THE LIMIT (~93% busy). 3D register writes 9.7M/s of which 5.4M same value. Drains/s: puller ~2.0-2.4k (463-475 waited, 68-87 ms, committer share 5-6 ms), writers(commands) 12-14k (450-464 waited, 43 ms, committer 16-18 ms), writers(dma read) ~900 (228-238 waited, 45-46 ms, committer 0), position ~250 (63-69 waited, 11-13 ms), writers(cpu lists) 70-97k (2 waited).
+
+# Iteration 3 (88b4fd8) measured
+- fps 2x: MT lite 62.6 / 63.4 / 72.3 (mean 66.1) vs MT unset 54.5 / 67.4 / 55.8 (mean 59.2): +12%. VERIFY 0, watchdog 0, DMA_READ_CHECK 0 stale. SPLIT_VERIFY differences ~70% also on the stable build (artifact).
+- EDEN_NX2_GPU_PROFILE front per second: push 304 ms, macro 162, front method 130 (was 219), split drain 324 (was 188), idle 58. 10.2M 3D register writes/s (5.5M same value).
+- Drains/s: puller 2015 (366 waited, 98 ms, committer 11 ms); writers(commands) 18.8k (371 waited, 83.5 ms, committer 25 ms); position 202 (67 waited, 83.5 ms => ~1.2 ms each, committer 13.8 ms); writers(dma read) 202 (70 waited, 46 ms); writers(cpu lists) 6/s; predicted acquires 3470/s.
+- Puller waits in 10 s: acquire drain 1641, acquire fences 1039, resume poll 16404 (1004 behind).
+- Acquire drains in 10 s: site1 op41 pending unmet 315, site1 op41 pending met 85, site2 op40 none unmet 693, site2 op41 none unmet 30, site2 op43 none met 518; top addresses 0x2105037010 (496), 0x21f6297000 (355), 0x21f6297100 (338), 0x21f6297040 (236), 0x21f6297140 (194).
+=> The front now mostly waits on the SEQUENCER (committer share small).
