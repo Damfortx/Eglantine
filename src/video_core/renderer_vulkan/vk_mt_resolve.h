@@ -197,7 +197,9 @@ inline void Resolver::Start() {
         decoder.EnableUniforms();
     }
     ready.store(false, std::memory_order_relaxed);
-    thread = std::jthread([this](std::stop_token stop) { Loop(stop); });
+    thread = std::jthread([this](std::stop_token stop) {
+        VideoCommon::MT::RunLoudThread("GPUResolve", stop, [&] { Loop(stop); });
+    });
     while (!ready.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }

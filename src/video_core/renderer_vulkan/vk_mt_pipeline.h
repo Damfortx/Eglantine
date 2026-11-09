@@ -34,6 +34,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
+#include "video_core/mt/thread_exit.h"
 #include "video_core/mt/capture.h"
 #include "video_core/mt/draw_packet.h"
 #include "video_core/mt/engine_ptr.h"
@@ -828,13 +829,17 @@ inline void Nx2DrawPipeline::Start() {
     seq_desc.Reset();
     commit_decoder.table.Reset();
     start_ready.store(false, std::memory_order_relaxed);
-    committer = std::jthread([this](std::stop_token stop) { CommitterLoop(stop); });
+    committer = std::jthread([this](std::stop_token stop) {
+        VideoCommon::MT::RunLoudThread("GPUCommit", stop, [&] { CommitterLoop(stop); });
+    });
     while (!start_ready.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
     StartResolvers();
     if (watch.on) {
-        watchdog = std::jthread([this](std::stop_token stop) { WatchdogLoop(stop); });
+        watchdog = std::jthread([this](std::stop_token stop) {
+            VideoCommon::MT::RunLoudThread("MTWatchdog", stop, [&] { WatchdogLoop(stop); });
+        });
     }
     running = true;
     VideoCommon::MT::g_write_hook_on.store(true, std::memory_order_seq_cst);

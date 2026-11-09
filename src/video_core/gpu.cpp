@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <vector>
 #include <condition_variable>
@@ -322,7 +323,42 @@ struct GPU::Impl {
     }
 
     void MapInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), is_async, true);
+        // Counted, so a CPU-side reader of GPU virtual memory (the command list snapshot at
+        // submit) can wait for the maps queued before it (WaitForQueuedMaps).
+        maps_queued.fetch_add(1, std::memory_order_acq_rel);
+        gpu_thread.Run(
+            [this, map = std::move(func)] {
+                map();
+                maps_done.fetch_add(1, std::memory_order_acq_rel);
+            },
+            is_async, true);
+    }
+
+    bool WaitForQueuedMaps() {
+        const u64 target = maps_queued.load(std::memory_order_acquire);
+        if (maps_done.load(std::memory_order_acquire) >= target) {
+            return true;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        auto next_log = start + std::chrono::seconds{2};
+        for (u32 spins = 0; maps_done.load(std::memory_order_acquire) < target; ++spins) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_log) {
+                LOG_WARNING(HW_GPU, "Waited {} s for {} queued GPU memory map(s)",
+                            std::chrono::duration_cast<std::chrono::seconds>(now - start).count(),
+                            target - maps_done.load(std::memory_order_acquire));
+                next_log = now + std::chrono::seconds{2};
+                if (now - start >= std::chrono::seconds{10}) {
+                    return false;
+                }
+            }
+            if (spins < 64) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds{50});
+            }
+        }
+        return true;
     }
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
@@ -490,6 +526,9 @@ struct GPU::Impl {
     /// last_sync_fence for lock-free readers (the multithreaded back's sequencer).
     std::atomic<u64> requested_sync_fence{};
     std::atomic<bool> mt_tick_posted{};
+    /// MapInOrder calls queued / run on the GPU thread (in order).
+    std::atomic<u64> maps_queued{};
+    std::atomic<u64> maps_done{};
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
 
@@ -709,6 +748,10 @@ void GPU::RunInOrder(std::function<void()>&& func) {
 
 void GPU::MapInOrder(std::function<void()>&& func) {
     impl->MapInOrder(std::move(func));
+}
+
+bool GPU::WaitForQueuedMaps() {
+    return impl->WaitForQueuedMaps();
 }
 
 void GPU::InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {

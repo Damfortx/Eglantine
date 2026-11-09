@@ -449,6 +449,25 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             // Before the copy: a suspension during it must count as one after it.
             entries.snapshot_suspensions =
                 channel_state->payload->dma_pusher.suspensions.load(std::memory_order_acquire);
+            // The GMMU maps of Switch 2 memory run in GPU-thread order (MapInOrder), but this
+            // copy reads the GMMU now. A list in memory whose map is still queued read as
+            // zeros: the list was dropped and the game waited forever for its semaphore (seen
+            // at boot whenever the GPU thread was slow to drain its queue, e.g. while it
+            // started the multithreaded back). Wait for the queued maps first.
+            for (const auto& entry : entries.command_lists) {
+                if (!channel_state->memory_manager->IsFullyMappedRange(
+                        entry.addr, static_cast<size_t>(entry.size) * sizeof(u32))) {
+                    static std::atomic<u32> waits{};
+                    if (waits.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        LOG_INFO(Service_NVDRV,
+                                 "Command list {:#x}+{:#x} not mapped yet: waiting for queued "
+                                 "GPU maps before the snapshot",
+                                 entry.addr.Value(), entry.size.Value() * 4);
+                    }
+                    gpu.WaitForQueuedMaps();
+                    break;
+                }
+            }
             size_t words = 0;
             for (const auto& entry : entries.command_lists) {
                 words += entry.size;

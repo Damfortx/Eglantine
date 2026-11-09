@@ -29,6 +29,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "video_core/mt/thread_exit.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
 #include "video_core/mt/mt_switches.h"
@@ -315,7 +316,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         mt_back->Start();
         mt_active.store(true, std::memory_order_seq_cst);
     }
-    back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
+    back_thread = std::jthread([this](std::stop_token stop_token) {
+        MT::RunLoudThread("GPUBack", stop_token, [&] { BackLoop(stop_token); });
+    });
     active = true;
 #ifdef ARCHITECTURE_x86_64
     // Front macros run compiled (macro_turing_jit.h) only.
