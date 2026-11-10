@@ -320,7 +320,7 @@ inline bool RegSetTest() {
     std::mt19937 rng{3};
     for (u32 i = 0; i < 500; ++i) {
         const u32 method = rng() % 0xE00;
-        regs[method] = rng();
+        regs[method] = static_cast<u32>(rng());
         set.Mark(method);
         expected[method] = true;
     }

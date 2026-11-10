@@ -692,7 +692,7 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                                MemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT));
     });
-    frame_parity = q;
+    frame_parity = static_cast<u32>(q);
 }
 
 } // namespace Vulkan
