@@ -254,3 +254,43 @@ Compiled only (build rc=0); nothing below has run. BIN, demo.sh, L as in Round 6
    EDEN_NX2_FRAMEGEN_RATE=<display Hz>` (b8-fg): INFO "FrameGen: ..." line; on-screen rate ~2x; check
    ghosting on the HUD/fast edges (smear in the wrong direction = motion-vector sign), pacing judder,
    input latency; VRAM +33 MB at 1440p. Without the switch: no change vs b8-off.
+
+## Batch 9 (branch mkw-mt-lite, docs/batch9-plan.md): one test round
+Compiled only (build rc=0); nothing below has run. BIN, demo.sh, L as in Round 6. Race benchmark:
+/home/appo/src/eglantine-buildenv/tools/race/ (README).
+0. Race benchmark calibration first (once): `CALIBRATE=<N> tools/race/race.sh <eden-cli> 240 calib`
+   (screenshots every N s into runs/calib-calib/), `calibmap.py` to map them to frames, fix
+   timeline.txt (title accept, default cursors Single Player / Grand Prix / Mushroom Cup, 24 A
+   presses, GO frame, markend inside race 1). Keep the save unchanged between compared runs.
+   Then `race.sh` + `racefps.py` replace the attract demo for 1-player numbers (fps, 1% low,
+   stalls > 100 ms, runtime-pipeline ms in the window).
+1. Upstream worker-thread translation (cold start: delete the title's Vulkan pipeline cache for
+   one run each, MT unset and L; tags b9-cold-off / b9-cold-lite): "Runtime pipelines ... built
+   ... ms on the GPU thread" total over the first 3 minutes must drop vs batch 8; "Async
+   translation in the last 10 s" line present (queued / ready in time / draws skipped / not
+   detached / latency). Skipped draws show as brief pop-in of new objects (acceptable for a few
+   frames; persistent missing geometry = bug, retry with EDEN_NX2_ASYNC_TRANSLATION=0). Not
+   detached > 0 often => report. A/B EDEN_NX2_ASYNC_TRANSLATION=a in-run. Close the emulator
+   while translations are queued (first minute): clean exit, cache saved, no crash/hang.
+2. Stage cache: `EDEN_NX2_STAGE_CACHE=verify` run (b9-stage-verify): no mismatch lines; then
+   EDEN_NX2_STAGE_CACHE=0 vs default cold-start pipeline ms. Picture problems: STAGE_CACHE=0,
+   GS_PASSTHROUGH_FIX=0, TRANSLATION_CACHE=0 (bisect in that order).
+3. Hot pages (off by default here): `EDEN_NX2_HOT_PAGES=a` in-run A/B (3 runs) and one run with
+   =1: fps / front ms vs default; flickering or one-frame-late UI/particles => keep off.
+4. U2 VRAM budget at 2x: startup "Video memory available (budget)" or "Low video memory" warning
+   (warning expected under 5.5 GiB budget); "Texture cache budget (auto): ... -> critical ...
+   expected" line (critical should be ~budget - 0.8-1 GiB, no longer <= 5 GiB). VRAM used vs
+   batch 8 (6.9-7.4 GB), stalls and GPU fence waits. A/B EDEN_NX2_TC_BUDGET_AUTO=a and
+   EDEN_NX2_TC_BUDGET_PROACTIVE=a in-run; margin sweep EDEN_NX2_TC_BUDGET_MARGIN_MB=512/1024.
+   With other GPU apps open (budget ~4.8 GiB): no ~4 fps collapse. BC1: picture of opaque
+   textures (blockiness vs BC7) and VRAM saved; EDEN_NX2_ASTC_BC7_OPAQUE_BC1=0 to compare.
+   First run after the change re-transcodes opaque textures (new disk-cache entries).
+5. Eviction / re-decode loop (suspect for the MT run without disk cache at 4-5 fps, GPU 100 %
+   util but ~98 W): `L EDEN_NX2_TC_CHURN=1` with and without EDEN_NX2_ASTC_DISKCACHE, and with
+   EDEN_NX2_TC_BUDGET_AUTO=0 (b9-churn-*): per 10 s "Texture churn" line: evictions/s, ASTC
+   re-created after eviction per s, ASTC refreshes/s, frames over expected / critical. Loop =
+   ASTC re-created/s steadily > 0 with frames over critical; then raise
+   EDEN_NX2_TC_BUDGET_FLOOR_MB / lower MARGIN, or EDEN_NX2_TC_CRITICAL_MIB, and note it in the
+   next plan. Add EDEN_NX2_VRAM_STATS=1 to see driver budget/usage alongside.
+6. fps on the race benchmark vs batch 8 (>= 3 alternating each, MT unset and L, after warm-up)
+   and first-3-minute stall count.
