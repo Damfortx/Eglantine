@@ -31,6 +31,7 @@
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/mt/lite9_vram.h"
 #include "video_core/mt/role.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
@@ -165,8 +166,13 @@ void TextureCache<P>::RunGarbageCollector() {
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 300ULL;
     }();
     bool protect_costly = false;
+    // Batch 9 U2 (EDEN_NX2_TC_BUDGET_PROACTIVE): the gentle band starts earlier under the budget
+    // thresholds, so it evicts at most one image a pass that needs a download (a GPU wait).
+    const bool bound_downloads = budget_auto_caps && Lite9Vram::ProactiveOn();
+    u32 gentle_downloads = 0;
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, &protect_costly](ImageId image_id) {
+                          &evict_old_costly, &protect_costly, bound_downloads,
+                          &gentle_downloads](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -181,6 +187,9 @@ void TextureCache<P>::RunGarbageCollector() {
             (!high_priority_mode && must_download)) {
             return false;
         }
+        if (must_download && bound_downloads && !aggressive_mode && gentle_downloads++ != 0) {
+            return false;
+        }
         if (must_download) {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
@@ -193,6 +202,16 @@ void TextureCache<P>::RunGarbageCollector() {
             UntrackImage(image, image_id);
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        if (Lite9Vram::ChurnStatsOn()) {
+            ++churn.evictions;
+            if (IsPixelFormatASTC(image.info.format)) {
+                ++churn.astc_evictions;
+                if (churn_evicted_astc.size() >= 65536) {
+                    churn_evicted_astc.clear();
+                }
+                churn_evicted_astc.insert(image.gpu_addr);
+            }
+        }
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (aggressive_mode && total_used_memory + AggressiveHysteresis < critical_memory) {
@@ -293,9 +312,13 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // What the device budget allows (budget minus margins), before that cap.
     const u64 budget_critical = critical_memory;
     const u64 budget_expected = expected_memory;
-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
-    expected_memory =
-        (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+    // Batch 9 U2: thresholds derived from the driver budget (TickFrame) are already the room
+    // this process has, with its own gentle band: no fixed cap.
+    if (!budget_auto_caps) {
+        critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
+        expected_memory = (std::min)(expected_memory,
+                                     critical_memory - (std::min)(critical_memory, u64{768_MiB}));
+    }
     minimum_memory =
         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB raise the collector's thresholds past
@@ -384,17 +407,38 @@ void TextureCache<P>::TickFrame() {
                                            ? slack
                                            : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
                     }
-                    critical_memory =
-                        budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
-                    expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    // Batch 9 U2 (EDEN_NX2_TC_BUDGET_AUTO, mt/lite9_vram.h): budget minus a
+                    // fixed margin, slack and out-of-memory room, floored, no 5 GiB cap; the
+                    // gentle collector starts a share of it below. Re-read here every 30 frames.
+                    const bool was_auto = budget_auto_caps;
+                    budget_auto_caps = Lite9Vram::BudgetAutoOn();
+                    if (budget_auto_caps) {
+                        const auto caps =
+                            Lite9Vram::DeriveCaps(budget, pressure_margin, slack_margin);
+                        critical_memory = caps.critical;
+                        expected_memory = caps.expected;
+                    } else {
+                        critical_memory = budget - (std::min)(margin + pressure_margin + slack_margin,
+                                                              budget / 2);
+                        expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    }
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time).
                     const u64 change = critical_memory > old_critical
                                            ? critical_memory - old_critical
                                            : old_critical - critical_memory;
-                    const bool log = budget_check_frames == 1 || change >= 256_MiB;
+                    const bool log = budget_check_frames == 1 || change >= 256_MiB ||
+                                     was_auto != budget_auto_caps;
                     ApplyThresholdOverrides(log);
-                    if (log) {
+                    if (log && budget_auto_caps) {
+                        LOG_INFO(HW_GPU,
+                                 "Texture cache budget (auto): budget {} MiB, margin {} MiB, out "
+                                 "of memory {} MiB, block slack {} MiB -> critical {} MiB, "
+                                 "expected {} MiB",
+                                 budget >> 20, Lite9Vram::BudgetMargin() >> 20,
+                                 pressure_margin >> 20, slack_margin >> 20,
+                                 critical_memory >> 20, expected_memory >> 20);
+                    } else if (log) {
                         LOG_INFO(HW_GPU,
                                  "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
                                  margin >> 20, pressure_margin >> 20, slack_margin >> 20);
@@ -424,6 +468,31 @@ void TextureCache<P>::TickFrame() {
     // Batch 8 U4: VRAM stats line (EDEN_NX2_VRAM_STATS) and decode image trim.
     if constexpr (requires { runtime.TickVram(u64{}, u64{}, u64{}); }) {
         runtime.TickVram(total_used_memory, expected_memory, critical_memory);
+    }
+    // Batch 9: EDEN_NX2_TC_CHURN, evictions and ASTC re-decodes every 10 s.
+    if (Lite9Vram::ChurnStatsOn()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (churn.frames == 0) {
+            churn.start = now;
+        }
+        ++churn.frames;
+        churn.high_priority_frames += total_used_memory >= expected_memory ? 1 : 0;
+        churn.aggressive_frames += total_used_memory >= critical_memory ? 1 : 0;
+        const double seconds = std::chrono::duration<double>(now - churn.start).count();
+        if (seconds >= 10.0) {
+            LOG_INFO(HW_GPU,
+                     "Texture churn in 10 s ({:.1f} s, {} frames): evictions {} ({:.1f}/s, ASTC "
+                     "{}), ASTC created {} (re-created after eviction {}, {:.1f}/s), ASTC "
+                     "refreshes {} ({:.1f}/s), frames over expected {} / over critical {}, "
+                     "device memory {} MiB (expected {} MiB, critical {} MiB)",
+                     seconds, churn.frames, churn.evictions, churn.evictions / seconds,
+                     churn.astc_evictions, churn.astc_created, churn.astc_recreated,
+                     churn.astc_recreated / seconds, churn.astc_refreshes,
+                     churn.astc_refreshes / seconds, churn.high_priority_frames,
+                     churn.aggressive_frames, total_used_memory >> 20, expected_memory >> 20,
+                     critical_memory >> 20);
+            churn = {};
+        }
     }
     // Every 600 frames: device memory in use against the collector's thresholds.
     // Skip expensive heap allocation, map construction, and sorting unless debug logging is explicitly enabled.
@@ -1857,6 +1926,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    if (Lite9Vram::ChurnStatsOn() && IsPixelFormatASTC(image.info.format)) {
+        ++churn.astc_refreshes;
+    }
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -2897,6 +2969,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             shape.second = gpu_addr;
         }
         ++images_created;
+        if (Lite9Vram::ChurnStatsOn() && IsPixelFormatASTC(new_info.format)) {
+            ++churn.astc_created;
+            if (churn_evicted_astc.erase(gpu_addr) != 0) {
+                ++churn.astc_recreated;
+            }
+        }
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&

@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/mt/astc_bc7.h"
+#include "video_core/mt/lite9_vram.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
 #include "video_core/engines/fermi_2d.h"
@@ -1247,6 +1248,20 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       render_pass_cache{render_pass_cache_}, descriptor_pool{descriptor_pool_},
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
       resolution{Settings::values.resolution_info} {
+    // Batch 9 U2: one warning when the driver grants this process little video memory for the
+    // resolution (an 8 GB card with 4.77 GiB left ran at ~4 fps, the driver paging).
+    if (const u64 budget = device.GetDeviceMemoryBudget(); budget != 0) {
+        const u64 threshold = VideoCommon::Lite9Vram::LowVramThreshold(resolution.up_factor);
+        if (budget < threshold) {
+            LOG_WARNING(Render_Vulkan,
+                        "Low video memory: {} MiB available (budget) at {:.2f}x resolution, under "
+                        "{} MiB: close other programs using the GPU or lower the resolution",
+                        budget >> 20, resolution.up_factor, threshold >> 20);
+        } else {
+            LOG_INFO(Render_Vulkan, "Video memory available (budget): {} MiB at {:.2f}x resolution",
+                     budget >> 20, resolution.up_factor);
+        }
+    }
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
@@ -2588,7 +2603,7 @@ bool TextureCacheRuntime::UseOpaqueAstcFormat() const {
         const char* value = std::getenv("EDEN_NX2_ASTC_BC1");
         return value == nullptr || value[0] != '0';
     }();
-    // Under BC7 (Batch 7 T1) opaque ASTC goes to BC7 too unless EDEN_NX2_ASTC_BC7_OPAQUE_BC1=1.
+    // Under BC7 (Batch 7 T1) opaque ASTC goes to BC1 unless EDEN_NX2_ASTC_BC7_OPAQUE_BC1=0.
     if (AstcBc7Enabled(device) && !VideoCommon::MT::AstcBc7OpaqueBc1()) {
         return false;
     }

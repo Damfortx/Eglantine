@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -16,6 +17,7 @@
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
+#include <unordered_set>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <vector>
@@ -145,6 +147,22 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
+    /// Batch 9 U2 (EDEN_NX2_TC_BUDGET_AUTO): thresholds come from the driver budget, so
+    /// ApplyThresholdOverrides leaves out the MaxCriticalMemory cap.
+    bool budget_auto_caps{};
+    /// EDEN_NX2_TC_CHURN (Lite9Vram::ChurnStatsOn): 10 s eviction / ASTC re-decode counters.
+    struct ChurnStats {
+        u64 evictions{};
+        u64 astc_evictions{};
+        u64 astc_created{};
+        u64 astc_recreated{};
+        u64 astc_refreshes{};
+        u64 high_priority_frames{};
+        u64 aggressive_frames{};
+        u64 frames{};
+        std::chrono::steady_clock::time_point start{};
+    } churn;
+    std::unordered_set<GPUVAddr> churn_evicted_astc; ///< ASTC addresses the collector evicted
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
@@ -155,7 +173,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
     /// The most device memory the collector lets the cache fill before it collects in earnest,
-    /// on every GPU (ApplyThresholdOverrides).
+    /// on every GPU (ApplyThresholdOverrides), unless the thresholds follow the driver budget
+    /// (budget_auto_caps, EDEN_NX2_TC_BUDGET_AUTO).
     static constexpr u64 MaxCriticalMemory = 5_GiB;
     /// How far below critical an aggressive pass frees before it stops.
     static constexpr u64 AggressiveHysteresis = 256_MiB;
