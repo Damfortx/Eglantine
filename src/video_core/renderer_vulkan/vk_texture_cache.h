@@ -17,6 +17,7 @@
 #include <span>
 
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/mt/c10_vram.h"
 #include "video_core/mt/lite8_vram.h"
 
 #include "shader_recompiler/shader_info.h"
@@ -104,6 +105,10 @@ public:
     /// Batch 8 U4: once a frame from TextureCache::TickFrame (EDEN_NX2_VRAM_STATS line,
     /// EDEN_NX2_VRAM_DECODE_TRIM).
     void TickVram(u64 cache_used, u64 expected, u64 critical);
+
+    /// Cycle 10 A (EDEN_NX2_VRAM_GUARD): the image lives (partly) in host memory, so the
+    /// collector may evict it to have it re-created in VRAM.
+    [[nodiscard]] bool IsHostResident(const Image& image) const noexcept;
 
     void LogMemoryStatistics() const;
 
@@ -511,6 +516,11 @@ public:
         return (this->*current_image).UsageFlags();
     }
 
+    /// Cycle 10 A: some of the image's memory is in host memory (EDEN_NX2_VRAM_GUARD).
+    [[nodiscard]] bool HostResident() const noexcept {
+        return original_residency.Bytes() != 0 || scaled_residency.Bytes() != 0;
+    }
+
     /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
         return original_image.GetMemoryBlock();
@@ -664,6 +674,11 @@ private:
 
     /// Records a clear of the whole image to zero.
     void ClearTiles();
+
+    /// Cycle 10 A (EDEN_NX2_VRAM_GUARD): host-memory placement of the images below. Declared
+    /// before them: MakeImage fills it while original_image is constructed.
+    VideoCommon::C10Vram::HostResidency original_residency;
+    VideoCommon::C10Vram::HostResidency scaled_residency;
 
     vk::Image original_image;
     vk::Image scaled_image;

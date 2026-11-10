@@ -113,6 +113,9 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
                           runtime.SparseAlignmentFor(sparse_compatible_))},
       tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
+    if (runtime.memory_allocator.IsHostResident(buffer)) {
+        host_residency.Set(VideoCommon::C10Vram::Kind::Buffer, SizeBytes());
+    }
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
     }

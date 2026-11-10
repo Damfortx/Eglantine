@@ -14,6 +14,7 @@
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/mt/c10_vram.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -84,6 +85,8 @@ private:
     const Device* device{};
     Scheduler* scheduler{};
     vk::Buffer buffer;
+    /// Cycle 10 A (EDEN_NX2_VRAM_GUARD): counted while the buffer is in host memory.
+    VideoCommon::C10Vram::HostResidency host_residency;
     std::vector<BufferView> views;
     VideoCommon::UsageTracker tracker;
     VkDeviceAddress device_address{};

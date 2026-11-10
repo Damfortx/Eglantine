@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <limits>
@@ -24,6 +25,7 @@
 #include "common/logging.h"
 #include <ranges>
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/mt/c10_vram.h"
 #include "video_core/mt/lite8_vram.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -207,12 +209,23 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
             }
         });
     }
+    static std::atomic<bool> guard_logged{};
+    if (VideoCommon::C10Vram::GuardOn() && !guard_logged.exchange(true)) {
+        LOG_INFO(Render_Vulkan,
+                 "VRAM guard on (EDEN_NX2_VRAM_GUARD): images and device-local buffers require "
+                 "device memory before host memory; relocating up to {} host images a frame",
+                 VideoCommon::C10Vram::RelocateLimit());
+    }
 }
 
 MemoryAllocator::~MemoryAllocator() = default;
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                       u64* host_bytes) const
 {
+    if (host_bytes != nullptr) {
+        *host_bytes = 0;
+    }
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -237,8 +250,33 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     // unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > (u64{1} << 28);
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : CreateImageAllocation(ci, alloc_ci, handle, allocation, alloc_info);
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    bool placed = false;
+    if (!huge && VideoCommon::C10Vram::GuardOn()) {
+        // Cycle 10 A (EDEN_NX2_VRAM_GUARD): with DEVICE_LOCAL only preferred, a full device heap
+        // sent images to system memory without a word (MKW at 2x: 26-32 fps instead of ~50).
+        // Require it: within the budget, then past it; only then the old placement below.
+        VmaAllocationCreateInfo strict = alloc_ci;
+        strict.requiredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        result = CreateImageAllocation(ci, strict, handle, allocation, alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            VideoCommon::C10Vram::g_counters.over_budget.fetch_add(1, std::memory_order_relaxed);
+            VideoCommon::C10Vram::RequestEmergencyCollect();
+            strict.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = CreateImageAllocation(ci, strict, handle, allocation, alloc_info);
+            if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                // The device heap is really full: the texture cache leaves more room from now
+                // on (pressure margin) and moves this image back once there is some.
+                VideoCommon::C10Vram::g_counters.device_full.fetch_add(1,
+                                                                       std::memory_order_relaxed);
+                pressure_events.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        placed = result == VK_SUCCESS;
+    }
+    if (!huge && !placed) {
+        result = CreateImageAllocation(ci, alloc_ci, handle, allocation, alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -294,6 +332,9 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                      ci.arrayLayers, static_cast<u32>(ci.format), static_cast<int>(result));
     }
     vk::Check(result);
+    if (NoteHostPlacement(true, alloc_info) && host_bytes != nullptr) {
+        *host_bytes = alloc_info.size;
+    }
 
     // Log GPU memory allocation for images
     if (GPU::Logging::IsActive() &&
@@ -480,7 +521,15 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
+    if (usage == MemoryUsage::DeviceLocal && VideoCommon::C10Vram::GuardOn()) {
+        // Cycle 10 A: the separate pool's memory type then requires DEVICE_LOCAL as well.
+        VmaAllocationCreateInfo strict = alloc_ci;
+        strict.requiredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        if (!CreateBufferInSeparatePool(ci, usage, strict, handle, allocation, alloc_info)) {
+            vk::Check(CreateGuardedBuffer(ci, alloc_ci, 0, handle, allocation, alloc_info));
+        }
+        NoteHostPlacement(false, alloc_info);
+    } else if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
         vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
@@ -538,8 +587,13 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
-                                           &allocation, &alloc_info));
+    if (usage == MemoryUsage::DeviceLocal && VideoCommon::C10Vram::GuardOn()) {
+        vk::Check(CreateGuardedBuffer(ci, alloc_ci, min_alignment, handle, allocation, alloc_info));
+        NoteHostPlacement(false, alloc_info);
+    } else {
+        vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
+                                               &allocation, &alloc_info));
+    }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
@@ -556,6 +610,61 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     };
     return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
                       location, device.GetDispatchLoader());
+}
+
+VkResult MemoryAllocator::CreateGuardedBuffer(const VkBufferCreateInfo& ci,
+                                              const VmaAllocationCreateInfo& alloc_ci,
+                                              VkDeviceSize min_alignment, VkBuffer& handle,
+                                              VmaAllocation& allocation,
+                                              VmaAllocationInfo& alloc_info) const {
+    const auto create = [&](const VmaAllocationCreateInfo& create_ci) {
+        return min_alignment > 1
+                   ? vmaCreateBufferWithAlignment(allocator, &ci, &create_ci, min_alignment,
+                                                  &handle, &allocation, &alloc_info)
+                   : vmaCreateBuffer(allocator, &ci, &create_ci, &handle, &allocation,
+                                     &alloc_info);
+    };
+    VmaAllocationCreateInfo strict = alloc_ci;
+    strict.requiredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    VkResult result = create(strict);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        VideoCommon::C10Vram::g_counters.over_budget.fetch_add(1, std::memory_order_relaxed);
+        VideoCommon::C10Vram::RequestEmergencyCollect();
+        strict.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = create(strict);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            VideoCommon::C10Vram::g_counters.device_full.fetch_add(1, std::memory_order_relaxed);
+            pressure_events.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (result != VK_SUCCESS) {
+        // The old placement (AUTO_PREFER_DEVICE: host memory when the device heap is full).
+        result = create(alloc_ci);
+    }
+    return result;
+}
+
+bool MemoryAllocator::NoteHostPlacement(bool image, const VmaAllocationInfo& alloc_info) const {
+    if (!VideoCommon::C10Vram::GuardOn() || alloc_info.deviceMemory == VK_NULL_HANDLE ||
+        !IsHostMemoryType(alloc_info.memoryType)) {
+        return false;
+    }
+    using VideoCommon::C10Vram::Kind;
+    VideoCommon::C10Vram::CountPlacedHost(image ? Kind::Image : Kind::Buffer, alloc_info.size);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Render_Vulkan, "{} of {} KiB placed in system memory (device memory full)",
+                    image ? "Image" : "Buffer", alloc_info.size >> 10);
+    }
+    return true;
+}
+
+bool MemoryAllocator::IsHostResident(const vk::Buffer& buffer) const noexcept {
+    if (!VideoCommon::C10Vram::GuardOn() || !buffer) {
+        return false;
+    }
+    const vk::MemoryLocation location = buffer.Location();
+    return location.memory != VK_NULL_HANDLE && IsHostMemoryType(location.memory_type);
 }
 
 MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage)
@@ -655,6 +764,7 @@ void LogMemoryStatistics(const Device& device) {
 }
 
 void TickVramStats(const Device& device, const VramCacheFigures& cache) {
+    VideoCommon::C10Vram::TickWarning();
     if (!Lite8Vram::StatsEnabled()) {
         return;
     }
@@ -666,6 +776,11 @@ void TickVramStats(const Device& device, const VramCacheFigures& cache) {
             free_ns, nodedicated;
     };
     static Snapshot previous{};
+    struct GuardSnapshot {
+        u64 images, image_bytes, buffers, buffer_bytes, over_budget, device_full, emergencies,
+            relocated, relocated_bytes;
+    };
+    static GuardSnapshot guard_previous{};
     ++frames;
     const Clock::time_point now = Clock::now();
     if (now - last < std::chrono::seconds{10}) {
@@ -736,6 +851,39 @@ void TickVramStats(const Device& device, const VramCacheFigures& cache) {
              current.nodedicated - previous.nodedicated, cache.used >> 20, cache.expected >> 20,
              cache.critical >> 20, cache.pressure_events);
     previous = current;
+    if (VideoCommon::C10Vram::GuardOn()) {
+        // Cycle 10 A: resources in system memory (the slow-mode signature) and the guard's work.
+        auto& g = VideoCommon::C10Vram::g_counters;
+        const GuardSnapshot guard{
+            .images = g.images_placed_host.load(std::memory_order_relaxed),
+            .image_bytes = g.image_bytes_placed_host.load(std::memory_order_relaxed),
+            .buffers = g.buffers_placed_host.load(std::memory_order_relaxed),
+            .buffer_bytes = g.buffer_bytes_placed_host.load(std::memory_order_relaxed),
+            .over_budget = g.over_budget.load(std::memory_order_relaxed),
+            .device_full = g.device_full.load(std::memory_order_relaxed),
+            .emergencies = g.emergencies.load(std::memory_order_relaxed),
+            .relocated = g.relocated.load(std::memory_order_relaxed),
+            .relocated_bytes = g.relocated_bytes.load(std::memory_order_relaxed),
+        };
+        LOG_INFO(Render_Vulkan,
+                 "VRAM in 10 s: host memory now {} images {} MiB / {} buffers {} MiB; placed in "
+                 "host {} images {} MiB / {} buffers {} MiB; device-local over budget {}, device "
+                 "full {}; emergency collections {}; relocated {} images {} MiB",
+                 g.host_images.load(std::memory_order_relaxed),
+                 g.host_image_bytes.load(std::memory_order_relaxed) >> 20,
+                 g.host_buffers.load(std::memory_order_relaxed),
+                 g.host_buffer_bytes.load(std::memory_order_relaxed) >> 20,
+                 guard.images - guard_previous.images,
+                 (guard.image_bytes - guard_previous.image_bytes) >> 20,
+                 guard.buffers - guard_previous.buffers,
+                 (guard.buffer_bytes - guard_previous.buffer_bytes) >> 20,
+                 guard.over_budget - guard_previous.over_budget,
+                 guard.device_full - guard_previous.device_full,
+                 guard.emergencies - guard_previous.emergencies,
+                 guard.relocated - guard_previous.relocated,
+                 (guard.relocated_bytes - guard_previous.relocated_bytes) >> 20);
+        guard_previous = guard;
+    }
     frames = 0;
 }
 

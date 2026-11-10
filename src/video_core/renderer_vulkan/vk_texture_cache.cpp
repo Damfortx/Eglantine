@@ -478,7 +478,8 @@ constexpr std::array<VkFormat, 2> Bc7AstcViewFormats{VK_FORMAT_BC7_UNORM_BLOCK,
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
-                                  bool unbacked = false, bool aliased = false) {
+                                  bool unbacked = false, bool aliased = false,
+                                  VideoCommon::C10Vram::HostResidency* residency = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -510,6 +511,13 @@ constexpr std::array<VkFormat, 2> Bc7AstcViewFormats{VK_FORMAT_BC7_UNORM_BLOCK,
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
             return image;
         }
+    }
+    if (residency != nullptr) {
+        // Cycle 10 A: images placed in host memory are counted and moved back by the collector.
+        u64 host_bytes = 0;
+        vk::Image image = allocator.CreateImage(image_ci, false, &host_bytes);
+        residency->Set(VideoCommon::C10Vram::Kind::Image, host_bytes);
+        return image;
     }
     return allocator.CreateImage(image_ci);
 }
@@ -2655,6 +2663,10 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
+bool TextureCacheRuntime::IsHostResident(const Image& image) const noexcept {
+    return image.HostResident();
+}
+
 void TextureCacheRuntime::TickVram(u64 cache_used, u64 expected, u64 critical) {
     ++vram_frame;
     TickVramStats(device, VramCacheFigures{
@@ -2738,7 +2750,8 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    UsesSparseTiles(runtime_.device, info, gpu_addr_) ||
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
-                                   SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased)),
+                                   SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
+                               &original_residency)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
@@ -3868,7 +3881,8 @@ bool Image::ScaleUp(bool ignore) {
         scaled_info.size.width = scaled_width;
         scaled_info.size.height = scaled_height;
         scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
-                                 runtime->ViewFormats(info.format));
+                                 runtime->ViewFormats(info.format), {}, false, false,
+                                 &scaled_residency);
         ignore = false;
     }
     current_image = &Image::scaled_image;

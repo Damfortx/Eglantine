@@ -108,7 +108,13 @@ namespace Vulkan {
 
         /// `dedicated`: own device memory, returned to the driver on destruction (short-lived
         /// images would otherwise leave holes in the shared blocks).
-        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        /// `host_bytes` (EDEN_NX2_VRAM_GUARD, mt/c10_vram.h): set to the allocation size when the
+        /// image ended up in host memory, else 0.
+        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                              u64* host_bytes = nullptr) const;
+
+        /// EDEN_NX2_VRAM_GUARD: the buffer's memory lacks DEVICE_LOCAL (false with the guard off).
+        [[nodiscard]] bool IsHostResident(const vk::Buffer& buffer) const noexcept;
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
@@ -152,6 +158,24 @@ namespace Vulkan {
         MemoryCommit Commit(const vk::Buffer &buffer, MemoryUsage usage);
 
     private:
+        /// Cycle 10 A: a memory type without DEVICE_LOCAL (system memory over PCIe).
+        [[nodiscard]] bool IsHostMemoryType(u32 type) const noexcept {
+            return type < properties.memoryTypeCount &&
+                   (properties.memoryTypes[type].propertyFlags &
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0;
+        }
+
+        /// Cycle 10 A (EDEN_NX2_VRAM_GUARD): a DeviceLocal buffer in DEVICE_LOCAL memory (within
+        /// the budget, then past it), else with `alloc_ci` (the old placement, may be host).
+        VkResult CreateGuardedBuffer(const VkBufferCreateInfo& ci,
+                                     const VmaAllocationCreateInfo& alloc_ci,
+                                     VkDeviceSize min_alignment, VkBuffer& handle,
+                                     VmaAllocation& allocation,
+                                     VmaAllocationInfo& alloc_info) const;
+
+        /// Cycle 10 A: counts a resource placed in host memory; true when it was.
+        bool NoteHostPlacement(bool image, const VmaAllocationInfo& alloc_info) const;
+
         /// vmaCreateImage, or (EDEN_NX2_VRAM_NODEDICATED) a small image in the shared blocks.
         VkResult CreateImageAllocation(const VkImageCreateInfo& ci,
                                        const VmaAllocationCreateInfo& alloc_ci, VkImage& handle,

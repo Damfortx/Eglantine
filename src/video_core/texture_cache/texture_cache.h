@@ -287,7 +287,8 @@ void TextureCache<P>::RunGarbageCollector() {
     Collect();
     if (total_used_memory >= critical_memory) {
         Configure(true);
-        if (protect_costly_enabled) {
+        // Cycle 10 A: after a device-local allocation failed, costly images are not spared.
+        if (protect_costly_enabled && !vram_emergency) {
             protect_costly = true;
             Collect();
             protect_costly = false;
@@ -300,6 +301,80 @@ void TextureCache<P>::RunGarbageCollector() {
             }
         } else {
             Collect();
+        }
+    }
+    if (vram_emergency && total_used_memory < critical_memory) {
+        vram_emergency = false;
+    }
+}
+
+template <class P>
+void TextureCache<P>::RelocateHostImages() {
+    if constexpr (requires(const Image& image) { runtime.IsHostResident(image); }) {
+        const u32 limit = C10Vram::RelocateLimit();
+        auto& counters = C10Vram::g_counters;
+        if (!C10Vram::GuardOn() || limit == 0 || frame_tick < 2 ||
+            counters.host_images.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        // An image placed in host memory in the last 300 frames means the heap is still full:
+        // evicting now would only re-create them there (another upload / ASTC decode each).
+        const u64 placed = counters.images_placed_host.load(std::memory_order_relaxed);
+        if (placed != seen_host_images_placed) {
+            seen_host_images_placed = placed;
+            relocate_quiet_until = frame_tick + 300;
+            return;
+        }
+        if (frame_tick < relocate_quiet_until || vram_emergency ||
+            total_used_memory >= critical_memory) {
+            return;
+        }
+        u64 room = critical_memory - total_used_memory;
+        std::vector<ImageId> picked;
+        lru_cache.ForEachItemBelow(frame_tick - 2, [&](ImageId image_id) {
+            Image& image = slot_images[image_id];
+            if (!runtime.IsHostResident(image) || True(image.flags & ImageFlagBits::IsDecoding)) {
+                return false;
+            }
+            const u64 bytes = ImageMemoryBytes(image) +
+                              (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
+            if (bytes >= room) {
+                return false;
+            }
+            room -= bytes;
+            picked.push_back(image_id);
+            return picked.size() >= limit;
+        });
+        bool downloaded = false;
+        for (const ImageId image_id : picked) {
+            Image& image = slot_images[image_id];
+            if (False(image.flags & ImageFlagBits::Registered)) {
+                continue;
+            }
+            const bool must_download =
+                IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+            if (must_download) {
+                // Each download is a full GPU wait: one a frame.
+                if (downloaded || gpu_memory == nullptr) {
+                    continue;
+                }
+                downloaded = true;
+                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+                const auto copies = FullDownloadCopies(image.info);
+                image.DownloadMemory(map, copies);
+                runtime.Finish();
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                             swizzle_data_buffer);
+                ++gc_download_deletes;
+            }
+            const u64 bytes = ImageMemoryBytes(image);
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            UnregisterImage(image_id);
+            DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+            counters.relocated.fetch_add(1, std::memory_order_relaxed);
+            counters.relocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
         }
     }
 }
@@ -561,9 +636,18 @@ void TextureCache<P>::TickFrame() {
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
+    // Cycle 10 A (EDEN_NX2_VRAM_GUARD): the allocator could not place an image or buffer in
+    // device memory within the budget; collect hard until under critical.
+    if (C10Vram::ConsumeEmergencyCollect() && !vram_emergency &&
+        total_used_memory >= critical_memory) {
+        vram_emergency = true;
+        C10Vram::g_counters.emergencies.fetch_add(1, std::memory_order_relaxed);
+    }
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
     }
+    vram_emergency = vram_emergency && total_used_memory >= critical_memory;
+    RelocateHostImages();
     sentenced_images.Tick();
     sentenced_image_index = (sentenced_image_index + 1) % TICKS_TO_DESTROY;
     sentenced_image_bytes[sentenced_image_index] = 0;

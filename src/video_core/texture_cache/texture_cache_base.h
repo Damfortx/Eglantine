@@ -39,6 +39,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
+#include "video_core/mt/c10_vram.h"
 #include "video_core/mt/concurrent_map.h"
 #include "video_core/mt/page_counter.h"
 #include "video_core/mt/stable_slot_vector.h"
@@ -147,6 +148,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
+    /// Cycle 10 A (EDEN_NX2_VRAM_GUARD, mt/c10_vram.h): a device-local allocation failed; the
+    /// collector runs aggressive with costly images unprotected until under critical.
+    bool vram_emergency{};
+    u64 seen_host_images_placed{}; ///< C10Vram images_placed_host already seen
+    u64 relocate_quiet_until{};    ///< No relocation before this frame (an image went to host)
     /// Batch 9 U2 (EDEN_NX2_TC_BUDGET_AUTO): thresholds come from the driver budget, so
     /// ApplyThresholdOverrides leaves out the MaxCriticalMemory cap.
     bool budget_auto_caps{};
@@ -542,6 +548,10 @@ private:
 
     /// Runs the Garbage Collector.
     void RunGarbageCollector();
+
+    /// Cycle 10 A: evicts a few images that live in host memory (unused this frame and the
+    /// last) while under critical, so they are re-created in VRAM on their next use.
+    void RelocateHostImages();
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
