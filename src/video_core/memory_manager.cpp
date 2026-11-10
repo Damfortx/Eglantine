@@ -266,14 +266,45 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
     if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
         return std::nullopt;
     }
-    if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
-        if (GetEntry(gpu_addr, false) != EntryType::Mapped)
-            return std::nullopt;
-        const DAddr dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
-        return dev_addr_base + (gpu_addr & page_mask);
+    // Upstream b1e650849e: the same few pages are looked up over and over (every draw rebinds its
+    // buffers and textures): a small per-thread cache of 4 KiB page translations, tagged with the
+    // manager and its page table generation (odd while stable; it moves at every map or unmap,
+    // upstream's map_serial). EDEN_NX2_TRANSLATION_CACHE=0 turns it off.
+    struct CachedPage {
+        u64 owner;
+        u64 serial;
+        u64 page;
+        u64 device_page;
+    };
+    static constexpr size_t CacheSize = 2048;
+    static thread_local std::array<CachedPage, CacheSize> cache{};
+    static const char cache_mode = Tegra::Nx2EnvMode("EDEN_NX2_TRANSLATION_CACHE");
+    constexpr u64 SubpageBits = 12;
+    constexpr u64 SubpageMask = (u64{1} << SubpageBits) - 1;
+    const u64 serial = layout_generation.load(std::memory_order_acquire);
+    const bool use_cache = (serial & 1) != 0 && Tegra::Nx2Switch(cache_mode, true);
+    const u64 owner_id = (u64{unique_identifier} << 1) | 1; // Never 0, the empty slot
+    const u64 page = gpu_addr >> SubpageBits;
+    CachedPage& slot = cache[(page ^ (page >> 11)) % CacheSize];
+    if (use_cache && slot.owner == owner_id && slot.page == page && slot.serial == serial) {
+        return slot.device_page + (gpu_addr & SubpageMask);
     }
-    const DAddr dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
-    return dev_addr_base + (gpu_addr & big_page_mask);
+    std::optional<DAddr> result;
+    if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
+        if (GetEntry(gpu_addr, false) != EntryType::Mapped) {
+            return std::nullopt;
+        }
+        const DAddr dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
+        result = dev_addr_base + (gpu_addr & page_mask);
+    } else {
+        const DAddr dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
+        result = dev_addr_base + (gpu_addr & big_page_mask);
+    }
+    // Only a translation read under one unchanged, stable generation is kept.
+    if (use_cache && layout_generation.load(std::memory_order_acquire) == serial) {
+        slot = CachedPage{owner_id, serial, page, *result - (gpu_addr & SubpageMask)};
+    }
+    return result;
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t size) const {
