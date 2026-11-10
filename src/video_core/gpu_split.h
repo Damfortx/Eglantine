@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <deque>
 #include <unordered_map>
@@ -24,6 +25,7 @@
 #include "video_core/mt/lite4_switches.h"
 #include "video_core/mt/lite5_list_switches.h"
 #include "video_core/mt/lite6_drain_switches.h"
+#include "video_core/mt/c10_front.h"
 #include "video_core/mt/seq_diet.h"
 
 namespace Core {
@@ -455,7 +457,8 @@ public:
     void NoteRelease(GPUVAddr address, u32 payload, bool at_least = false) {
         if (PredictAcquires()) {
             FlushState();
-            pending_releases[address] = PendingRelease{payload, write_position, at_least};
+            pending_releases[address] =
+                PendingRelease{payload, write_position, at_least, C10NextNoteSeq()};
         }
     }
     /// The value a release still on its way will write at `address`: one sent but not yet in
@@ -507,8 +510,11 @@ public:
         // the value of its first word; KnownPendingWords refuses reads past it.
         const bool has_value =
             value.has_value() && (size == 4 || (size > 4 && VideoCommon::MT::LiteOverlayFirst()));
+        // EDEN_NX2_C10_ACQ_SEQ: notes not known by position get a sequence number (see
+        // C10NextNoteSeq): the ring position by which their trigger was sent.
         PushPendingWrite({address, address + size, position, known, tag, value.value_or(0),
-                          has_value, static_cast<u8>(size == 16 ? flags : 0)});
+                          has_value, static_cast<u8>(size == 16 ? flags : 0),
+                          known == WriteKnown::Position ? u64{0} : C10NextNoteSeq()});
     }
 
     /// EDEN_NX2_MT_LITE_I2MPOS (D4): a 3D inline upload (launch_dma) starts. Its destination is
@@ -518,7 +524,8 @@ public:
     void OpenI2mWrite(GPUVAddr address, u64 size, WriteKnown known) {
         CloseI2mWrite();
         open_i2m = {address, address + size, known == WriteKnown::Position ? SentPosition() : 0,
-                    known, VideoCommon::MT::TagI2m, 0, false, 0};
+                    known, VideoCommon::MT::TagI2m, 0, false, 0,
+                    known == WriteKnown::Position ? u64{0} : C10NextNoteSeq()};
         open_i2m_active = true;
     }
     /// D4: inline_data words were just sent to the back (one method or a multi-method run).
@@ -732,7 +739,7 @@ public:
             FlushState();
             auto& adds = pending_adds[address];
             if (adds.size() < 4096) {
-                adds.push_back({write_position, payload});
+                adds.push_back({write_position, payload, C10NextNoteSeq()});
             }
         }
     }
@@ -800,6 +807,12 @@ public:
     void NoteWriter(u8 kind = 6) {
         last_writer_position = write_position;
         last_writer_kind = kind;
+        // EDEN_NX2_C10_*: copy, I2M and 2D writers (anything but compute, kind 1): their guest
+        // writes and semaphore releases are not noted with addresses on the front. Sent (and
+        // committed by Method) before DmaPusher calls this.
+        if (kind != 1) {
+            c10_range_writer_position = write_position;
+        }
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
@@ -818,6 +831,7 @@ public:
     struct ListWait {
         bool waited;    ///< It found the back behind
         bool shortened; ///< The committer was not waited for up to every writer
+        bool c10_shortened{}; ///< EDEN_NX2_C10_LIST_PRECISE: not up to L24's bound either
     };
     /// EDEN_NX2_MT_LITE_LISTPOS (L24): WaitForWriters before a command list on GPU-written pages,
     /// with the multithreaded back: the sequencer past every writer sent (it marks the pages they
@@ -826,26 +840,66 @@ public:
     /// the list's pages at, read once `consumed` passed the writers) and its queued guest memory
     /// writes: the copies and write counts Nx2ReadListCopy reads are made when the committer
     /// records those writers, and a page no captured writer wrote holds what guest memory holds.
+    ///
+    /// EDEN_NX2_C10_LIST_PRECISE (B2; `list_size` != 0): "its queued guest memory writes" become
+    /// the bulk ones (DMA copies/clears, downloads: committer_bulk_write_position), the copy/I2M/2D
+    /// writers sent (their semaphore releases are not noted: c10_range_writer_position) and the
+    /// writes the front noted over [list_address, list_address + list_size) (semaphore/report
+    /// words, inline uploads; their positions, which also raise the sequencer target). The
+    /// committer's other writes (semaphore/report words and fence callbacks) are all noted by the
+    /// front with their addresses (the same argument as EDEN_NX2_MT_LITE_WRITERS for CPU lists);
+    /// one over the list's bytes that is not known by position (QMD releases, drain-known) keeps
+    /// L24's bound. Invariant: noted writes are only dropped by drains that settled every
+    /// committer guest write queued before them (C10NotedWritesBound also covers a bulk-only one).
     template <typename Bound>
-    ListWait WaitForListWriters(const Bound& page_bound) {
+    ListWait WaitForListWriters(const Bound& page_bound, GPUVAddr list_address = 0,
+                                u64 list_size = 0) {
         ReleaseFrontHold(HoldWait); // W1 GPUPARAM v2 front hold
         if (!MtActive()) {
             return ListWait{WaitForWriters(), false};
         }
         FlushState();
-        const u64 target = std::min(last_writer_position, write_position);
-        const auto bound = [&] {
-            return std::min(target,
+        const u64 l24_target = std::min(last_writer_position, write_position);
+        u64 target = l24_target;
+        // B2: front-only state, read before the wait (no note is made or dropped meanwhile).
+        const bool precise = list_size != 0 && VideoCommon::MT::C10ListPrecise();
+        std::optional<u64> noted;
+        if (precise) {
+            ++c10_stats.list_calls;
+            noted = C10NotedWritesBound(list_address, list_size);
+            if (!noted) {
+                ++c10_stats.list_kept;
+            } else {
+                // A noted write over the list's bytes sent after the last writer (a 3D inline
+                // upload: not a NoteWriter writer) is waited for too.
+                target = std::max(target, std::min(*noted, write_position));
+            }
+        }
+        // Read once `consumed` reached the target: the sequencer stores the committer write
+        // positions (release) before it stores `consumed` (seq_cst) past their entries.
+        const auto l24_bound = [&] {
+            return std::min(l24_target,
                             std::max<u64>(page_bound(),
                                           committer_write_position.load(std::memory_order_acquire)));
+        };
+        const auto bound = [&] {
+            if (!noted) {
+                return l24_bound();
+            }
+            return std::min(
+                target,
+                std::max({page_bound(),
+                          committer_bulk_write_position.load(std::memory_order_acquire), *noted}));
         };
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             const u64 settle = bound();
             const u64 now = settled.load(std::memory_order_acquire);
             if (now >= settle) {
+                const bool c10 = noted.has_value() && now < l24_bound();
+                c10_stats.list_nowait += c10 ? 1 : 0;
                 CountWait(DrainReason::WritersCommands, false, 0);
-                return ListWait{false, now < target};
+                return ListWait{false, now < target, c10};
             }
         }
         Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
@@ -858,11 +912,46 @@ public:
         }
         const u64 settle = bound();
         TimedWaitSettled(settle);
-        const bool shortened = settled.load(std::memory_order_acquire) < target;
+        const u64 now = settled.load(std::memory_order_acquire);
+        const bool shortened = now < target;
+        const bool c10 = noted.has_value() && now < l24_bound();
+        c10_stats.list_short += c10 ? 1 : 0;
         CountWait(DrainReason::WritersCommands, true,
                   Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
-        return ListWait{true, shortened};
+        return ListWait{true, shortened, c10};
     }
+
+    // ---- Cycle 10 B1 (EDEN_NX2_C10_ACQ_SEQ, mt/c10_front.h) ----
+    /// Front counters for the drains line (EDEN_NX2_GPU_PROFILE).
+    VideoCommon::MT::C10FrontStats c10_stats;
+    /// DmaPusher, at the start of each method call (front thread): the notes made so far
+    /// (releases, adds, writer-known writes) get the ring position by which the method that
+    /// triggers each of them was sent. The QMD mirror notes a QMD's releases (FrontApply) BEFORE
+    /// the method that launches or signals it is sent (or while the macro that writes it gathers
+    /// its writes in the list): their `position` is too early. Invariant: every note made during
+    /// a DmaPusher call has its trigger sent, or gathered in the state/list buffers that this
+    /// flushes, by the time the next call starts; a note not resolved yet counts as everything
+    /// sent (C10NoteBound).
+    void C10ResolveNotes() {
+        if (c10_note_seq != c10_resolved_seq) [[unlikely]] {
+            C10ResolveNotesSlow();
+        }
+    }
+    struct C10Target {
+        bool ok;       ///< false: some noted write over the word has no usable position
+        u64 position;  ///< The back must be past this before memory answers for the word
+    };
+    /// B1: how far the back must have run before the word at `address` holds what everything
+    /// sent so far leaves there, as far as the front noted writes to it (pending release(s),
+    /// adds, noted writes, the open I2M note) plus the copy/I2M/2D writers sent so far (whose
+    /// releases and writes are not noted). Compute shader writes are the caller's part (pages
+    /// GPU work wrote are refused).
+    [[nodiscard]] C10Target C10AcquireTarget(GPUVAddr address);
+    /// B1: waits for the sequencer past `target` and the committer past its guest writes queued
+    /// before it (ReadSettleTarget, puller reason: EDEN_NX2_MT_LITE_DRAIN). Counted as a puller
+    /// wait. Clears no note. Returns whether the back was behind.
+    bool C10WaitAcquireTarget(u64 target);
+    // ---- end cycle 10 B1 ----
 
 private:
     /// EDEN_NX2_GPU_PROFILE: counts a front wait (`waited`: it found the back behind) and logs
@@ -876,6 +965,71 @@ private:
     /// WaitSettled, timed for the drain report.
     void TimedWaitSettled(u64 target);
     u64 stat_window_start{};
+
+    // ---- Cycle 10 (mt/c10_front.h), front thread only ----
+    /// EDEN_NX2_C10_ACQ_SEQ: sequence number for a note whose trigger may still be unsent
+    /// (C10ResolveNotes); 0 with the switch off (nothing is ever resolved then).
+    u64 C10NextNoteSeq() {
+        return VideoCommon::MT::C10AcqSeq() ? ++c10_note_seq : 0;
+    }
+    void C10ResolveNotesSlow();
+    /// The ring position by which the trigger of note `seq` had been sent (an upper bound:
+    /// resolutions dropped from the table answer with the oldest one kept; unresolved, or 0,
+    /// with everything sent). Call after FlushState.
+    [[nodiscard]] u64 C10NoteBound(u64 seq) const {
+        if (seq == 0 || seq > c10_resolved_seq) {
+            return write_position;
+        }
+        const u64 kept = std::min<u64>(c10_resolution_count, c10_resolutions.size());
+        for (u64 i = c10_resolution_count - kept; i < c10_resolution_count; ++i) {
+            const C10Resolution& resolution = c10_resolutions[i % c10_resolutions.size()];
+            if (resolution.seq >= seq) {
+                return resolution.position;
+            }
+        }
+        return write_position;
+    }
+    /// EDEN_NX2_C10_LIST_PRECISE: the newest position of the writes noted over the range and of
+    /// the copy/I2M/2D writers (nullopt: a note over it is not known by position, or the table
+    /// overflowed). Also covers committer writes behind notes a bulk-only drain dropped.
+    [[nodiscard]] std::optional<u64> C10NotedWritesBound(GPUVAddr address, u64 size) const {
+        // The QMD mirror notes the QMD release words (committer fence callbacks / queries) only
+        // when acquires are predicted: without it they are not all noted.
+        if (pending_write_overflow || !PredictAcquires()) {
+            return std::nullopt;
+        }
+        u64 bound = std::max(c10_range_writer_position, c10_bulk_clear_position);
+        for (size_t i = 0; i < pending_write_count; ++i) {
+            const auto& write = pending_writes[i];
+            if (!(address < write.end && write.begin < address + size)) {
+                continue;
+            }
+            if (write.known != WriteKnown::Position) {
+                return std::nullopt;
+            }
+            bound = std::max(bound, write.position);
+        }
+        if (open_i2m_active && address < open_i2m.end && open_i2m.begin < address + size) {
+            if (open_i2m.known != WriteKnown::Position) {
+                return std::nullopt;
+            }
+            bound = std::max(bound, open_i2m.position);
+        }
+        return bound;
+    }
+    u64 c10_note_seq{};
+    u64 c10_resolved_seq{};
+    struct C10Resolution {
+        u64 seq;      ///< Notes up to this sequence number ...
+        u64 position; ///< ... had their triggers sent before this ring position
+    };
+    std::array<C10Resolution, 256> c10_resolutions{};
+    u64 c10_resolution_count{};
+    /// write_position when the last copy/I2M/2D writer (not compute) was noted (NoteWriter).
+    u64 c10_range_writer_position{};
+    /// write_position at the last drain that dropped the notes while settling only the bulk
+    /// committer writes (EDEN_NX2_MT_LITE_WRITERS reasons; none today, kept for safety).
+    u64 c10_bulk_clear_position{};
 
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -954,6 +1108,7 @@ private:
         u32 value;      ///< The word it writes, when has_value.
         bool has_value; ///< A 4-byte write whose value the front knows (a fence release).
         u8 flags;       ///< WriteDirect64
+        u64 seq;        ///< EDEN_NX2_C10_ACQ_SEQ: note sequence number (0: known by position)
     };
     std::array<PendingWrite, 256> pending_writes{};
     size_t pending_write_count{};
@@ -1009,11 +1164,13 @@ private:
         u32 payload;
         u64 position;
         bool at_least;
+        u64 seq; ///< EDEN_NX2_C10_ACQ_SEQ (C10NextNoteSeq; 0: switch off)
     };
     std::unordered_map<GPUVAddr, PendingRelease> pending_releases;
     struct PendingAdd {
         u64 position;
         u32 payload;
+        u64 seq; ///< EDEN_NX2_C10_ACQ_SEQ (C10NextNoteSeq; 0: switch off)
     };
     std::unordered_map<GPUVAddr, std::deque<PendingAdd>> pending_adds;
     u64 predicted_acquires{};

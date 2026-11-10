@@ -335,6 +335,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}",
              front_macros ? ", macros on the first" : "",
              state_blocks ? ", state writes in blocks" : "");
+    if (MtActive()) {
+        VideoCommon::MT::C10LogStart(); // cycle 10 front switches (mt/c10_front.h)
+    }
 }
 
 bool GpuSplit::PredictAcquires() {
@@ -564,6 +567,11 @@ void GpuSplit::CountWait(DrainReason reason, bool waited, u64 wait_ns) {
     line += fmt::format(" | predicted acquires {:.0f}/s",
                         static_cast<double>(predicted_acquires) / seconds);
     predicted_acquires = 0;
+    // Cycle 10 (mt/c10_front.h): what B1 / B2 avoided or shortened.
+    if (VideoCommon::MT::C10AcqSeq() || VideoCommon::MT::C10ListPrecise()) {
+        line += c10_stats.Format(seconds);
+    }
+    c10_stats = {};
     LOG_INFO(HW_GPU, "GPU split drains per second:{}", line);
     stat_waits = {};
     stat_wait_ns = {};
@@ -696,6 +704,11 @@ void GpuSplit::DrainToSettleTarget(DrainReason reason) {
     FlushState();
     // Everything sent so far has run once this returns: so have the writes it noted (those the
     // committer makes are inside the settle target).
+    // EDEN_NX2_C10_LIST_PRECISE: a settle target of the bulk writes only leaves noted
+    // semaphore/report words unsettled: list reads keep waiting for the committer up to here.
+    if (LiteWritersReason(reason)) {
+        c10_bulk_clear_position = write_position;
+    }
     pending_write_count = 0;
     pending_write_overflow = false;
     DrainedOpenI2m();
@@ -715,6 +728,95 @@ void GpuSplit::DrainToSettleTarget(DrainReason reason) {
     wait_target.store(~u64{0}, std::memory_order_relaxed);
     publish_every = 8;
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
+}
+
+void GpuSplit::C10ResolveNotesSlow() {
+    // Called between DmaPusher method calls: the triggers of the notes made so far were sent,
+    // or sit in the gathered state/macro list, which goes out now (in stream order, as the next
+    // entry would send it anyway).
+    if (!active) {
+        c10_resolved_seq = c10_note_seq;
+        return;
+    }
+    FlushState();
+    c10_resolutions[c10_resolution_count % c10_resolutions.size()] =
+        C10Resolution{c10_note_seq, write_position};
+    ++c10_resolution_count;
+    c10_resolved_seq = c10_note_seq;
+}
+
+GpuSplit::C10Target GpuSplit::C10AcquireTarget(GPUVAddr address) {
+    // Front thread. Everything below is front-owned (no atomics): notes, positions sent.
+    FlushState();
+    if (pending_write_overflow) {
+        return C10Target{false, 0};
+    }
+    // Copy/I2M/2D writers: their semaphore releases (copy engine) and writes are not noted.
+    u64 target = c10_range_writer_position;
+    if (const auto it = pending_releases.find(address); it != pending_releases.end()) {
+        target = std::max({target, it->second.position, C10NoteBound(it->second.seq)});
+    }
+    if (const auto it = pending_adds.find(address); it != pending_adds.end()) {
+        for (const PendingAdd& add : it->second) {
+            target = std::max({target, add.position, C10NoteBound(add.seq)});
+        }
+    }
+    const auto overlaps = [address](const PendingWrite& write) {
+        return address < write.end && write.begin < address + 4;
+    };
+    for (size_t i = 0; i < pending_write_count; ++i) {
+        const PendingWrite& write = pending_writes[i];
+        if (!overlaps(write)) {
+            continue;
+        }
+        switch (write.known) {
+        case WriteKnown::Position:
+            target = std::max(target, write.position);
+            break;
+        case WriteKnown::Writers:
+            // QMD release words and inline QMD descriptors (the QMD mirror): noted before the
+            // method that triggers them was sent.
+            target = std::max(target, C10NoteBound(write.seq));
+            break;
+        case WriteKnown::Drain:
+            return C10Target{false, 0};
+        }
+    }
+    if (open_i2m_active && overlaps(open_i2m)) {
+        if (open_i2m.known != WriteKnown::Position) {
+            return C10Target{false, 0};
+        }
+        target = std::max(target, open_i2m.position);
+    }
+    return C10Target{true, std::min(target, write_position)};
+}
+
+bool GpuSplit::C10WaitAcquireTarget(u64 target) {
+    ReleaseFrontHold(HoldWait); // W1 GPUPARAM v2 front hold
+    FlushState();
+    target = std::min(target, write_position);
+    // Ordering: `consumed` (seq_cst store by the sequencer after the entries ran, acquire here)
+    // makes the sequencer's guest writes and its committer_write_position stores (release,
+    // before `consumed` passed the entry) visible; `settled` (seq_cst CAS by the committer,
+    // acquire here) the committer's. ReadSettleTarget is read only once `consumed` >= target.
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    if (consumed_cache >= target &&
+        (!MtActive() ||
+         settled.load(std::memory_order_acquire) >= ReadSettleTarget(target, DrainReason::Puller))) {
+        CountWait(DrainReason::Puller, false, 0);
+        return false;
+    }
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
+    wait_target.store(target, std::memory_order_seq_cst);
+    Publish();
+    WaitConsumed(target);
+    if (MtActive()) {
+        TimedWaitSettled(ReadSettleTarget(target, DrainReason::Puller));
+    }
+    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    CountWait(DrainReason::Puller, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
+    return true;
 }
 
 bool GpuSplit::WaitForWriters(DrainReason reason) {

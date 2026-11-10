@@ -30,6 +30,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/mt/c10_front.h"
 #include "video_core/mt/lite4_switches.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -60,6 +61,7 @@ enum class PullerSite : u32 {
     PendAcquire,     ///< EDEN_NX2_MT_LITE_PENDACQ: no queued value meets it, no drain
     PendPollLazy,    ///< EDEN_NX2_MT_LITE_PENDPOLL: resume poll with a release pending, no drain
     PendCheckMet,    ///< EDEN_NX2_MT_LITE_PENDCHECK: a D5/D6 skip the drain found met
+    C10AcqSeq,       ///< EDEN_NX2_C10_ACQ_SEQ: partial wait instead of the drain (B1)
     Count,
 };
 void NotePullerSite(PullerSite site, bool run = false) {
@@ -81,7 +83,7 @@ void NotePullerSite(PullerSite site, bool run = false) {
         "acquire drain", "acquire fences", "resume poll",   "sem_execute drain",
         "sem_execute fences", "sem_execute skipped", "word flush", "legacy acquire",
         "acquire nodrain", "acquire ledger", "acquire seq wait", "pendacq nodrain",
-        "pendpoll lazy", "pendacq would meet"};
+        "pendpoll lazy", "pendacq would meet", "c10 acq seq"};
     std::string line;
     for (size_t i = 0; i < names.size(); ++i) {
         if (calls[i] != 0) {
@@ -308,6 +310,51 @@ void NoteAcquireDrain(DmaPusher& dma_pusher, int site, u32 op, GPUVAddr address,
         counts.clear();
         window = std::chrono::steady_clock::now();
     }
+}
+
+// EDEN_NX2_C10_ACQ_SEQ (B1, mt/c10_front.h): a GEQ acquire on a word with a release still
+// noted as pending whose value does not meet it (PredictedRelease failed; ACQUIRE_STATS "site 1
+// op 41 pending": MKW's QMD plain-release words, met by memory in every case). Instead of
+// draining everything sent, wait for the back only up to the entries that make the writes the
+// front noted over the word (GpuSplit::C10AcquireTarget) and look at memory. Same assumption
+// as MetInMemory for GEQ words: what the front did not note (shader writes) does not lower them;
+// pages GPU work wrote are refused anyway. Equal to the drain for every noted write: the drain,
+// too, ends before fence callbacks (QMD releases) that are still waiting for the GPU. Returns
+// true when memory meets it (the acquire passes); false: the caller drains as before.
+bool C10AcquireWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || !split.PredictAcquires() || !VideoCommon::MT::LiteDrain() ||
+        !split.HasPendingRelease(address)) {
+        return false;
+    }
+    auto& stats = split.c10_stats;
+    ++stats.acq_tries;
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Tegra::Nx2IsGpuWritten(*device)) {
+        ++stats.acq_refused;
+        return false;
+    }
+    const auto target = split.C10AcquireTarget(address);
+    if (!target.ok) {
+        ++stats.acq_refused;
+        return false;
+    }
+    const bool full = target.position >= split.SentPosition();
+    NotePullerSite(PullerSite::C10AcqSeq);
+    const bool waited = split.C10WaitAcquireTarget(target.position);
+    // As after the drain: a word the buffer cache holds GPU data for is flushed first (a Run).
+    if (ReadSemaphoreWord(dma_pusher, address) < value) {
+        ++stats.acq_unmet;
+        return false;
+    }
+    if (!waited) {
+        ++stats.acq_nowait;
+    } else if (full) {
+        ++stats.acq_full;
+    } else {
+        ++stats.acq_short;
+    }
+    return true;
 }
 
 } // Anonymous namespace
@@ -660,6 +707,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 VideoCommon::GpuSplit::Get().NotePredictedAcquire();
                 return;
             }
+        }
+        // EDEN_NX2_C10_ACQ_SEQ (B1): wait only as far as the noted writes over the word.
+        if (op == GpuSemaphoreOperation::AcquireGequal && VideoCommon::MT::C10AcqSeq() &&
+            C10AcquireWithoutDrain(dma_pusher, acquire.address, acquire.value)) {
+            NoteAcquireDrain(dma_pusher, 5, static_cast<u32>(op), acquire.address, acquire.value,
+                             true);
+            return;
         }
         const bool had_pending =
             VideoCommon::GpuSplit::Get().HasPendingRelease(acquire.address);

@@ -632,6 +632,8 @@ void DmaPusher::CallMethod(u32 argument) {
         WatchArgument(dma_state.method, argument);
     }
     auto& split = VideoCommon::GpuSplit::Get();
+    // EDEN_NX2_C10_ACQ_SEQ: the notes the previous calls made have their triggers sent by now.
+    split.C10ResolveNotes();
     if (dma_state.method < non_puller_methods) {
         VideoCommon::Nx2Profile::Scope puller_scope{VideoCommon::Nx2Profile::Zone::PullerMethod};
         puller.CallPullerMethod(*this, Engines::Puller::MethodCall{
@@ -736,6 +738,8 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         }
     }
     auto& split = VideoCommon::GpuSplit::Get();
+    // EDEN_NX2_C10_ACQ_SEQ: as in CallMethod.
+    split.C10ResolveNotes();
     if (dma_state.method < non_puller_methods) {
         VideoCommon::Nx2Profile::Scope puller_scope{VideoCommon::Nx2Profile::Zone::PullerMethod};
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
@@ -978,6 +982,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
          Tegra::g_nx2_skip_known_writer_waits.load(std::memory_order_relaxed));
     bool skipped = false;
     bool shortened = false;
+    bool c10_shortened = false; // EDEN_NX2_C10_LIST_PRECISE: committer wait below L24's bound
     bool waited = false;
     if (split.Active()) {
         if (mt && VideoCommon::MT::LiteListKnown() && !new_page && pages_fit && skip_policy &&
@@ -987,9 +992,12 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
             skipped = true;
         } else if (mt && VideoCommon::MT::LiteListPos() && !new_page && pages_fit) {
             // EDEN_NX2_MT_LITE_LISTPOS (L24): the committer only up to these pages' writers.
-            const auto wait = split.WaitForListWriters(page_bound);
+            // EDEN_NX2_C10_LIST_PRECISE (B2): the list's bytes, for the noted writes over them.
+            const auto wait =
+                split.WaitForListWriters(page_bound, address, u64{count} * sizeof(u32));
             waited = wait.waited;
             shortened = wait.shortened;
+            c10_shortened = wait.c10_shortened;
         } else {
             waited = split.WaitForWriters();
         }
@@ -1081,6 +1089,31 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         }
     }
 
+    // EDEN_NX2_C10_LIST_CHECK: a fetch B2 read before L24's committer bound is read again after
+    // every writer ran (WaitForWriters: the committer up to them all) and compared; the second
+    // read is used. Before LISTCHECK, which then compares against this (verified) read.
+    if (ok && c10_shortened && VideoCommon::MT::C10ListCheck()) {
+        split.WaitForWriters();
+        check_headers.resize_destructive(count);
+        std::array<u8, 4> check_results{};
+        if (ReadGpuWrittenChunks(address, count, reinterpret_cast<u8*>(check_headers.data()),
+                                 std::span<u8>{check_results.data(), page_count})) {
+            ++list_stats.c10_compared;
+            if (std::memcmp(check_headers.data(), command_headers.data(),
+                            size_t{count} * sizeof(u32)) != 0) {
+                if (list_stats.c10_stale++ < 16) {
+                    LOG_WARNING(HW_GPU, "C10 list check: stale GPU-written list {:#x} ({} words)",
+                                address, count);
+                }
+                std::memcpy(command_headers.data(), check_headers.data(),
+                            size_t{count} * sizeof(u32));
+            }
+        } else {
+            ++list_stats.c10_unverifiable;
+            ok = false;
+        }
+    }
+
     // EDEN_NX2_MT_LITE_LISTCHECK: read again after every writer ran and compare.
     if (ok && VideoCommon::MT::LiteListCheck() && (skipped || shortened)) {
         split.WaitForWriters();
@@ -1104,7 +1137,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
             ok = false;
         }
     }
-    if (stats || VideoCommon::MT::LiteListCheck()) {
+    if (stats || VideoCommon::MT::LiteListCheck() || VideoCommon::MT::C10ListCheck()) {
         list_stats.MaybeLog(stats);
     }
     (void)waited;
