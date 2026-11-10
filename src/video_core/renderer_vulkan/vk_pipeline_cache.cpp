@@ -1543,6 +1543,19 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
     const bool uses_vertex_b{key.unique_hashes[1] != 0};
 
+    // Upstream d1195b7d49: native stages translated before for other pipelines
+    // (VideoCommon::StageCache, EDEN_NX2_STAGE_CACHE). A merged VertexA/VertexB pair is always
+    // translated, and so are geometry stages here (PruneUnreadGeometryOutputs makes their SPIR-V
+    // depend on the fragment stage, which the runtime key doesn't carry).
+    using StageCache = VideoCommon::StageCache;
+    const bool cache_stages{stage_cache.Enabled() && !uses_vertex_a};
+    std::array<Shader::Environment*, Maxwell::MaxShaderProgram> stage_envs{};
+    std::array<std::shared_ptr<const StageCache::Translation>, Maxwell::MaxShaderProgram> reused{};
+    std::array<std::shared_ptr<StageCache::Translation>, Maxwell::MaxShaderProgram> recorded{};
+    std::vector<std::pair<std::shared_ptr<StageCache::Translation>,
+                          std::shared_ptr<const StageCache::Emitted>>>
+        new_translations;
+
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
 
@@ -1580,11 +1593,37 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-        if (!uses_vertex_a || index != 1) {
+        stage_envs[index] = &env;
+        const bool cacheable{cache_stages && env.IsNativeProgram() &&
+                             index != static_cast<size_t>(Maxwell::ShaderType::Geometry)};
+        std::vector<u8> signature;
+        if (cacheable) {
+            signature = StageCache::Signature(env, key.unique_hashes[index], index);
+            reused[index] = stage_cache.Find(signature, env);
+            // A layer emulation source is needed with its IR (GenerateGeometryPassthrough).
+            if (reused[index] && reused[index]->program.info.requires_layer_emulation) {
+                reused[index] = nullptr;
+            }
+        }
+        if (reused[index]) {
+            programs[index] = reused[index]->program;
+            StageCache::GiveGpuParamCounts(*reused[index], env);
+        } else if (cacheable) {
+            StageCache::Recorder recorder{env};
+            Shader::Maxwell::Flow::CFG cfg(recorder, pools.flow_block, cfg_offset, index == 0);
+            programs[index] = TranslateProgram(pools.inst, pools.block, recorder, cfg, host_info);
+            auto translation = std::make_shared<StageCache::Translation>();
+            translation->signature = std::move(signature);
+            translation->reads = recorder.TakeReads();
+            translation->program = StageCache::Summary(programs[index]);
+            recorder.ForwardGpuParamCounts(*translation);
+            recorded[index] = std::move(translation);
+        } else if (!uses_vertex_a || index != 1) {
             // Normal path
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
             programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
         } else {
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
@@ -1659,12 +1698,61 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
-        ConvertLegacyToGeneric(program, runtime_info);
-        if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
-            PruneUnreadGeometryOutputs(program, programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)],
-                                       key, device.IsNvGeometryShaderPassthroughSupported());
+        const StageCache::Translation* const translation{
+            reused[index] ? reused[index].get() : recorded[index].get()};
+        std::vector<u8> runtime_key;
+        std::shared_ptr<const StageCache::Emitted> emitted;
+        if (translation) {
+            runtime_key = StageCache::RuntimeKey(runtime_info, binding);
+            if (reused[index]) {
+                emitted = stage_cache.FindEmitted(*reused[index], runtime_key);
+            }
         }
-        const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+        std::vector<u32> code;
+        if (emitted && !stage_cache.Verify()) {
+            code = emitted->spirv;
+            program = emitted->program;
+            binding = emitted->bindings_out;
+            stage_cache.CountReuse(true);
+        } else {
+            if (reused[index]) {
+                // Emitted for other runtime info only, or verifying: the IR is needed again. The
+                // counters were given at Find; a fresh translation would note them twice.
+                Shader::Environment& stage_env{*stage_envs[index]};
+                StageCache::Recorder retranslate{stage_env};
+                const u32 stage_cfg_offset{
+                    static_cast<u32>(stage_env.StartAddress() + sizeof(Shader::ProgramHeader))};
+                Shader::Maxwell::Flow::CFG cfg(retranslate, pools.flow_block, stage_cfg_offset,
+                                               index == 0);
+                program = TranslateProgram(pools.inst, pools.block, retranslate, cfg, host_info);
+            }
+            ConvertLegacyToGeneric(program, runtime_info);
+            if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
+                PruneUnreadGeometryOutputs(program,
+                                           programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)],
+                                           key, device.IsNvGeometryShaderPassthroughSupported());
+            }
+            code = EmitSPIRV(profile, runtime_info, program, binding);
+            if (emitted) {
+                if (code != emitted->spirv ||
+                    std::memcmp(&binding, &emitted->bindings_out, sizeof(binding)) != 0) {
+                    stage_cache.CountVerifyMismatch(key.unique_hashes[index]);
+                }
+                stage_cache.CountReuse(true);
+            } else if (translation) {
+                auto entry = std::make_shared<StageCache::Emitted>();
+                entry->runtime_key = std::move(runtime_key);
+                entry->spirv = code;
+                entry->program = StageCache::Summary(program);
+                entry->bindings_out = binding;
+                if (reused[index]) {
+                    stage_cache.AddEmitted(*reused[index], std::move(entry));
+                    stage_cache.CountReuse(false);
+                } else {
+                    new_translations.emplace_back(recorded[index], std::move(entry));
+                }
+            }
+        }
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
 
@@ -1691,6 +1779,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             modules[stage_index].SetObjectNameEXT(name.c_str());
         }
         previous_stage = &program;
+    }
+    for (auto& [new_translation, entry] : new_translations) {
+        stage_cache.Insert(std::move(new_translation), std::move(entry));
     }
     u8 draw_param_reads = 0;
     if (key.state.app_stage == Tegra::Engines::Maxwell3D::EngineHint::OnGpuParamDraw) {
