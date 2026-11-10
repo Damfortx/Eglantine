@@ -451,7 +451,7 @@ inline void Resolver::ResolveDraw(const u64* entry) {
 }
 
 inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, ResolvedDraw& out) {
-    using Maxwell = Maxwell3D::Regs;
+    using MaxwellRegs = Maxwell3D::Regs;
     RasterizerVulkan& r = pipeline.rasterizer;
     const auto& header = packet.header;
     if (current == nullptr || current->tex_channel == nullptr) {
@@ -477,8 +477,8 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
             buffer_fail = why;
         }
     };
-    std::array<u32, Maxwell::MaxShaderStage> stage_base{};
-    std::array<u32, Maxwell::MaxShaderStage> stage_buffers{};
+    std::array<u32, MaxwellRegs::MaxShaderStage> stage_base{};
+    std::array<u32, MaxwellRegs::MaxShaderStage> stage_buffers{};
     u32 payload_entries = 0;
     for (size_t stage = 0; stage < stage_infos.size(); ++stage) {
         if (!info.spec.enabled_stages[stage]) {
@@ -512,7 +512,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     }
     // Results: views, samplers, then buffers (UBOs, SSBOs, geometry), in u64 words.
     u32 max_buffers = static_cast<u32>(packet.ssbos.size() + packet.geometry.size() +
-                                       packet.ubos.size() + Maxwell::MaxShaderStage);
+                                       packet.ubos.size() + MaxwellRegs::MaxShaderStage);
     const size_t view_words = size_t{info.num_image_elements} * sizeof(ViewRef) / 8;
     const size_t sampler_words = size_t{info.num_textures} * sizeof(SamplerRef) / 8;
     const size_t buffer_words = size_t{max_buffers} * sizeof(BufferRef) / 8;
@@ -558,7 +558,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
     TextureCache& texture_cache = r.texture_cache;
     BufferCache& buffer_cache = r.buffer_cache;
     VideoCommon::TextureCacheChannelInfo& channel = *current->tex_channel;
-    const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    const bool via_header_index = regs.sampler_binding == MaxwellRegs::SamplerBinding::ViaHeaderBinding;
     const u32 tic_limit = regs.tex_header.limit;
     const u32 tsc_limit = via_header_index ? tic_limit : regs.tex_sampler.limit;
     const bool native_tiling = r.gpu_memory->UsesNativeTiling();
@@ -702,10 +702,10 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         r.guest_descriptor_queue.SupportsDescriptorBuffer() && info.uses_descriptor_buffer;
     const u64 ring_local = header.batch / count;
     // A streamed uniform buffer's bytes into the ring (or the slot's previous allocation).
-    const auto stream_uniform = [&](PayloadSink& sink, u32 stage, u32 index, const u8* data,
+    const auto stream_uniform = [&](PayloadSink& sink, u32 stage, u32 ubo_index, const u8* data,
                                     u32 size, u64 source) -> bool {
         UniformRing& rg = *ring;
-        std::optional<u64> offset = rg.memo.Find(stage, index, ring_local, source, data, size);
+        std::optional<u64> offset = rg.memo.Find(stage, ubo_index, ring_local, source, data, size);
         if (offset) {
             counters.ring_reuses.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -715,7 +715,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
                 return false;
             }
             std::memcpy(rg.mapped.data() + *offset, data, size);
-            rg.memo.Store(stage, index, ring_local, source, *offset, data, size);
+            rg.memo.Store(stage, ubo_index, ring_local, source, *offset, data, size);
             counters.ring_bytes.fetch_add(size, std::memory_order_relaxed);
         }
         counters.ring_streams.fetch_add(1, std::memory_order_relaxed);
@@ -724,7 +724,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         ref = BufferRef{};
         ref.kind = KindUboStream;
         ref.stage = static_cast<u8>(stage);
-        ref.slot = static_cast<u8>(index);
+        ref.slot = static_cast<u8>(ubo_index);
         ref.buffer = VideoCommon::NULL_BUFFER_ID.index;
         ref.offset = static_cast<u32>(*offset);
         ref.size = size;
@@ -756,28 +756,28 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
         // streamed ones (RBUF) into the ring, bank 17 from the root table when unbound.
         u32 mask = info.enabled_uniform_buffer_masks[stage];
         while (mask != 0) {
-            const u32 index = static_cast<u32>(std::countr_zero(mask));
+            const u32 ubo_index = static_cast<u32>(std::countr_zero(mask));
             mask &= mask - 1;
             const VideoCommon::MT::UboEntry* ubo = nullptr;
             if (ubo_cursor < packet.ubos.size() && packet.ubos[ubo_cursor].stage == stage &&
-                packet.ubos[ubo_cursor].index == index) {
+                packet.ubos[ubo_cursor].index == ubo_index) {
                 ubo = &packet.ubos[ubo_cursor++];
             }
             if (ubo == nullptr) {
                 if (buffer_fail != BufNone) {
                     continue;
                 }
-                if (index != 17 || !mirror.root_tables.loaded) {
+                if (ubo_index != 17 || !mirror.root_tables.loaded) {
                     fail_buffers(BufMissingUniform);
                     continue;
                 }
                 // Root table 0 streamed as bank 17 (BindHostGraphicsUniformBuffer).
                 const auto& table = mirror.root_tables.tables[0];
-                const u32 size = uniform_sizes[stage][index];
+                const u32 size = uniform_sizes[stage][ubo_index];
                 const u32 copied = (std::min)(size, static_cast<u32>(sizeof(table)));
                 ring->scratch.assign(size, 0);
                 std::memcpy(ring->scratch.data(), table.data(), copied);
-                if (!stream_uniform(sink, static_cast<u32>(stage), index, ring->scratch.data(), size,
+                if (!stream_uniform(sink, static_cast<u32>(stage), ubo_index, ring->scratch.data(), size,
                                     0)) {
                     fail_buffers(BufRingFull);
                 }
@@ -807,7 +807,7 @@ inline bool Resolver::ResolveOne(const Nx2DrawPipeline::PacketView& packet, Reso
                 fail_buffers(BufUniformMemo); // the committer's per-slot copy, no replica here
                 continue;
             }
-            if (!stream_uniform(sink, static_cast<u32>(stage), index, bytes, ubo->size,
+            if (!stream_uniform(sink, static_cast<u32>(stage), ubo_index, bytes, ubo->size,
                                 source)) {
                 fail_buffers(BufRingFull);
             }
@@ -1109,7 +1109,7 @@ inline void Nx2DrawPipeline::PrepareResolvedTextures(const MT::ResolvedDraw& res
         view.id = ref.null != 0 ? VideoCommon::NULL_IMAGE_VIEW_ID : VideoCommon::ImageViewId{ref.view};
         commit_views.push_back(view);
         if (ref.null == 0) {
-            const TextureCache::MtResolvedView resolved{
+            const TextureCache::MtResolvedView resolved_view{
                 .view = view.id,
                 .view_gen = ref.view_gen,
                 .image = VideoCommon::ImageId{ref.image},
@@ -1117,7 +1117,7 @@ inline void Nx2DrawPipeline::PrepareResolvedTextures(const MT::ResolvedDraw& res
                 .image_version = ref.image_version,
                 .object = &texture_cache.NullImageViewObject(),
             };
-            texture_cache.MtApplyViewIntent(resolved, ref.written != 0, ref.blacklist != 0,
+            texture_cache.MtApplyViewIntent(resolved_view, ref.written != 0, ref.blacklist != 0,
                                             (ref.prep & MT::ViewPrepRefresh) != 0);
         }
     }
@@ -1363,10 +1363,10 @@ inline void Nx2DrawPipeline::LogResolverStats(double seconds) {
             ring_reuses += take(c.ring_reuses);
             ring_streams += take(c.ring_streams);
         }
-        std::string fail_text;
+        std::string buffer_fail_text;
         for (size_t i = 1; i < buffer_fail.size(); ++i) {
             if (buffer_fail[i] != 0) {
-                fail_text += fmt::format(" {} {:.0f}", MT::BufferFailNames[i], rate(buffer_fail[i]));
+                buffer_fail_text += fmt::format(" {} {:.0f}", MT::BufferFailNames[i], rate(buffer_fail[i]));
             }
         }
         LOG_INFO(Render_Vulkan,
@@ -1374,7 +1374,7 @@ inline void Nx2DrawPipeline::LogResolverStats(double seconds) {
                  "committer:{} | ring {:.0f} streams ({:.0f} reused), {:.2f} MB | uniform id "
                  "mismatches {}",
                  rate(take(counters.resolved_buffers)), rate(buffer_fail[MT::BufNone]),
-                 fail_text.empty() ? std::string{" none"} : fail_text, rate(ring_streams),
+                 buffer_fail_text.empty() ? std::string{" none"} : buffer_fail_text, rate(ring_streams),
                  rate(ring_reuses), static_cast<double>(ring_bytes) / 1e6 / seconds,
                  counters.uniform_id_mismatches.load(std::memory_order_relaxed));
     }

@@ -11,8 +11,10 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
-#include <sched.h>
+#ifdef __linux__
 #include <pthread.h>
+#include <sched.h>
+#endif
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -97,7 +99,9 @@ namespace VideoCommon {
 
 namespace {
 inline void CpuRelax() {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && defined(_M_X64)
+    _mm_pause();
+#elif defined(__x86_64__)
     __builtin_ia32_pause();
 #else
     std::this_thread::yield();

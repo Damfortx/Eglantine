@@ -11,7 +11,9 @@
 #include <map>
 #include <mutex>
 #include <string>
+#if defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
+#endif
 #include <fmt/format.h>
 #include "common/logging.h"
 
@@ -76,7 +78,11 @@ static void NoteGuestIncrement(u32 syncpoint_id, u32 value) {
     static std::map<std::pair<u32, std::string>, std::pair<u64, u32>> counts;
     static auto window = std::chrono::steady_clock::now();
     char name[32]{};
+#if defined(__linux__) || defined(__APPLE__)
     pthread_getname_np(pthread_self(), name, sizeof(name));
+#else
+    name[0] = '?';
+#endif
     std::scoped_lock lk{mutex};
     auto& entry = counts[{syncpoint_id, name}];
     ++entry.first;

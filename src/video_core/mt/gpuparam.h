@@ -561,16 +561,16 @@ public:
             while (used >= 3 && code[used - 1] == 0 && code[used - 2] == 0 && code[used - 3] == 0) {
                 used -= 3; // trailing empty instructions (last macro of the RAM)
             }
-            std::string words;
+            std::string code_text;
             for (size_t i = 0; i < used; ++i) {
-                words += fmt::format("{}{:x}", i ? "," : "", code[i]);
+                code_text += fmt::format("{}{:x}", i ? "," : "", code[i]);
             }
             LOG_INFO(HW_GPU,
                      "GPU params: macro {} start={:x} hash={:016x} {} N={} begin={:#x}: {}{}{} "
                      "code={}",
                      index, start, HashCode(code), kind == Kind::IndexedSingle ? "single" : "multi",
                      max_draws, begin, ok ? "deferrable" : "rejected (",
-                     ok ? "" : RejectNames[static_cast<size_t>(reject)], ok ? "" : ")", words);
+                     ok ? "" : RejectNames[static_cast<size_t>(reject)], ok ? "" : ")", code_text);
             if (!ok && !last_error.empty()) {
                 LOG_INFO(HW_GPU, "GPU params: macro {} run error: {}", index, last_error);
             }
@@ -602,8 +602,8 @@ public:
     /// v2 check, after Compare: the constant buffer words the macro wrote before its draws for
     /// the real words are what the built-ins give (record words 3 and 4). True when it drew
     /// nothing (nothing to compare).
-    [[nodiscard]] bool BuiltinsMatch(std::span<const u32> words) const {
-        if (trace.draws.empty() || words.size() < 5) {
+    [[nodiscard]] bool BuiltinsMatch(std::span<const u32> record_words) const {
+        if (trace.draws.empty() || record_words.size() < 5) {
             return true;
         }
         const auto pre = [this](u32 offset, u32& out) {
@@ -619,23 +619,23 @@ public:
         u32 vertex{};
         u32 instance{};
         return pre(BuiltinBaseVertexOffset, vertex) && pre(BuiltinBaseInstanceOffset, instance) &&
-               vertex == words[3] && instance == words[4];
+               vertex == record_words[3] && instance == record_words[4];
     }
 
     /// EDEN_NX2_GPUPARAM_CHECK: the macro's draws for the real words against the reference's.
     /// Returns whether they match (`actual`/`expected` hold both).
     template <typename Executable>
     bool Compare(std::span<const u32> code_ram, u32 start, Kind kind, u32 begin, u32 max_draws,
-                 const CbPlan& cb, std::span<const u32> words, std::span<const u32> regs,
+                 const CbPlan& cb, std::span<const u32> call_words, std::span<const u32> regs,
                  const DataRam& dram, Executable&& executable, std::vector<DrawRecord>& actual,
-                 std::vector<DrawRecord>& expected, std::string_view& error, bool& cb_same) {
+                 std::vector<DrawRecord>& expected_draws, std::string_view& error, bool& cb_same) {
         params.assign(1, begin);
-        params.insert(params.end(), words.begin(), words.end());
+        params.insert(params.end(), call_words.begin(), call_words.end());
         scratch_dram = dram;
         RunTrace(interp, code_ram, start, params, regs, scratch_dram, executable, trace, 1U << 20);
         error = trace.error;
         actual = trace.draws;
-        ReferenceDraws(kind, begin, words, max_draws, expected, 1U << 20);
+        ReferenceDraws(kind, begin, call_words, max_draws, expected_draws, 1U << 20);
         // The constant buffer words the draws saw and the call left, against the plan's.
         cb_same = true;
         if (cb.per_draw) {
@@ -644,9 +644,9 @@ public:
             cb_same = PerDrawWords(trace.cb_writes, trace.draws, last) && cb.post_count == 2 &&
                       last[0] == cb.post[0].value && last[1] == cb.post[1].value;
         } else if (!trace.draws.empty()) {
-            const auto resolve = [&words](const CbWord& w) {
+            const auto resolve = [&call_words](const CbWord& w) {
                 return w.gpu_word == NoGpuWord ? w.value
-                       : w.gpu_word < words.size() ? words[w.gpu_word]
+                       : w.gpu_word < call_words.size() ? call_words[w.gpu_word]
                                                    : 0U;
             };
             const auto net = [this](u32 offset, bool before_draws, u32& out) {
@@ -673,7 +673,7 @@ public:
             }
             cb_same &= (pre_writes == 0) == (cb.pre_count == 0);
         }
-        return trace.ok && actual == expected && cb_same;
+        return trace.ok && actual == expected_draws && cb_same;
     }
 
 private:

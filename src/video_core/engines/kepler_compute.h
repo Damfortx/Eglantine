@@ -272,11 +272,11 @@ public:
     [[nodiscard]] MtDispatchState MtGetDispatchState() const {
         return {native_mode, dlss_chain.active, indirect_compute.value_or(GPUVAddr{})};
     }
-    void MtSetDispatchState(const MtDispatchState& state) {
-        native_mode = state.native_mode;
-        dlss_chain.active = state.dlss_active;
-        if (state.indirect_address != 0) {
-            indirect_compute = state.indirect_address;
+    void MtSetDispatchState(const MtDispatchState& dispatch) {
+        native_mode = dispatch.native_mode;
+        dlss_chain.active = dispatch.dlss_active;
+        if (dispatch.indirect_address != 0) {
+            indirect_compute = dispatch.indirect_address;
         } else {
             indirect_compute.reset();
         }

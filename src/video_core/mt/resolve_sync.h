@@ -8,6 +8,10 @@
 #include <memory>
 #include <thread>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 #include "common/common_types.h"
 
 /// Synchronization between the sequencer, the resolvers and the committer of the multithreaded
@@ -16,7 +20,9 @@
 namespace VideoCommon::MT {
 
 inline void CpuPause() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && defined(_M_X64)
+    _mm_pause();
+#elif defined(__x86_64__)
     __builtin_ia32_pause();
 #else
     std::this_thread::yield();

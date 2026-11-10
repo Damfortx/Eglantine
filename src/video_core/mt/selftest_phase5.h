@@ -823,6 +823,11 @@ inline bool ArenaWorkerStressTest() {
     return ok;
 }
 
+// GCC 13+ (seen on aarch64) reports a false -Wdangling-pointer for close_batch's captures.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 /// T5: SEQ → SpmcStream → committer + 2 resolvers; batches published with BatchCursor, slots in
 /// a 64-entry SeqSlotRing with back-pressure; batches closed early at random serial points.
 inline bool BatchPublishStressTest() {
@@ -983,6 +988,9 @@ inline bool BatchPublishStressTest() {
     }
     return ok;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 /// T6: model of the sampler variant array: lock-free Find over [0, count), Emplace under a
 /// mutex, keys reduced once 32 variants exist.

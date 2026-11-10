@@ -114,8 +114,8 @@ public:
             return;
         }
         fetch.sampled = false;
-        std::FILE* const file = File();
-        if (file == nullptr || bytes_written > (u64{1} << 30)) {
+        std::FILE* const out = File();
+        if (out == nullptr || bytes_written > (u64{1} << 30)) {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -150,8 +150,8 @@ public:
         line += " |";
         Decode(line, entry, words, macro);
         line += '\n';
-        std::fwrite(line.data(), 1, line.size(), file);
-        std::fflush(file);
+        std::fwrite(line.data(), 1, line.size(), out);
+        std::fflush(out);
         bytes_written += line.size();
         ++records;
     }

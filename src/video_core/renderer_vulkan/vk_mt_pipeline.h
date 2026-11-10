@@ -26,6 +26,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 #include "common/alignment.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -927,7 +931,9 @@ private:
 };
 
 inline void Pause() {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && defined(_M_X64)
+    _mm_pause();
+#elif defined(__x86_64__)
     __builtin_ia32_pause();
 #else
     std::this_thread::yield();
@@ -1950,7 +1956,7 @@ inline void Nx2DrawPipeline::SeqReadDeferredUploads() {
 
 inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_indexed,
                                          const IndirectParams* indirect) {
-    using Maxwell = Maxwell3D::Regs;
+    using MaxwellRegs = Maxwell3D::Regs;
     Maxwell3D& real = *rasterizer.maxwell3d.Real();
     Tegra::MemoryManager& memory = *rasterizer.gpu_memory;
     const auto& regs = real.regs;
@@ -1970,7 +1976,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
         return 5;
     }
     const bool native = real.GetNativeMacroEngine().native_turing;
-    for (u32 index = 0; index < Maxwell::NumVertexArrays; ++index) {
+    for (u32 index = 0; index < MaxwellRegs::NumVertexArrays; ++index) {
         if (native && regs.vertex_streams[index].enable != 0 &&
             regs.NativeVertexStreamSize(index) > (std::numeric_limits<u32>::max)()) {
             return 10;
@@ -1986,7 +1992,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
             }
         }
     }
-    const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    const bool via_header_index = regs.sampler_binding == MaxwellRegs::SamplerBinding::ViaHeaderBinding;
     const u32 tic_limit = regs.tex_header.limit;
     const u32 tsc_limit = via_header_index ? tic_limit : regs.tex_sampler.limit;
     const bool native_tiling = memory.UsesNativeTiling();
@@ -2141,7 +2147,7 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
             .device_addr = 0,
         });
     }
-    for (u32 index = 0; index < Maxwell::NumVertexArrays; ++index) {
+    for (u32 index = 0; index < MaxwellRegs::NumVertexArrays; ++index) {
         const auto& array = regs.vertex_streams[index];
         if (array.enable == 0) {
             continue;
@@ -3707,7 +3713,7 @@ inline void Nx2DrawPipeline::SeqDispatch() {
 
 inline void Nx2DrawPipeline::CommitCompute(const u64* entry) {
     ComputeHeader header;
-    std::memcpy(&header, entry + 1, sizeof(header));
+    std::memcpy(static_cast<void*>(&header), entry + 1, sizeof(header));
     const u64* cursor = entry + 1 + ComputeHeaderWords;
     const std::span<const VideoCommon::MT::OverlayEntry> overlay_span{
         reinterpret_cast<const VideoCommon::MT::OverlayEntry*>(cursor), header.num_overlay};
