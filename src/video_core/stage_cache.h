@@ -32,6 +32,7 @@
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/nx2.h"
 
 namespace VideoCommon {
 
@@ -194,7 +195,9 @@ public:
     StageCache() {
         // EDEN_NX2_STAGE_CACHE=0 translates every stage again; =verify also builds every reused
         // stage and compares the SPIR-V.
+        // 'a' alternates (Tegra::Nx2Switch) per pipeline.
         const char* const value = std::getenv("EDEN_NX2_STAGE_CACHE");
+        mode = Tegra::Nx2EnvMode("EDEN_NX2_STAGE_CACHE");
         enabled = value == nullptr || value[0] != '0';
         verify = enabled && value != nullptr && std::string_view{value} == "verify";
         if (verify) {
@@ -203,8 +206,8 @@ public:
         }
     }
 
-    [[nodiscard]] bool Enabled() const noexcept {
-        return enabled;
+    [[nodiscard]] bool Enabled() const {
+        return enabled && (mode != 'a' || Tegra::Nx2AltOn());
     }
 
     /// Whether EDEN_NX2_STAGE_CACHE=verify: every reused stage is also built and compared.
@@ -490,6 +493,7 @@ private:
                         : std::string{});
     }
 
+    char mode{'d'};
     bool enabled{};
     bool verify{};
 
