@@ -1630,7 +1630,15 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
 
 void EmitContext::DefineInputs(const IR::Program& program) {
     const Info& info{program.info};
-    const VaryingState loads{info.loads.mask | info.passthrough.mask};
+    // Upstream 4233c05d8b (Orchid geometry passthrough fixes): passthrough attributes declare
+    // only Position and generic inputs, not every masked built-in. EDEN_NX2_GS_PASSTHROUGH_FIX=0
+    // restores the previous inputs (loads | passthrough for everything).
+    static const bool passthrough_fix = [] {
+        const char* const value = std::getenv("EDEN_NX2_GS_PASSTHROUGH_FIX");
+        return value == nullptr || value[0] != '0';
+    }();
+    const VaryingState loads{passthrough_fix ? info.loads.mask
+                                             : info.loads.mask | info.passthrough.mask};
 
     if (info.uses_workgroup_id) {
         workgroup_id = DefineInput(*this, U32[3], false, spv::BuiltIn::WorkgroupId);
@@ -1698,7 +1706,8 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
-    if (loads.AnyComponent(IR::Attribute::PositionX)) {
+    if (loads.AnyComponent(IR::Attribute::PositionX) ||
+        info.passthrough.AnyComponent(IR::Attribute::PositionX)) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -1765,7 +1774,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         if (!runtime_info.previous_stage_stores.Generic(index)) {
             continue;
         }
-        if (!loads.Generic(index)) {
+        if (!loads.Generic(index) && !info.passthrough.Generic(index)) {
             continue;
         }
         if (input_type == AttributeType::Disabled) {

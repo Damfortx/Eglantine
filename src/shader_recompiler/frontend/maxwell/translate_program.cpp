@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -385,6 +386,21 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
                 program.info.passthrough.mask[i] = ((mask[i / 32] >> (i % 32)) & 1) == 0;
             }
 
+            static const bool passthrough_fix = [] {
+                const char* const value = std::getenv("EDEN_NX2_GS_PASSTHROUGH_FIX");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (!normalized_host_info.support_geometry_shader_passthrough && passthrough_fix) {
+                // The lowered shader copies only Position and the generics; the mask's other
+                // bits (InstanceId, VertexId, FrontFace...) would declare stage inputs a geometry
+                // shader can't have, BaseInstance without DrawParameters among them.
+                for (size_t i = 0; i < program.info.passthrough.mask.size(); ++i) {
+                    if (i < static_cast<size_t>(IR::Attribute::PositionX) ||
+                        i > static_cast<size_t>(IR::Attribute::Generic31W)) {
+                        program.info.passthrough.mask[i] = false;
+                    }
+                }
+            }
             if (!normalized_host_info.support_geometry_shader_passthrough) {
                 program.output_vertices = GetOutputTopologyVertices(program.output_topology);
                 LowerGeometryPassthrough(program, normalized_host_info);
