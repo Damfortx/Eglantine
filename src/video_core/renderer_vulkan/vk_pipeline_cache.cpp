@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
+#include <future>
+#include <optional>
 #include <fstream>
 #include <iostream>
 #include <memory>
