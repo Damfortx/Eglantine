@@ -28,6 +28,40 @@ It's written in C++ with portability in mind, with builds for Windows, Linux and
   
 </p>
 
+> [!IMPORTANT]
+> **This is an unofficial performance fork** focused on Mario Kart World. It adds an experimental
+> multithreaded GPU backend (sequencer + committer threads), an ASTC → BC7 transcoder and a disk
+> cache for transcoded textures. Branches: `main` (this work), `mkw-perf2` (single-threaded, stable).
+>
+> The new paths are **off unless you enable them** with environment variables:
+>
+> | Variable | What it does |
+> |---|---|
+> | `EDEN_NX2_MT=1` + `EDEN_NX2_MT_LITE=1` | multithreaded GPU backend |
+> | `EDEN_NX2_ASTC_BC7=1` | transcode ASTC textures to BC7 (less VRAM than the default) |
+> | `EDEN_NX2_ASTC_DISKCACHE=1` | keep transcoded textures on disk between runs |
+>
+> **Linux:**
+> ```sh
+> EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 EDEN_NX2_ASTC_BC7=1 EDEN_NX2_ASTC_DISKCACHE=1 ./eglantine
+> ```
+> **Windows:** create `run-mt.bat` next to `eglantine.exe`:
+> ```bat
+> @echo off
+> set EDEN_NX2_MT=1
+> set EDEN_NX2_MT_LITE=1
+> set EDEN_NX2_ASTC_BC7=1
+> set EDEN_NX2_ASTC_DISKCACHE=1
+> start "" "%~dp0eglantine.exe" %*
+> ```
+>
+> Measured on a Ryzen 7 5800X + RTX 3070 Ti 8 GB at 2x resolution (Grand Prix race 1, fixed
+> window): ~22 fps single-threaded vs ~50 fps with all four enabled. With 8 GB of VRAM some runs
+> drop into a slow mode (resources spill to system memory); work in progress. Developed and tested
+> on Linux only; Windows builds come from CI and are untested. Use the Mailbox vsync mode if you
+> are capped by FIFO.
+
+
 <p align="center">
   <a href="#compatibility">Compatibility</a> |
   <a href="#development">Development</a> |
