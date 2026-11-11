@@ -40,7 +40,10 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
 #include "video_core/mt/thread_exit.h"
+#include "video_core/mt/c11_commit.h"
+#include "video_core/mt/c12_capture.h"
 #include "video_core/mt/capture.h"
+#include "video_core/mt/c11_serial.h"
 #include "video_core/mt/draw_packet.h"
 #include "video_core/mt/engine_ptr.h"
 #include "video_core/mt/epoch.h"
@@ -322,6 +325,7 @@ public:
         case MT::Kind::ConditionalRendering:
         case MT::Kind::InvalidateRegion:
         case MT::Kind::InvalidateGPUCache:
+        case MT::Kind::Channel: // EDEN_NX2_C11_CHANCMD: cache binds and mirrors only
             return false;
         default:
             return true;
@@ -355,6 +359,9 @@ public:
     /// RasterizerVulkan::DispatchCompute on the sequencer: Serial, or a ComputePacket with
     /// EDEN_NX2_MT_COMPUTE=packet.
     void SeqDispatch();
+    /// RasterizerVulkan::BindChannel on the sequencer (vk_mt_seq.h, mt/c11_serial.h): nothing for
+    /// the bound channel (EDEN_NX2_C11_SAMECHAN), a Command (EDEN_NX2_C11_CHANCMD), else Serial.
+    void SeqBindChannel(Tegra::Control::ChannelState& channel);
     /// RasterizerVulkan::FlushRegion on the sequencer (EDEN_NX2_MT_FLUSHCMD): nothing when no
     /// cache can hold GPU data to download there, a Command when `may_queue` and the front
     /// drains for it (t_flush_async), else a Serial.
@@ -439,7 +446,15 @@ private:
         u32 num_ssbo;
         u32 num_geometry;
         u32 tic_valid_words;
-        u32 pad2;
+        /// EDEN_NX2_C11_REPEAT: seq - the seq of the earlier capture of this pipeline whose
+        /// texture inputs are byte-identical to this draw's (0: none).
+        u32 repeat_delta;
+        /// EDEN_NX2_C12_CAPTURE_REPEAT (mt/c12_capture.h): seq - the seq of the earlier packet of
+        /// this pipeline whose capture pass 1 (TIC/TSC entries, handles, storage descriptors)
+        /// was byte-identical to this draw's (0: none), and what else matched it
+        /// (MT::C12PacketFlags; only with c12_repeat != 0).
+        u32 c12_repeat;
+        u32 c12_flags;
     };
     static constexpr u32 DrawHeaderWords = static_cast<u32>((sizeof(DrawHeader) + 7) / 8);
     /// EDEN_NX2_MT_COMPACT draw packets (stream header aux 1): this header, the indirect
@@ -463,7 +478,7 @@ private:
         u8 tic_valid_words;
         u8 flags;
         u8 draw_mode;
-        u16 pad;
+        u16 repeat_delta; ///< DrawHeader::repeat_delta (0 when it does not fit)
         u32 topology;
         u32 inline_index_offset;
         u32 inline_index_size;
@@ -474,6 +489,10 @@ private:
         u32 base_instance;
         u32 draw_instance_count;
         u32 drawn_instances;
+        u32 c12_repeat;   ///< DrawHeader::c12_repeat
+        u16 c12_ref_slot; ///< EDEN_NX2_C12_CAPTURE_REF: the readers' overlay slot
+        u8 c12_ref_op;    ///< MT::C12RefOp
+        u8 c12_flags;     ///< DrawHeader::c12_flags (MT::C12PacketFlags fit in 8 bits)
         enum Flags : u8 {
             IsIndexed = 1 << 0,
             NativeTuring = 1 << 1,
@@ -585,7 +604,9 @@ private:
         u32 blob_size;
     };
     static constexpr u32 ComputeHeaderWords = static_cast<u32>((sizeof(ComputeHeader) + 7) / 8);
-    int CaptureCompute(ComputePipeline* pipeline);
+    /// `native_key`: the collision-map program's (EDEN_NX2_C11_DISPATCH_CMD) also captures its
+    /// CB0 output handle and that TIC entry (the publish reads them at commit).
+    int CaptureCompute(ComputePipeline* pipeline, u64 native_key = 0);
     void EmitCompute(ComputePipeline* pipeline, u64 native_key);
     void CommitCompute(const u64* entry);
     /// `overlay_blob`: the overlay's bytes (null: `blob`).
@@ -671,6 +692,10 @@ private:
     /// Committer: the mirrors of the rasterizer's bound channel (created from the real engines
     /// while the sequencer waits), installed as this thread's engine overrides.
     void BindCurrentChannel();
+    /// Committer, EDEN_NX2_C11_CHANCMD: the channel Command (vk_mt_seq.h). Takes `snapshot`.
+    void C11CommitChannel(s32 channel_id, VideoCommon::MT::C11ChannelSnapshot* snapshot);
+    /// Sequencer, EDEN_NX2_C11_DISPATCH_CMD: before a guest write while a publish is pending.
+    void C11PublishGuard();
     ChannelMirrors* FindMirrors(const Maxwell3D* real3d);
     void VerifyMirror(const char* where);
     void LogStats();
@@ -716,6 +741,94 @@ private:
     std::vector<u8> lite7_ubo_check;
     /// C4: per desc_inserts entry, the raw_bytes offset of the read kept for it.
     std::vector<u32> lite7_insert_offsets;
+    // Cycle 11 W4a, EDEN_NX2_C11_REPEAT (mt/c11_commit.h), sequencer-owned: per pipeline (direct
+    // mapped), the texture inputs of its last capture and the seq that capture's packet got.
+    const char c11_repeat_mode = VideoCommon::MT::C11RepeatMode();
+    struct RepeatSlot {
+        const GraphicsPipeline* pipeline = nullptr;
+        u64 seq = 0;
+        bool valid = false;
+        std::vector<u64> key;
+    };
+    std::array<RepeatSlot, 256> c11_repeat_slots{};
+    std::vector<u64> c11_repeat_key; ///< this capture's texture inputs
+    /// For EmitDraw: DrawHeader::repeat_delta of the capture (0: none).
+    u64 c11_repeat_delta = 0;
+    /// Words of c11_repeat_key before the first handle (the tables, limits and channel).
+    static constexpr size_t RepeatKeyHeader = 6;
+    // Cycle 12 W3, EDEN_NX2_C12_CAPTURE_REPEAT (mt/c12_capture.h), sequencer-owned: per pipeline
+    // (direct mapped), the last pass 1 of its captures and where its reads are in device pages.
+    using C12SsboList = boost::container::small_vector<VideoCommon::MT::C12SsboCapture, 32>;
+    struct C12Memo {
+        const GraphicsPipeline* pipeline = nullptr;
+        bool valid = false;
+        bool ref_stored = false; ///< CAPTURE_REF: the readers hold this memo's overlay
+        u32 miss_streak = 0;
+        u32 throttle = 0;
+        u64 seq = 0; ///< the last packet whose pass 1 these reads were
+        u64 layout_gen = 0;
+        const Tegra::MemoryManager* memory = nullptr;
+        std::array<u32, 5> cbuf_masks{}; ///< constant buffers pass 1 reads from, per stage
+        std::vector<u64> key;
+        std::vector<RawRead> reads; ///< capture order
+        std::vector<u8> bytes;      ///< raw_bytes of the capture
+        std::vector<VideoCommon::MT::C12MemoPage> pages;
+        std::vector<VideoCommon::MT::C12MemoCheck> checks;
+        std::vector<VideoCommon::MT::SsboEntry> ssbo_entries;
+        std::vector<VideoCommon::MT::C12SsboCapture> ssbos;
+        std::vector<u64> tic_valid;
+        u32 tic_valid_count = 0;
+        std::vector<u64> c11_key;
+        /// Of the packet `seq` (c12_flags).
+        std::vector<VideoCommon::MT::GeometryEntry> geometry;
+        std::vector<u64> ubo_binds;
+        /// EDEN_NX2_C13_MEMO_WAYS (cycle 13 W4, mt/c13_memo.h): the view tag of the captures
+        /// this way holds, and when it was last used (c13_use_clock; 0 never).
+        u64 c13_tag = 0;
+        u64 c13_last_use = 0;
+    };
+    static constexpr size_t C12MemoSlots = VideoCommon::MT::C12RefSlotCount;
+    /// EDEN_NX2_C13_MEMO_WAYS: ways per slot (c12_memos holds C12MemoSlots * this entries, the
+    /// slot's ways contiguous). 1: the cycle 12 memo exactly.
+    const u32 c13_ways_alloc = VideoCommon::MT::C13MemoWaysMax();
+    u64 c13_use_clock = 0;
+    /// M1: the capture's lookup over a slot's ways (C12Begin with more than one way).
+    void C13BeginWays(const GraphicsPipeline* pipeline, C12Memo* set, u32 ways);
+    /// M1: this draw's view tag (EDEN_NX2_C13_MEMO_TAG).
+    u64 C13ViewTag(const GraphicsPipeline* pipeline);
+    const char c12_repeat_mode = VideoCommon::MT::C12CaptureRepeatMode();
+    const char c12_gens_mode = VideoCommon::MT::C12CaptureGensMode();
+    const bool c12_check = VideoCommon::MT::C12CaptureRepeatCheck();
+    const bool c12_ref = VideoCommon::MT::C12CaptureRef();
+    std::unique_ptr<C12Memo[]> c12_memos;
+    C12Memo* c12_memo = nullptr; ///< this capture's slot (null: no repeat for this capture)
+    bool c12_hit = false;        ///< the memo's pass 1 is this capture's
+    bool c12_gens = false;       ///< generations used by this capture
+    u32 c12_repeat = 0;          ///< for EmitDraw: DrawHeader::c12_repeat
+    u32 c12_flags = 0;
+    u8 c12_ref_op = 0;
+    u16 c12_ref_slot = 0;
+    /// Generations armed under another epoch are ignored (bumped when the tracking is found
+    /// off: writes in between were not counted).
+    u32 c12_gen_epoch = 1;
+    u64 c12_gen_on_captures = 0;
+    u32 c12_probe = 0;
+    u64 c12_layout_begin = 0; ///< page table layout before pass 1
+    std::vector<u64> c12_key;
+    std::vector<u64> c12_ubo_binds;
+    /// Before pass 1: the slot, and whether its memo holds this capture's pass 1.
+    void C12Begin(const GraphicsPipeline* pipeline);
+    /// The memo's pages and bytes against guest memory now (generations, then compares).
+    bool C12Validate(C12Memo& memo);
+    /// After pass 1 (skipped on a hit): restores it, or checks and records it.
+    void C12AfterPass1(const GraphicsPipeline* pipeline, C12SsboList& ssbos);
+    void C12Record(C12Memo& memo, const GraphicsPipeline* pipeline, const C12SsboList& ssbos);
+    bool C12Compare(const C12Memo& memo, const C12SsboList& ssbos);
+    /// At the end of the capture: c12_flags, the memo's packet state, CAPTURE_REF. True when the
+    /// overlay goes by reference (no FinishOverlay).
+    bool C12Finish();
+    void C12BuildKey(const std::array<u32, 5>& masks, std::vector<u64>& out);
+    static std::array<u32, 5> C12CbufMasks(const GraphicsPipeline* pipeline);
 
     // Sequencer-owned.
     std::vector<u64> delta_scratch;
@@ -805,6 +918,7 @@ private:
         case MT::Kind::Barrier:          // barriers, flushes of the scheduler
         case MT::Kind::FlushRegion:      // downloads (only clear GPU-modified state)
         case MT::Kind::InvalidateRegion: // marks images CPU-modified
+        case MT::Kind::Channel:          // EDEN_NX2_C11_CHANCMD: binds, no GPU work
             return;
         default:
             seq_async_buffer_position = stream.WritePosition();
@@ -843,6 +957,30 @@ private:
     }
 
     // Committer-owned.
+    /// EDEN_NX2_C11_LOCKRUN (mt/c11_commit.h): the cache mutexes the committer holds across a
+    /// run of draw packets (CommitterLoop), and the run's draws so far.
+    const char c11_lockrun_mode = VideoCommon::MT::C11LockRunMode();
+    std::unique_lock<Common::SpinRecursiveMutex> run_buffer_lock;
+    std::unique_lock<Common::SpinRecursiveMutex> run_texture_lock;
+    std::unique_lock<Common::SpinRecursiveMutex> run_tracker_lock;
+    std::optional<VideoCommon::MT::HeldTrackerNote> run_tracker_note;
+    u32 run_draws = 0;
+    /// Whether runs may be used at all (not with MT_VERIFY or lockstep; resolvers, which start
+    /// after the committer, are checked per run).
+    [[nodiscard]] bool LockRunAllowed() const noexcept {
+        return c11_lockrun_mode != '0' && !verify && !lockstep;
+    }
+    [[nodiscard]] bool RunHeld() const noexcept {
+        return run_buffer_lock.owns_lock();
+    }
+    /// Contender check between packets: another thread waits for a mutex the run holds.
+    [[nodiscard]] bool RunContended() const noexcept {
+        return run_buffer_lock.mutex()->Contended() || run_texture_lock.mutex()->Contended() ||
+               (run_tracker_lock.owns_lock() && run_tracker_lock.mutex()->Contended());
+    }
+    void BeginRun();
+    /// `reason`: the C11CommitCounters end_* counter to bump (null: none).
+    void EndRun(std::atomic<u64>* reason);
     std::unique_ptr<u8[]> ubo_memo_bytes;
     /// EDEN_NX2_MT_COMPACT: the committer's TIC/TSC replica and decoded overlay.
     VideoCommon::MT::PacketDecoder commit_decoder;
@@ -982,9 +1120,14 @@ inline void Nx2DrawPipeline::Start() {
                                                    View::UboMemoBytes);
         }
     }
-    if (VideoCommon::MT::UboGen()) {
+    if (VideoCommon::MT::UboGen() || VideoCommon::MT::C12CaptureGensMode() != '0') {
         VideoCommon::MT::g_ubo_gen_on.store(true, std::memory_order_seq_cst);
     }
+    // EDEN_NX2_C12_CAPTURE_REPEAT: forget the memos (and the generations armed while the
+    // tracking was off) with the replicas reset below.
+    c12_memos.reset();
+    ++c12_gen_epoch;
+    c12_gen_on_captures = 0;
     // The TIC/TSC table and the committer's replica (resolvers make theirs at StartResolvers).
     seq_desc.Reset();
     commit_decoder.table.Reset();
@@ -1278,6 +1421,9 @@ inline void Nx2DrawPipeline::WaitCommitted() {
 }
 
 inline void Nx2DrawPipeline::BeforeWrite(u64 device_addr, u64 size) {
+    if (VideoCommon::MT::g_c11_publish_position != 0) [[unlikely]] {
+        C11PublishGuard();
+    }
     if (VideoCommon::MT::StrictTextures() || Tegra::Nx2MayHoldTexture(device_addr, size) ||
         Tegra::Nx2AnyCommandListPage(device_addr, size)) {
         if (stream.ConsumerPosition(consumer) != stream.WritePosition()) {
@@ -1301,6 +1447,8 @@ inline void Nx2DrawPipeline::BindCurrentChannel() {
     KeplerCompute* const real_compute = rasterizer.kepler_compute.Real();
     if (real3d == nullptr) {
         current = nullptr;
+        VideoCommon::MT::PinEngineView<Maxwell3D>(nullptr);
+        VideoCommon::MT::PinEngineView<KeplerCompute>(nullptr);
         return;
     }
     ChannelMirrors* pair = FindMirrors(real3d);
@@ -1357,6 +1505,11 @@ inline void Nx2DrawPipeline::BindCurrentChannel() {
     pair->mirror3d->GetNativeMacroEngine().native_turing =
         real3d->GetNativeMacroEngine().native_turing;
     current = pair;
+    if (VideoCommon::MT::C11ChanCmd()) {
+        // EDEN_NX2_C11_CHANCMD: the stored engine pointers may already name a later channel.
+        VideoCommon::MT::PinEngineView<Maxwell3D>(pair->mirror3d.get());
+        VideoCommon::MT::PinEngineView<KeplerCompute>(pair->mirror_compute.get());
+    }
     channel_gen.fetch_add(1, std::memory_order_release);
     rasterizer.state_tracker.SetFlags(&pair->mirror3d->dirty.flags);
     rasterizer.state_tracker.InvalidateState();
@@ -1408,14 +1561,66 @@ inline void Nx2DrawPipeline::CommitterLoop(std::stop_token stop) {
     split.RegisterHostThread();
     BindCurrentChannel();
     start_ready.store(true, std::memory_order_release);
+    VideoCommon::MT::C11CommitLogStart(LockRunAllowed());
+    VideoCommon::MT::C12CommitLogStart();
+    const bool lockrun = LockRunAllowed();
     while (true) {
         const u64* const entry = stream.Peek(consumer);
         if (entry == nullptr) {
+            // EDEN_NX2_C11_LOCKRUN: never wait for the sequencer with the cache mutexes held.
+            EndRun(&VideoCommon::MT::g_c11_commit.end_idle);
             if (stop.stop_requested()) {
                 break;
             }
             Idle(stop);
             continue;
+        }
+        if (lockrun) {
+            // EDEN_NX2_C11_LOCKRUN: a run spans draw packets and the mirror entries and marks
+            // between them; anything else runs outside it.
+            switch (static_cast<MT::StreamEntry>(SpmcStream::HeaderKind(entry[0]))) {
+            case MT::StreamEntry::DrawPacket:
+                if (RunHeld()) {
+                    if (run_draws >= VideoCommon::MT::C11LockRunMax()) {
+                        EndRun(&VideoCommon::MT::g_c11_commit.end_max);
+                    } else if (RunContended()) {
+                        EndRun(&VideoCommon::MT::g_c11_commit.end_contended);
+                    }
+                }
+                if (!RunHeld() && resolver_count == 0 &&
+                    VideoCommon::MT::Lite7Detail::On(c11_lockrun_mode)) {
+                    BeginRun();
+                }
+                if (RunHeld()) {
+                    ++run_draws;
+                }
+                break;
+            case MT::StreamEntry::Deltas:
+            case MT::StreamEntry::ComputeDeltas:
+            case MT::StreamEntry::CbBind:
+            case MT::StreamEntry::RootTable:
+                if (RunHeld() && RunContended()) {
+                    EndRun(&VideoCommon::MT::g_c11_commit.end_contended);
+                }
+                break;
+            case MT::StreamEntry::Mark:
+                // Cycle 13 W3 L2 (mt/c13_front.h): the kick's Mark ends the lock run, so the
+                // front's list read after it does not meet the cache mutexes held.
+                if (VideoCommon::MT::C13KickRun() &&
+                    VideoCommon::GpuSplit::Get().C13KickMark(entry[1])) [[unlikely]] {
+                    if (RunHeld()) {
+                        EndRun(&VideoCommon::MT::g_c11_commit.end_entry);
+                        VideoCommon::MT::g_c13_kick_run_ends.fetch_add(1,
+                                                                       std::memory_order_relaxed);
+                    }
+                } else if (RunHeld() && RunContended()) {
+                    EndRun(&VideoCommon::MT::g_c11_commit.end_contended);
+                }
+                break;
+            default:
+                EndRun(&VideoCommon::MT::g_c11_commit.end_entry);
+                break;
+            }
         }
         if (lite_loop) {
             // EDEN_NX2_MT_LITE_LOOP: no locked instruction per entry. `committer_quiet` only
@@ -1441,10 +1646,12 @@ inline void Nx2DrawPipeline::CommitterLoop(std::stop_token stop) {
             }
         }
         if (hook_requested.load(std::memory_order_relaxed)) [[unlikely]] {
+            EndRun(&VideoCommon::MT::g_c11_commit.end_idle);
             hook_requested.store(false, std::memory_order_seq_cst);
             rasterizer.scheduler.FlushDeferred();
         }
     }
+    EndRun(nullptr);
     // EDEN_NX2_MT_REPLAY: the open segment belongs to this thread.
     rasterizer.scheduler.EndReplaySegment(ReplayCloseReason::Idle);
     rasterizer.scheduler.FlushDeferred();
@@ -1471,6 +1678,42 @@ inline void Nx2DrawPipeline::CommitterLoop(std::stop_token stop) {
     split.StoreSettled(last_mark);
     VideoCommon::GpuSplit::MarkCommitterThread(false);
     VideoCommon::MT::g_role = VideoCommon::MT::Role::None;
+}
+
+inline void Nx2DrawPipeline::BeginRun() {
+    // Same order as everywhere else: both cache mutexes (std::lock), then tracker_mutex.
+    run_buffer_lock = std::unique_lock{rasterizer.buffer_cache.mutex, std::defer_lock};
+    run_texture_lock = std::unique_lock{rasterizer.texture_cache.mutex, std::defer_lock};
+    std::lock(run_buffer_lock, run_texture_lock);
+    if (VideoCommon::MT::C11LockRunTracker() && VideoCommon::MT::TrapLock()) {
+        Common::SpinRecursiveMutex& tracker = rasterizer.buffer_cache.MtTrackerMutex();
+        run_tracker_lock = std::unique_lock{tracker};
+        // EDEN_NX2_MT_LITE7_LOCKSKIP: the draws' TrackerScopes skip their lock.
+        run_tracker_note.emplace(&tracker);
+    }
+    run_draws = 0;
+    if (VideoCommon::MT::C11RepeatStats()) {
+        VideoCommon::MT::g_c11_commit.runs.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void Nx2DrawPipeline::EndRun(std::atomic<u64>* reason) {
+    if (!RunHeld()) {
+        return;
+    }
+    if (VideoCommon::MT::C11RepeatStats()) {
+        VideoCommon::MT::g_c11_commit.run_draws.fetch_add(run_draws, std::memory_order_relaxed);
+        if (reason != nullptr) {
+            reason->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    run_tracker_note.reset();
+    if (run_tracker_lock.owns_lock()) {
+        run_tracker_lock.unlock();
+    }
+    run_texture_lock.unlock();
+    run_buffer_lock.unlock();
+    run_draws = 0;
 }
 
 inline void Nx2DrawPipeline::Idle(std::stop_token& stop) {
@@ -1789,6 +2032,30 @@ inline void Nx2DrawPipeline::LogStats() {
                  rate(VideoCommon::MT::g_lite7_lock_skip_mismatches),
                  rate(counters.lite7_slot_mismatch));
     }
+    {
+        // Cycle 11 W2 (mt/c11_serial.h): channel binds by kind, collision dispatches.
+        auto& c11 = VideoCommon::MT::g_c11_serial;
+        const auto rate = [&](std::atomic<u64>& value) {
+            return static_cast<double>(take(value)) / seconds;
+        };
+        std::string refused;
+        for (size_t i = 0; i < c11.bind_serial.size(); ++i) {
+            if (const u64 value = take(c11.bind_serial[i]); value != 0) {
+                refused += fmt::format(" {} {:.0f}", VideoCommon::MT::C11ChanRefuseNames[i],
+                                       static_cast<double>(value) / seconds);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "C11 serial/s: channel binds same {:.0f} (+{:.0f} back), command {:.0f}, "
+                 "serial:{} | mirrors created {:.0f}, rebind register diffs {:.0f} | collision "
+                 "packets {:.0f}, serial {:.0f} | publish guard checks {:.0f}, waits {:.0f} "
+                 "({:.1f} ms)",
+                 rate(c11.bind_same), rate(c11.bind_same_back), rate(c11.bind_cmd),
+                 refused.empty() ? std::string{" none"} : refused, rate(c11.mirror_created),
+                 rate(c11.mirror_diff_regs), rate(c11.collision_packets),
+                 rate(c11.collision_serial), rate(c11.guard_checks), rate(c11.guard_waits),
+                 static_cast<double>(take(c11.guard_wait_ns)) / 1e6 / seconds);
+    }
 }
 
 } // namespace Vulkan
@@ -1997,15 +2264,46 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
     const u32 tsc_limit = via_header_index ? tic_limit : regs.tex_sampler.limit;
     const bool native_tiling = memory.UsesNativeTiling();
     const SeqRecorder recorder{this};
-    struct SsboCapture {
-        DAddr device_addr;
-        u32 size;
-        bool is_written;
-        size_t stage;
+    // EDEN_NX2_C11_REPEAT: this capture's texture inputs (c11_repeat_key), compared at the end
+    // with the pipeline's previous capture. Its slot stays invalid if this draw goes as a Serial.
+    c11_repeat_delta = 0;
+    const bool repeat_key = c11_repeat_mode != '0' && resolver_count == 0;
+    RepeatSlot* repeat_slot = nullptr;
+    bool repeat_prev = false;
+    if (repeat_key) {
+        const u64 bits = reinterpret_cast<std::uintptr_t>(pipeline) >> 4;
+        repeat_slot = &c11_repeat_slots[(bits ^ (bits >> 8) ^ (bits >> 16)) &
+                                        (c11_repeat_slots.size() - 1)];
+        if (repeat_slot->pipeline == pipeline) {
+            repeat_prev = repeat_slot->valid;
+            repeat_slot->valid = false;
+        }
+        c11_repeat_key.clear();
+        c11_repeat_key.push_back(regs.tex_header.Address());
+        c11_repeat_key.push_back(regs.tex_sampler.Address());
+        c11_repeat_key.push_back(u64{tic_limit} | u64{tsc_limit} << 32);
+        c11_repeat_key.push_back(via_header_index ? 1 : 0);
+        c11_repeat_key.push_back(reinterpret_cast<std::uintptr_t>(&memory));
+        c11_repeat_key.push_back(native_tiling ? 1 : 0);
+        static_assert(RepeatKeyHeader == 6);
+    }
+    // A TIC/TSC entry's bytes (raw_bytes offset; ~0: not read, out of the table) into the key.
+    const auto repeat_entry = [&](u32 offset) {
+        if (offset == ~0U) {
+            c11_repeat_key.push_back(~u64{0});
+            return;
+        }
+        const size_t at = c11_repeat_key.size();
+        c11_repeat_key.resize(at + 4);
+        std::memcpy(c11_repeat_key.data() + at, raw_bytes.data() + offset, 32);
     };
-    boost::container::small_vector<SsboCapture, 32> ssbos;
+    using SsboCapture = VideoCommon::MT::C12SsboCapture;
+    C12SsboList ssbos;
     const bool prefers_sparse = rasterizer.buffer_cache.MtPrefersSparseSources();
-    for (size_t stage = 0; stage < infos.size(); ++stage) {
+    // EDEN_NX2_C12_CAPTURE_REPEAT: a hit skips pass 1's reads (C12AfterPass1 restores them).
+    C12Begin(pipeline);
+    const size_t pass1_stages = c12_hit && !c12_check ? size_t{0} : infos.size();
+    for (size_t stage = 0; stage < pass1_stages; ++stage) {
         const Shader::Info& info = infos[stage];
         const auto& cbufs = real.state.shader_stages[stage].const_buffers;
         u8 ssbo_index = 0;
@@ -2020,14 +2318,27 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
                 .device_addr = 0,
                 .gpu_addr = 0,
             };
-            const GPUVAddr ssbo_addr = cbufs[desc.cbuf_index].address + desc.cbuf_offset;
+            GPUVAddr ssbo_addr = cbufs[desc.cbuf_index].address + desc.cbuf_offset;
+            // sync-nx2: mirrors BindGraphicsStorageBuffer (upstream 4ac9e703fe table pointers,
+            // 405e5f7ac8 native graphics pointers sized from the mapping).
+            const bool table_pointer = desc.indirect_offset != ~0U;
+            if (table_pointer) {
+                const GPUVAddr holder = SeqRead<u64>(ssbo_addr);
+                if (holder == 0) {
+                    continue;
+                }
+                ssbo_addr = holder + desc.indirect_offset;
+            }
             const GPUVAddr gpu_addr = SeqRead<u64>(ssbo_addr);
             if (gpu_addr == 0) {
                 continue;
             }
-            const u64 next_qword = SeqRead<u64>(ssbo_addr + 8);
+            const bool native_pointer = real.GetNativeMacroEngine().native_turing;
+            const bool reads_size_word = !(table_pointer && !desc.is_written) && !native_pointer;
+            const u64 next_qword = reads_size_word ? SeqRead<u64>(ssbo_addr + 8) : 0;
             const VideoCommon::Binding binding = rasterizer.buffer_cache.MtStorageBinding(
-                gpu_addr, next_qword, desc.cbuf_index, desc.is_written);
+                gpu_addr, next_qword, desc.cbuf_index, desc.is_written, native_pointer,
+                native_pointer, table_pointer);
             ssbo_entry.gpu_addr = binding.gpu_addr;
             ssbo_entry.size = binding.size;
             ssbo_entry.device_addr = binding.device_addr;
@@ -2068,14 +2379,15 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
             }
             return Tegra::Texture::TexturePair(SeqRead<u32>(addr), via_header_index);
         };
-        const auto capture_view = [&](u32 handle) {
+        // Returns the TIC entry's raw_bytes offset (~0: out of the table).
+        const auto capture_view = [&](u32 handle) -> u32 {
             const u32 index = Tegra::Texture::TextureHeaderIndex(handle, tic_limit, native_tiling);
             if (lite_no_tic_valid && resolver_count == 0) {
                 // EDEN_NX2_MT_LITE_TICVALID: the validity bits are for resolvers only.
                 if (index <= tic_limit) {
-                    SeqReadDescriptor(regs.tex_header.Address() + u64{index} * 32);
+                    return SeqReadDescriptor(regs.tex_header.Address() + u64{index} * 32);
                 }
-                return;
+                return ~0U;
             }
             const u32 bit = tic_valid_count++;
             if (bit / 64 >= tic_valid.size()) {
@@ -2086,23 +2398,38 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
                 if (SeqTicValid(raw_bytes.data() + offset)) {
                     tic_valid[bit / 64] |= u64{1} << (bit % 64);
                 }
+                return offset;
             }
+            return ~0U;
         };
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle = read_handle(desc, index);
-                capture_view(handle.first);
+                const u32 tic_offset = capture_view(handle.first);
+                u32 tsc_offset = ~0U;
                 if (handle.second <= tsc_limit) {
-                    SeqReadDescriptor(regs.tex_sampler.Address() + u64{handle.second} * 32);
+                    tsc_offset =
+                        SeqReadDescriptor(regs.tex_sampler.Address() + u64{handle.second} * 32);
+                }
+                if (repeat_key) {
+                    c11_repeat_key.push_back(u64{handle.first} | u64{handle.second} << 32);
+                    repeat_entry(tic_offset);
+                    repeat_entry(tsc_offset);
                 }
             }
         }
         for (const auto& desc : info.image_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
-                capture_view(read_handle(desc, index).first);
+                const u32 handle = read_handle(desc, index).first;
+                const u32 tic_offset = capture_view(handle);
+                if (repeat_key) {
+                    c11_repeat_key.push_back(u64{handle} | u64{1} << 63);
+                    repeat_entry(tic_offset);
+                }
             }
         }
     }
+    C12AfterPass1(pipeline, ssbos);
 
     // Pass 2: the buffer tracker, in the order the committer synchronizes the bindings.
     std::optional<MTDetail::SeqTrackerLock> lock{std::in_place, rasterizer.buffer_cache};
@@ -2231,6 +2558,10 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
             } else if (fast) {
                 SeqStageUniform(entry);
             } else {
+                // C13 W2 (EDEN_NX2_C13_BANK=1): the native bank re-upload, once per frame, as a
+                // guest write taken into this packet by the SeqTakeUploads below.
+                rasterizer.buffer_cache.MtC13CaptureBank(device_addr, size, sizes[stage][index],
+                                                         memory.UsesNativeTiling());
                 SeqTakeUploads(device_addr, size);
             }
             ubos.push_back(entry);
@@ -2274,7 +2605,37 @@ inline int Nx2DrawPipeline::CaptureDraw(GraphicsPipeline* pipeline, bool is_inde
     compact_packet = compact && ubos.size() <= 0xff && ssbo_entries.size() <= 0xff &&
                      geometry_entries.size() <= 0xff && tic_valid.size() <= 0xff &&
                      raw_reads.size() <= 0xffff;
-    if (compact_packet) {
+    if (repeat_key) {
+        // EDEN_NX2_C11_REPEAT: EmitDraw gives this capture the seq next_seq.
+        const bool textures = c11_repeat_key.size() > RepeatKeyHeader;
+        if (textures) {
+            const bool stats = VideoCommon::MT::C11RepeatStats();
+            auto& c11 = VideoCommon::MT::g_c11_commit;
+            if (stats) {
+                c11.captures.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (repeat_prev && repeat_slot->key == c11_repeat_key &&
+                VideoCommon::MT::Lite7Detail::On(c11_repeat_mode)) {
+                const u64 delta = next_seq - repeat_slot->seq;
+                const u64 limit = compact_packet ? 0xffff : 0xffffffff;
+                if (delta != 0 && delta <= limit) {
+                    c11_repeat_delta = delta;
+                    if (stats) {
+                        c11.flagged.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else if (stats) {
+                    c11.key_far.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        repeat_slot->pipeline = pipeline;
+        repeat_slot->seq = next_seq;
+        repeat_slot->valid = textures;
+        repeat_slot->key.swap(c11_repeat_key);
+    }
+    if (C12Finish()) {
+        // EDEN_NX2_C12_CAPTURE_REF: the readers use the overlay they stored for this memo.
+    } else if (compact_packet) {
         FinishOverlayCompact();
     } else {
         FinishOverlay();
@@ -2527,6 +2888,11 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
         header.num_ssbo = static_cast<u8>(ssbo_entries.size());
         header.num_geometry = static_cast<u8>(geometry_entries.size());
         header.tic_valid_words = static_cast<u8>(tic_words);
+        header.repeat_delta = static_cast<u16>(c11_repeat_delta); // fits (CaptureDraw)
+        header.c12_repeat = c12_repeat;
+        header.c12_ref_slot = c12_ref_slot;
+        header.c12_ref_op = c12_ref_op;
+        header.c12_flags = static_cast<u8>(c12_flags);
         header.flags = static_cast<u8>(
             (is_indexed ? CompactDrawHeader::IsIndexed : 0) |
             (real.GetNativeMacroEngine().native_turing ? CompactDrawHeader::NativeTuring : 0) |
@@ -2583,6 +2949,9 @@ inline void Nx2DrawPipeline::EmitDraw(GraphicsPipeline* pipeline, bool is_indexe
         header.num_ssbo = static_cast<u32>(ssbo_entries.size());
         header.num_geometry = static_cast<u32>(geometry_entries.size());
         header.tic_valid_words = tic_words;
+        header.repeat_delta = static_cast<u32>(c11_repeat_delta); // fits (CaptureDraw)
+        header.c12_repeat = c12_repeat;
+        header.c12_flags = c12_flags;
         std::memset(out + 1, 0, DrawHeaderWords * 8);
         std::memcpy(out + 1, &header, sizeof(header));
     }
@@ -2759,6 +3128,9 @@ inline Nx2DrawPipeline::PacketView Nx2DrawPipeline::ParsePacket(
     header.num_ssbo = packed.num_ssbo;
     header.num_geometry = packed.num_geometry;
     header.tic_valid_words = packed.tic_valid_words;
+    header.repeat_delta = packed.repeat_delta;
+    // EDEN_NX2_C12_COMMIT_REPEAT: W3's whole-capture flag, once both headers carry it.
+    VideoCommon::MT::C12CopyRepeatFlag(header, packed);
     const u64* cursor = entry + 1 + CompactHeaderWords + (indirect ? IndirectWords : 0);
     std::span<const VideoCommon::MT::OverlayEntry> wire;
     take(cursor, wire, packed.num_overlay);
@@ -2851,6 +3223,12 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
     if (current == nullptr) {
         return;
     }
+    // EDEN_NX2_C13_COMMIT_PROFILE (cycle 13 W4c, mt/c13_memo.h): every 32nd packet is timed by
+    // phase (the marks below and in GraphicsPipeline::ConfigureImpl).
+    VideoCommon::MT::C13ProfBegin();
+    SCOPE_EXIT {
+        VideoCommon::MT::C13ProfEnd();
+    };
     RasterizerVulkan& r = rasterizer;
     Maxwell3D& mirror = *current->mirror3d;
     auto& state = mirror.draw_manager.draw_state;
@@ -2876,7 +3254,20 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
     if (verify) {
         VerifyDraw(header, overlay_span, ubo_span, upload_span, blob_data, packet.overlay_blob);
     }
+    if (RunHeld()) {
+        // EDEN_NX2_C11_LOCKRUN: a FlushWork that dispatches or submits (every 32nd draw, the
+        // check FlushWork itself makes) runs outside the run.
+#ifdef __ANDROID__
+        constexpr u32 flush_check_mask = 3;
+#else
+        constexpr u32 flush_check_mask = 31;
+#endif
+        if (((r.draw_counter + 1) & flush_check_mask) == 0) {
+            EndRun(&VideoCommon::MT::g_c11_commit.end_flush);
+        }
+    }
     r.FlushWork();
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::Setup);
     VideoCommon::MT::CaptureView view{
         .overlay = overlay_span,
         .ubos = ubo_span,
@@ -2899,6 +3290,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
             std::lock(buffer_lock, texture_lock);
             r.buffer_cache.MtApplyUploads(upload_span, blob_data);
         }
+        VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::Uploads);
         VideoCommon::MT::t_capture = &view;
         r.mt_commit_pipeline = header.pipeline;
         SCOPE_EXIT {
@@ -2944,6 +3336,41 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         }
         GraphicsPipeline::MtResolvedTextures resolved_textures;
         GraphicsPipeline::MtResolvedDraw resolved_draw;
+        // EDEN_NX2_C11_REPEAT: the pipeline keeps (and may reuse) its texture memo by packet.
+        // EDEN_NX2_C12_COMMIT_REPEAT (cycle 12 W2): the texture half takes the C11 flag, or W3's
+        // whole-capture flag (c12_repeat: identical inputs imply identical texture inputs), and
+        // the buffer half runs, for the draws the switch takes ('a': per draw). The draws it
+        // does not take keep the memos but reuse nothing (unless EDEN_NX2_C11_REPEAT is set).
+        const bool c12_draw = VideoCommon::MT::C12CommitRepeatDraw();
+        u64 repeat_of = header.repeat_delta != 0 ? header.seq - header.repeat_delta : 0;
+        if (c12_draw) {
+            auto& c12 = VideoCommon::MT::g_c12_commit;
+            VideoCommon::MT::C12Add(c12.draws);
+            const u64 same_as = VideoCommon::MT::C12SameAsDelta(header);
+            if (same_as != 0 && same_as < header.seq) {
+                VideoCommon::MT::C12Add(c12.w3_flagged);
+                if (repeat_of == 0 && VideoCommon::MT::C12TextureRepeatEnabled()) {
+                    repeat_of = header.seq - same_as;
+                    VideoCommon::MT::C12Add(c12.w3_texture);
+                }
+            }
+        } else if (!VideoCommon::MT::C11RepeatExplicit()) {
+            repeat_of = 0;
+        }
+        // The texture memo by packet: C11 REPEAT set by itself, or through C12 for its draws
+        // (the other half of C12 'a' runs as the cycle 11 default: no memo per packet).
+        const bool c11_active =
+            c11_repeat_mode != '0' && (c12_draw || VideoCommon::MT::C11RepeatExplicit());
+        const GraphicsPipeline::MtRepeatDraw repeat_draw{
+            .seq = header.seq,
+            .repeat_of = c11_active ? repeat_of : 0,
+            .layout_gen = header.layout_gen,
+            .c12_buffers = c12_draw && VideoCommon::MT::C12BufferRepeatEnabled(),
+            .textures = c11_active,
+        };
+        if ((c11_active || repeat_draw.c12_buffers) && res == nullptr) {
+            GraphicsPipeline::mt_repeat_draw = &repeat_draw;
+        }
         struct BufferContext {
             Nx2DrawPipeline* self;
             const MT::ResolvedDraw* res;
@@ -2983,6 +3410,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
                 } else {
                     r.RecordDraw(is_indexed, header.instance_count);
                 }
+                VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::DrawRecord);
             }
         } catch (const std::exception& e) {
             LOG_ERROR(Render_Vulkan, "MT: draw packet threw: {}", e.what());
@@ -2990,6 +3418,7 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
         GraphicsPipeline::mt_shadow_sink = nullptr;
         GraphicsPipeline::mt_resolved_textures = nullptr;
         GraphicsPipeline::mt_resolved_draw = nullptr;
+        GraphicsPipeline::mt_repeat_draw = nullptr;
         if (compare && shadow_sink.filled) {
             ShadowCompare(*res, header, shadow_sink);
         }
@@ -3003,6 +3432,9 @@ inline void Nx2DrawPipeline::CommitDraw(const u64* entry) {
     if (++collect_countdown >= 16) {
         collect_countdown = 0;
         CollectEpochs();
+        VideoCommon::MT::C11CommitMaybeLog();
+        VideoCommon::MT::C12CommitMaybeLog();
+        VideoCommon::MT::C13MemoMaybeLog();
     }
 }
 
@@ -3307,12 +3739,26 @@ inline void Nx2DrawPipeline::SeqInvalidateBuffers(
         if (!mutex_ranges.empty()) {
             counters.seq_mutex_writes.fetch_add(mutex_ranges.size(), std::memory_order_relaxed);
             std::scoped_lock lock{r.buffer_cache.mutex};
+            r.buffer_cache.MtC13ClaimCpuWrites(std::span<const std::pair<DAddr, std::size_t>>(
+                mutex_ranges.data(), mutex_ranges.size())); // C13 W2 B2
             for (const auto& [addr, size] : mutex_ranges) {
                 r.buffer_cache.WriteMemory(addr, size);
             }
         }
     } else {
         std::scoped_lock lock{r.buffer_cache.mutex};
+        if (VideoCommon::MT::C13Bank::ClaimOn()) {
+            // C13 W2 B2: claim the ranges written here now; the owner ranges are claimed with
+            // all the regions in the Serial below.
+            boost::container::small_vector<std::pair<DAddr, std::size_t>, 8> claim_now;
+            for (const auto& [addr, size] : regions) {
+                if (!r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
+                    claim_now.emplace_back(addr, size);
+                }
+            }
+            r.buffer_cache.MtC13ClaimCpuWrites(
+                std::span<const std::pair<DAddr, std::size_t>>(claim_now.data(), claim_now.size()));
+        }
         for (const auto& [addr, size] : regions) {
             if (r.buffer_cache.MtPageHoldsGpuData(addr, size)) {
                 owner_ranges.emplace_back(addr, size);
@@ -3325,6 +3771,7 @@ inline void Nx2DrawPipeline::SeqInvalidateBuffers(
         counters.inval_owner_serials.fetch_add(1, std::memory_order_relaxed);
         Serial(MT::Kind::InvalidateRegion, [&] {
             std::scoped_lock lock{r.buffer_cache.mutex};
+            r.buffer_cache.MtC13ClaimCpuWrites(regions); // C13 W2 B2 (Serial is synchronous)
             for (const auto& [addr, size] : owner_ranges) {
                 r.buffer_cache.WriteMemory(addr, size);
             }
@@ -3426,7 +3873,7 @@ inline bool Nx2DrawPipeline::SeqIsContinuous(u64 gpu_addr, u64 size) {
     return continuous;
 }
 
-inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
+inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline, u64 native_key) {
     KeplerCompute& real = *rasterizer.kepler_compute.Real();
     Tegra::MemoryManager& memory = *rasterizer.gpu_memory;
     const Shader::Info& info = pipeline->GetInfo();
@@ -3450,6 +3897,14 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
     const auto enabled = [&](u32 cbuf) { return ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0; };
     const bool native = real.IsNativeMode();
     const bool mapping_sized = real.IsDlssDispatch();
+    // EDEN_NX2_C11_LISTRANGE (W1 F2, mt/c11_front.h): the program's written SSBO descriptors,
+    // for the front's command list writer ranges (a no-op with the switch off).
+    VideoCommon::MT::C11PublishComputeWrites(
+        memory.GetID(), real.regs.code_loc.Address(), info, mapping_sized,
+        native_key == VideoCommon::MT::C11CollisionMapProgram);
+    // Cycle 13 W3 L1 (mt/c13_front.h): the program's shader hash, the front census key.
+    VideoCommon::MT::C13PublishProgramHash(memory.GetID(), real.regs.code_loc.Address(),
+                                           pipeline->ShaderHash());
     const bool prefers_sparse = rasterizer.buffer_cache.MtPrefersSparseSources();
     struct SsboCapture {
         DAddr device_addr;
@@ -3464,14 +3919,25 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
         if (!enabled(desc.cbuf_index)) {
             continue;
         }
-        const GPUVAddr ssbo_addr = cbufs[desc.cbuf_index].Address() + desc.cbuf_offset;
+        GPUVAddr ssbo_addr = cbufs[desc.cbuf_index].Address() + desc.cbuf_offset;
+        // sync-nx2: mirrors BindComputeStorageBuffer (upstream 4ac9e703fe table pointers).
+        const bool table_pointer = desc.indirect_offset != ~0U;
+        if (table_pointer) {
+            const GPUVAddr holder = SeqRead<u64>(ssbo_addr);
+            if (holder == 0) {
+                continue;
+            }
+            ssbo_addr = holder + desc.indirect_offset;
+        }
         const GPUVAddr gpu_addr = SeqRead<u64>(ssbo_addr);
         if (gpu_addr == 0) {
             continue;
         }
-        const u64 next_qword = mapping_sized ? 0 : SeqRead<u64>(ssbo_addr + 8);
+        const bool reads_size_word = !(table_pointer && !desc.is_written) && !mapping_sized;
+        const u64 next_qword = reads_size_word ? SeqRead<u64>(ssbo_addr + 8) : 0;
         const VideoCommon::Binding binding = rasterizer.buffer_cache.MtStorageBinding(
-            gpu_addr, next_qword, desc.cbuf_index, desc.is_written, native, mapping_sized);
+            gpu_addr, next_qword, desc.cbuf_index, desc.is_written, native, mapping_sized,
+            table_pointer);
         if (binding.size == 0 || binding.device_addr == 0) {
             continue;
         }
@@ -3529,6 +3995,13 @@ inline int Nx2DrawPipeline::CaptureCompute(ComputePipeline* pipeline) {
         for (u32 index = 0; index < desc.count; ++index) {
             capture_view(read_handle(desc, index).first);
         }
+    }
+    if (native_key == VideoCommon::MT::C11CollisionMapProgram && enabled(0) &&
+        cbufs[0].size >= 0x3c) {
+        // EDEN_NX2_C11_DISPATCH_CMD: what DispatchComputeBody's publish reads at commit (the
+        // output handle in CB0, then VisitImageView's TIC entry), from the overlay.
+        const u32 handle = SeqRead<u32>(cbufs[0].Address() + 0x38);
+        capture_view(Tegra::Texture::TexturePair(handle, via_header_index).first);
     }
     // Texture and image buffers: their TIC entries, and the CPU-modified bytes of the ranges
     // they name (ComputePipeline::Configure binds them through the buffer cache).
@@ -3700,15 +4173,55 @@ inline void Nx2DrawPipeline::SeqDispatch() {
         }
         return;
     }
-    // The collision map program publishes an image into guest memory after it runs.
-    constexpr u64 CollisionMapProgram = 0x6e0ae200ee9aa220ULL;
-    const int reason = native_key == CollisionMapProgram ? 12 : CaptureCompute(pipeline);
+    // The collision map program publishes an image into guest memory after it runs: a Serial,
+    // or (EDEN_NX2_C11_DISPATCH_CMD) a packet whose commit publishes it, see below.
+    const bool collision = native_key == VideoCommon::MT::C11CollisionMapProgram;
+    if (collision) {
+        VideoCommon::MT::C11SerialLogStart();
+    }
+    const bool collision_packet = collision && VideoCommon::MT::C11DispatchCmd();
+    const int reason =
+        collision && !collision_packet ? 12 : CaptureCompute(pipeline, native_key);
     if (reason >= 0) {
         ForceSerialReason(static_cast<u32>(reason));
+        if (collision) {
+            VideoCommon::MT::g_c11_serial.collision_serial.fetch_add(1, std::memory_order_relaxed);
+        }
         serial_dispatch();
         return;
     }
     EmitCompute(pipeline, native_key);
+    if (collision_packet) {
+        // The publish writes guest memory on the committer: the front's reads after this entry
+        // wait for it (bulk: an image download), FlushRegion sees async work, and the
+        // sequencer's next guest write waits for it (C11PublishGuard) as it waited the Serial.
+        stream.Flush();
+        VideoCommon::GpuSplit::Get().NoteCommitterWrite(true);
+        NoteAsyncWork(MT::Kind::Dispatch);
+        if (!VideoCommon::MT::C11DispatchNoGuard()) {
+            VideoCommon::MT::g_c11_publish_position = stream.WritePosition();
+        }
+        VideoCommon::MT::g_c11_serial.collision_packets.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void Nx2DrawPipeline::C11PublishGuard() {
+    // Sequencer, before a guest memory write (BeforeWrite): the collision publish the old Serial
+    // finished before anything after the dispatch ran must land first.
+    const u64 target = VideoCommon::MT::g_c11_publish_position;
+    auto& stats = VideoCommon::MT::g_c11_serial;
+    stats.guard_checks.fetch_add(1, std::memory_order_relaxed);
+    if (stream.ConsumerPosition(consumer) < target) {
+        stats.guard_waits.fetch_add(1, std::memory_order_relaxed);
+        const auto begin = std::chrono::steady_clock::now();
+        WaitCommitted();
+        stats.guard_wait_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - begin)
+                                 .count()),
+            std::memory_order_relaxed);
+    }
+    VideoCommon::MT::g_c11_publish_position = 0;
 }
 
 inline void Nx2DrawPipeline::CommitCompute(const u64* entry) {

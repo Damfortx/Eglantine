@@ -62,6 +62,7 @@ private:
         u64 tick = 0;
         bool deferred{};
         u64 last_frame = 0; ///< Batch 8 U4: frame of the last request (EDEN_NX2_VRAM_STAGING_KEEP)
+        bool c13_trim{};    ///< Cycle 13 V4: picked by the device-local cap (C13Trim)
 
         StagingBufferRef Ref() const noexcept {
             return {
@@ -101,6 +102,13 @@ private:
     void ReleaseCache(MemoryUsage usage);
 
     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
+
+    /// Cycle 13 V4 (EDEN_NX2_C13_STAGING_TRIM, mt/c13_vram.h): frees idle buffers of every pool
+    /// and caps the device-local pool outside loads.
+    void C13Trim();
+
+    /// Cycle 13 V4 census (EDEN_NX2_C13_STAGING_TRIM_CHECK / EDEN_NX2_C13_STATS).
+    void C13Census();
     size_t Region(size_t iter) const noexcept {
         return iter / region_size;
     }

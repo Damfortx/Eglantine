@@ -49,7 +49,7 @@ Kept as they are (already the light shape with K=0): lazy wake (P1), UBIND_FOLD 
 INVAL_TEXFILTER/ONELOCK, DMA_CONSUMED, COMPACT, REPLAY, FLUSHCMD. EBR stays on (CPU trap path
 reads cache slots under an epoch guard).
 
-## What to measure (BIN=/home/appo/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
+## What to measure (BIN=$HOME/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
 Start line to check: `MT lite: true (ubo true, loop true, ticvalid true, drain true, quiet true; resolvers 0)`.
 1. fps: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 ./demo.sh $BIN 120 lite-fps`
    vs MT unset (same tree, `lite-off`) and full MT (EDEN_NX2_MT=1, `lite-full`).

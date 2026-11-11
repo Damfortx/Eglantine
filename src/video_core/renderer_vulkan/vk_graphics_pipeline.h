@@ -90,6 +90,22 @@ public:
         const std::array<const Shader::Info*, NUM_STAGES>& infos);
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    const std::array<u64, 6>& ShaderHashes() const noexcept {
+        return key.unique_hashes;
+    }
+
+    struct SampledImage {
+        u32 stage;
+        u32 tic;
+        VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
+    };
+
+    /// The sampled textures of the last configured draw, kept while a sampled frame dump runs.
+    std::span<const SampledImage> SampledImages() const noexcept {
+        return sampled_images;
+    }
+
     bool SupportsAlphaToCoverage() const noexcept {
         return fragment_has_color0_output;
     }
@@ -280,6 +296,23 @@ public:
     };
     static inline thread_local const MtResolvedDraw* mt_resolved_draw = nullptr;
 
+    /// EDEN_NX2_C11_REPEAT (cycle 11 W4a, video_core/mt/c11_commit.h): set by the committer
+    /// around a draw packet's Configure while the switch is not '0'. The memo is kept for every
+    /// such draw (and tagged with its seq); `repeat_of` != 0 is the seq of the earlier capture of
+    /// this pipeline whose texture inputs the sequencer found byte-identical to this draw's.
+    struct MtRepeatDraw {
+        u64 seq;
+        u64 repeat_of;
+        u64 layout_gen; ///< GPU page table layout generation at capture
+        /// EDEN_NX2_C12_COMMIT_REPEAT (cycle 12 W2, video_core/mt/c12_commit.h): this draw may
+        /// take the buffer half (C12UpdateGraphicsBuffers with c12_buffer_memo).
+        bool c12_buffers = false;
+        /// The texture memo by packet (C11 REPEAT, or C12's texture half) is on for this draw;
+        /// false: only the buffer half (repeat_of is 0 then).
+        bool textures = true;
+    };
+    static inline thread_local const MtRepeatDraw* mt_repeat_draw = nullptr;
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
@@ -345,8 +378,28 @@ private:
         std::array<u32, NUM_STAGES> stage_begin{}; ///< First of the stage's entries
         std::array<u32, NUM_STAGES> stage_count{}; ///< How many entries the stage has
         std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling{};
+        // EDEN_NX2_C11_REPEAT: the draw packet that last set or used the memo (0: the last
+        // Configure of this pipeline was not a packet's, or did not keep the memo).
+        u64 packet_seq{};
+        u64 layout_gen{};
+        u64 cpu_epoch{};                 ///< texture cache CPU-modified epoch when it was set
+        std::vector<u8> view_blacklist;  ///< ImageViewInOut::blacklist per image element
     };
     TextureMemo tex_memo;
+    std::vector<SampledImage> sampled_images;
+    /// EDEN_NX2_C12_COMMIT_REPEAT, buffer half: this pipeline's last resolved uniform/storage
+    /// bindings (BufferCache::C12UpdateGraphicsBuffers; committer only, like tex_memo).
+    VideoCommon::C12GraphicsBufferMemo c12_buffer_memo;
+    /// EDEN_NX2_C13_MEMO_WAYS (cycle 13 W4, video_core/mt/c13_memo.h), committer only:
+    /// M2, the buffer memo's ways (way 0 is c12_buffer_memo); and the texture memo by packet's
+    /// other ways (tex_memo is the active one, these the kept ones, most recent first), so a draw
+    /// whose repeat_of names the other view's last packet finds that packet's memo.
+    VideoCommon::MT::C13WaySet<VideoCommon::C12GraphicsBufferMemo> c13_buffer_ways;
+    std::vector<TextureMemo> c13_tex_ways;
+    /// Before a packet draw's texture repeat: makes tex_memo the way of `repeat_of`'s packet,
+    /// or, when no way holds it, keeps the active memo as a way (the fill overwrites the least
+    /// recent one). False when the switch gives this draw one way (cycle 12 path).
+    bool C13SelectTextureWay(u64 repeat_of);
     u32 num_textures{};
     bool fragment_has_color0_output{};
 

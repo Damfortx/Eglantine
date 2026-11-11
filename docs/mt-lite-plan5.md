@@ -35,7 +35,7 @@ each), committer share 32.7 ms (so ~115 ms/s is the sequencer).
 | stats | EDEN_NX2_LIST_STATS=1 (full) / EDEN_NX2_GPU_PROFILE (basic) | line "GPU-written list fetches per second": fetches, waited, new pages, multi-page; **waited because**: page writer queued (a writer of the list's pages was not yet run by the sequencer), page writer uncommitted (run, not committed), other writers (no writer of these pages pending: pure over-wait), first list of page; last writer kind (compute/dma/i2m/...); results synced/copied/unknown; L24/L25 counts. With LIST_STATS=1 also the page state before the fetch (no entry/synced/copy current/copy stale/draw-written, all and waited, via BufferCache::Nx2PeekListPage) and the 6 pages that waited most | lite5_list_switches.h, dma_pusher.cpp, buffer_cache_base.h, rasterizer_interface.h, vk_rasterizer.h |
 Start line: `MT lite 5: listpos true, listknown true, listcheck false`.
 
-## What to measure (BIN=/home/appo/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
+## What to measure (BIN=$HOME/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
 1. Data first: `EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 EDEN_NX2_LIST_STATS=1 EDEN_NX2_MT_LITE_LISTKNOWN=0`
    (+ GPU_PROFILE): tells what the 408 waits/s are. Expected (hypothesis): results ~all synced,
    reasons mostly "other writers" (pure over-wait), state before "synced". If results are mostly

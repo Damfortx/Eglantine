@@ -14,6 +14,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "video_core/mt/capture.h"
+#include "video_core/mt/c12_capture.h"
 
 /// EDEN_NX2_MT_COMPACT: the stream-ordered state behind compact draw packets.
 ///
@@ -126,6 +127,35 @@ struct PacketDecoder {
         }
         while (ref < refs.size()) {
             push_ref();
+        }
+    }
+
+    // ---- EDEN_NX2_C12_CAPTURE_REF (contingent, c12_capture.h) ----
+    // The decoded overlay of the last packet that stored it, per sequencer memo slot. Every
+    // reader of every draw packet applies the operation in stream order (ParsePacket, after
+    // ApplyInserts), so the slots equal what the sequencer assumes. Never sent with resolvers.
+    struct C12RefSlot {
+        std::vector<OverlayEntry> overlay;
+        std::vector<u8> bytes;
+    };
+    std::unique_ptr<C12RefSlot[]> c12_ref_slots;
+
+    /// After Decode/ApplyInserts of a compact packet: Store keeps `overlay`/`bytes` in the slot,
+    /// Use replaces them (the packet carried none) with the slot's.
+    void C12ApplyRef(u8 op, u32 slot) {
+        if (op == static_cast<u8>(C12RefOp::None)) {
+            return;
+        }
+        if (!c12_ref_slots) {
+            c12_ref_slots = std::make_unique<C12RefSlot[]>(C12RefSlotCount);
+        }
+        C12RefSlot& kept = c12_ref_slots[slot & (C12RefSlotCount - 1)];
+        if (op == static_cast<u8>(C12RefOp::Store)) {
+            kept.overlay.assign(overlay.begin(), overlay.end());
+            kept.bytes.assign(bytes.begin(), bytes.end());
+        } else if (op == static_cast<u8>(C12RefOp::Use)) {
+            overlay.assign(kept.overlay.begin(), kept.overlay.end());
+            bytes.assign(kept.bytes.begin(), kept.bytes.end());
         }
     }
 

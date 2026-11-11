@@ -8,6 +8,7 @@
 #include <limits>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <memory>
@@ -26,6 +27,8 @@
 #include "video_core/nx2.h"
 #include "video_core/mt/astc_bc7.h"
 #include "video_core/mt/lite9_vram.h"
+#include "video_core/mt/c11_vram.h"
+#include "video_core/mt/c13_vram.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
 #include "video_core/engines/fermi_2d.h"
@@ -479,7 +482,8 @@ constexpr std::array<VkFormat, 2> Bc7AstcViewFormats{VK_FORMAT_BC7_UNORM_BLOCK,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
-                                  VideoCommon::C10Vram::HostResidency* residency = nullptr) {
+                                  VideoCommon::C10Vram::HostResidency* residency = nullptr,
+                                  bool c13_device_only = false) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -506,6 +510,11 @@ constexpr std::array<VkFormat, 2> Bc7AstcViewFormats{VK_FORMAT_BC7_UNORM_BLOCK,
         if (device.IsKhrImageFormatListSupported()) {
             image_ci.pNext = &image_format_list;
         }
+    }
+    if (c13_device_only) {
+        // Cycle 13 V2 (EDEN_NX2_C13_RELOC): device-local memory within the budget or nothing
+        // (Image::C13Rebind tries again later).
+        return allocator.C13CreateDeviceImage(image_ci);
     }
     if (unbacked) {
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
@@ -2667,8 +2676,53 @@ bool TextureCacheRuntime::IsHostResident(const Image& image) const noexcept {
     return image.HostResident();
 }
 
+void TextureCacheRuntime::C13DeviceVmaBytes(u64& alloc_bytes, u64& block_bytes) const {
+    alloc_bytes = 0;
+    block_bytes = 0;
+    const VmaAllocator allocator = device.GetAllocator();
+    if (allocator == nullptr) {
+        return;
+    }
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+        if ((properties->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+            continue;
+        }
+        alloc_bytes += budgets[heap].statistics.allocationBytes;
+        block_bytes += budgets[heap].statistics.blockBytes;
+    }
+}
+
 void TextureCacheRuntime::TickVram(u64 cache_used, u64 expected, u64 critical) {
     ++vram_frame;
+    if (vram_frame == 1) {
+        VideoCommon::C11Vram::LogStart();
+        VideoCommon::C13Vram::LogStart();
+    }
+    // Cycle 11 V3 (EDEN_NX2_VRAM_STATS): the runtime's own images for the category line.
+    if (VideoCommon::C11Vram::StatsOn() &&
+        vram_frame % VideoCommon::C11Vram::CategoryWalkFrames == 0) {
+        auto& categories = VideoCommon::C11Vram::g_categories;
+        categories.decode_class_bytes = 0;
+        categories.decode_class_count = 0;
+        for (const auto& [key, decode] : persistent_decodes) {
+            if (decode.image) {
+                categories.decode_class_bytes += decode.image.GetMemoryBlock().size;
+                ++categories.decode_class_count;
+            }
+        }
+        categories.transcode_scratch_bytes = 0;
+        for (const PendingTranscode& t : pending_transcodes) {
+            categories.transcode_scratch_bytes += t.image ? t.image.GetMemoryBlock().size : 0;
+        }
+        for (const PendingTranscode& t : free_transcodes) {
+            categories.transcode_scratch_bytes += t.image ? t.image.GetMemoryBlock().size : 0;
+        }
+        categories.msaa_scratch_count = msaa_scratch_images.size();
+    }
     TickVramStats(device, VramCacheFigures{
                               .used = cache_used,
                               .expected = expected,
@@ -2687,6 +2741,24 @@ void TextureCacheRuntime::TickVram(u64 cache_used, u64 expected, u64 critical) {
             return bytes >= Lite8Vram::DecodeTrimMinBytes &&
                    vram_frame - decode.last_frame >= Lite8Vram::DecodeTrimFrames &&
                    scheduler.IsFree(decode.tick);
+        });
+    }
+    // Cycle 11 V2 (EDEN_NX2_C11_DECODE_TRIM, default on with the ASTC disk cache): every class
+    // (any size) unused for DecodeTrimFrames goes back to the driver once the GPU is done with
+    // it; a disk cache miss of that class allocates it again.
+    if (VideoCommon::C11Vram::DecodeTrimOn() &&
+        vram_frame % VideoCommon::C11Vram::DecodeTrimSweepFrames == 0) {
+        const u64 idle = VideoCommon::C11Vram::DecodeTrimFrames();
+        std::erase_if(persistent_decodes, [this, idle](const auto& entry) {
+            const PersistentDecode& decode = entry.second;
+            if (vram_frame - decode.last_frame < idle || !scheduler.IsFree(decode.tick)) {
+                return false;
+            }
+            auto& counters = VideoCommon::C11Vram::g_counters;
+            counters.trimmed.fetch_add(1, std::memory_order_relaxed);
+            counters.trimmed_bytes.fetch_add(
+                decode.image ? decode.image.GetMemoryBlock().size : 0, std::memory_order_relaxed);
+            return true;
         });
     }
 }
@@ -2730,6 +2802,41 @@ void TextureCacheRuntime::TickFrame() {
     std::erase_if(pending_resolve_shadows, [this](const auto& pending) {
         return scheduler.IsFree(pending.first);
     });
+    // Cycle 11 V1 (EDEN_NX2_C11_DROP1X): dropped 1x originals the GPU is done with.
+    while (!c11_dropped_originals.empty() &&
+           scheduler.IsFree(c11_dropped_originals.front().first)) {
+        c11_dropped_originals.pop_front();
+    }
+    // Cycle 13 V2 (EDEN_NX2_C13_RELOC): replaced host-memory backings the GPU is done with, and
+    // (CHECK) the tiles their rebinds read back.
+    while (!c13_retired.empty() && scheduler.IsFree(c13_retired.front().tick)) {
+        c13_retired.pop_front();
+    }
+    while (!c13_checks.empty() && scheduler.IsFree(c13_checks.front().tick)) {
+        C13Check& check = c13_checks.front();
+        auto& counters = VideoCommon::C13Vram::g_counters;
+        const u8* const base = check.ref.mapped_span.data();
+        const size_t compare = static_cast<size_t>(
+            (std::min)(check.compare_bytes, static_cast<u64>(C13CheckStride)));
+        for (u32 tile = 0; tile < check.tiles; ++tile) {
+            const u8* const old_tile = base + tile * C13CheckStride;
+            const u8* const new_tile = base + (2 + tile) * C13CheckStride;
+            counters.check_tiles.fetch_add(1, std::memory_order_relaxed);
+            if (std::memcmp(old_tile, new_tile, compare) == 0) {
+                continue;
+            }
+            counters.check_mismatches.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_ERROR(Render_Vulkan,
+                          "C13 reloc check: tile {} of the rebound image {:#x} ({}x{}, format {}) "
+                          "differs from the old backing",
+                          tile, check.gpu_addr, check.width, check.height, check.format);
+            }
+        }
+        FreeDeferredStagingBuffer(check.ref);
+        c13_checks.pop_front();
+    }
 }
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
@@ -2983,7 +3090,8 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                             std::span<const VideoCommon::BufferImageCopy> copies) {
-    if (!original_image) {
+    // Cycle 11 V1: a dropped 1x original is made again by the ScaleDown below.
+    if (!original_image && !c11_original_dropped) {
         LOG_CRITICAL(Render_Vulkan, "Missing image at download: gpu={:#x}, cpu={:#x}, type={}, format={}, flags={:#x}, size={}, dimensions={}x{}",
                      gpu_addr, cpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
                      static_cast<u32>(flags), unswizzled_size_bytes, info.size.width, info.size.height);
@@ -3871,6 +3979,7 @@ bool Image::ScaleUp(bool ignore) {
         return false;
     }
     ASSERT(info.type != ImageType::Linear);
+    C11Note1xUse(); // Cycle 11 V1: the 1x original was current until now
     flags |= ImageFlagBits::Rescaled;
     has_scaled = true;
     if (!scaled_image) {
@@ -3912,9 +4021,16 @@ bool Image::ScaleDown(bool ignore) {
         return false;
     }
     ASSERT(info.type != ImageType::Linear);
+    // Cycle 11 V1 (EDEN_NX2_C11_DROP1X): a dropped 1x original is made again, with the scaled
+    // contents blitted into it (also for an upload: a partial upload keeps the rest current).
+    const bool recreated = c11_original_dropped;
+    if (recreated) {
+        C11RecreateOriginal(ignore);
+    }
+    C11Note1xUse();
     flags &= ~ImageFlagBits::Rescaled;
     current_image = &Image::original_image;
-    if (ignore) {
+    if (ignore || recreated) {
         return true;
     }
     if (aspect_mask == 0) {
@@ -3930,6 +4046,388 @@ bool Image::ScaleDown(bool ignore) {
         BlitScale(*scheduler, *scaled_image, *original_image, info, aspect_mask, resolution, false);
     }
     return true;
+}
+
+void Image::C11Note1xUse() noexcept {
+    if (runtime != nullptr) {
+        c11_last_1x_frame = runtime->vram_frame;
+    }
+}
+
+u64 Image::C11DropOriginal(u64 min_age) {
+    namespace C11 = VideoCommon::C11Vram;
+    if (c11_original_dropped || runtime == nullptr || !original_image || !scaled_image ||
+        False(flags & ImageFlagBits::Rescaled) || current_image != &Image::scaled_image) {
+        return 0;
+    }
+    if (runtime->vram_frame - c11_last_1x_frame < min_age) {
+        return 0;
+    }
+    // Only plain single-sample 2D images the BlitScale path handles (no scale views or
+    // framebuffers holding the 1x handle), with every byte in the 1x image's own memory.
+    constexpr auto refused_flags =
+        ImageFlagBits::Sparse | ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::Converted | ImageFlagBits::AcceleratedUpload |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding |
+        ImageFlagBits::CpuModified | ImageFlagBits::BadOverlap | ImageFlagBits::Dead;
+    // The constructor sizes storage_image_views to the host levels for every image (null
+    // handles until StorageImageView makes one), so "has a storage view" means a non-null entry:
+    // the cycle 11 test round's `!storage_image_views.empty()` refused every candidate (0 dropped,
+    // ~32 refused per sweep = all rescaled images).
+    const auto has_view = [](const std::vector<vk::ImageView>& views) {
+        return std::any_of(views.begin(), views.end(),
+                           [](const vk::ImageView& view) { return static_cast<bool>(view); });
+    };
+    if (True(flags & refused_flags) || info.type != ImageType::e2D || info.num_samples != 1 ||
+        host_level_offset != 0 || original_image.IsUnbacked()) {
+        C11::g_counters.refused.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    if (has_view(storage_image_views) || has_view(storage_layer_views)) {
+        C11::g_counters.refused_views.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    if (normal_view || normal_framebuffer || scale_view || scale_framebuffer ||
+        NeedsScaleHelper()) {
+        C11::g_counters.refused_helper.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const u64 bytes = original_image.GetMemoryBlock().size;
+    if (ENABLE_MSAA_RESOLVE_CONSUME) {
+        runtime->EraseResolveShadow(*original_image);
+    }
+    // Commands recorded so far may still use it (the scale-up blit): freed once the GPU is past
+    // the current tick (TextureCacheRuntime::TickFrame).
+    runtime->c11_dropped_originals.emplace_back(scheduler->CurrentTick(),
+                                                std::move(original_image));
+    original_image = vk::Image{};
+    original_residency.Reset();
+    c11_original_dropped = true;
+    auto& counters = C11::g_counters;
+    counters.dropped.fetch_add(1, std::memory_order_relaxed);
+    counters.dropped_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    return bytes;
+}
+
+void Image::C11RecreateOriginal(bool for_upload) {
+    namespace C11 = VideoCommon::C11Vram;
+    // Same creation as the constructor's for the images C11DropOriginal accepts (no ASTC,
+    // sparse or trimmed levels).
+    u32 level_offset = 0;
+    original_image = MakeImage(runtime->device, runtime->memory_allocator,
+                               TrimmedHostInfo(runtime->device, info, level_offset),
+                               runtime->ViewFormats(info.format),
+                               AstcHostFormat(runtime->device, info), false, false,
+                               &original_residency);
+    if (runtime->device.HasDebuggingToolAttached()) {
+        original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
+    }
+    c11_original_dropped = false;
+    auto& counters = C11::g_counters;
+    const u64 bytes = original_image.GetMemoryBlock().size;
+    counters.recreated.fetch_add(1, std::memory_order_relaxed);
+    counters.recreated_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    (for_upload ? counters.recreated_upload : counters.recreated_down)
+        .fetch_add(1, std::memory_order_relaxed);
+    if (C11::Drop1xCheck()) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 128) {
+            LOG_INFO(Render_Vulkan,
+                     "C11 drop1x: re-created the 1x image of {:#x} ({}x{}, format {}, {} KiB) "
+                     "for {} after {} frames",
+                     gpu_addr, info.size.width, info.size.height, static_cast<u32>(info.format),
+                     bytes >> 10, for_upload ? "an upload" : "a scale-down",
+                     runtime->vram_frame - c11_last_1x_frame);
+        }
+    }
+    if (aspect_mask == 0) {
+        aspect_mask = ImageAspectMask(info.format);
+    }
+    // The scaled copy holds the current contents: blit them down (C11DropOriginal only accepts
+    // images BlitScale handles, so no helper views are involved).
+    BlitScale(*scheduler, *scaled_image, *original_image, info, aspect_mask, runtime->resolution,
+              false);
+}
+
+VideoCommon::C13Vram::RebindResult Image::C13Rebind(bool check) {
+    namespace C13 = VideoCommon::C13Vram;
+    using Result = C13::RebindResult;
+    if (runtime == nullptr || scheduler == nullptr || !HostResident()) {
+        return Result::Refused;
+    }
+    // Plain images only: no sparse binding, no converted / transcoded storage (their backing is
+    // made with other formats and views), nothing decoding into it.
+    constexpr auto refused_flags =
+        ImageFlagBits::Sparse | ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::Converted | ImageFlagBits::AcceleratedUpload |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Dead;
+    if (True(flags & refused_flags) || info.type == ImageType::Buffer || host_level_offset != 0 ||
+        original_image.IsUnbacked()) {
+        return Result::Refused;
+    }
+    const bool original_host = original_image && original_residency.Bytes() != 0;
+    const bool scaled_host = scaled_image && scaled_residency.Bytes() != 0;
+    if (!original_host && !scaled_host) {
+        return Result::Refused;
+    }
+    if (aspect_mask == 0) {
+        aspect_mask = ImageAspectMask(info.format);
+    }
+    const Device& device = runtime->device;
+    // The same creation as the constructor / C11RecreateOriginal (1x) and ScaleUp (scaled).
+    u32 level_offset = 0;
+    const ImageInfo original_info = TrimmedHostInfo(device, info, level_offset);
+    const std::optional<VkFormat> original_override = AstcHostFormat(device, info);
+    ImageInfo scaled_info = info;
+    {
+        const auto& resolution = runtime->resolution;
+        const bool is_2d = info.type == ImageType::e2D;
+        scaled_info.size.width = resolution.ScaleUp(info.size.width);
+        scaled_info.size.height =
+            is_2d ? resolution.ScaleUp(info.size.height) : info.size.height;
+    }
+    // Every new backing first: nothing changes unless all of them fit.
+    vk::Image new_original;
+    vk::Image new_scaled;
+    if (original_host) {
+        new_original = MakeImage(device, runtime->memory_allocator, original_info,
+                                 runtime->ViewFormats(info.format), original_override, false,
+                                 false, nullptr, true);
+        if (!new_original) {
+            return Result::NoRoom;
+        }
+    }
+    if (scaled_host) {
+        new_scaled = MakeImage(device, runtime->memory_allocator, scaled_info,
+                               runtime->ViewFormats(info.format), {}, false, false, nullptr, true);
+        if (!new_scaled) {
+            return Result::NoRoom;
+        }
+    }
+    // Views and framebuffers made on the old handles: retired with them, made again on demand.
+    TextureCacheRuntime::C13Retired views_retired{};
+    views_retired.tick = scheduler->CurrentTick();
+    for (vk::ImageView& view : storage_image_views) {
+        if (view) {
+            views_retired.views.push_back(std::move(view));
+            view = vk::ImageView{};
+        }
+    }
+    for (vk::ImageView& view : storage_layer_views) {
+        if (view) {
+            views_retired.views.push_back(std::move(view));
+        }
+    }
+    storage_layer_views.clear();
+    views_retired.view_a = std::move(scale_view);
+    views_retired.view_b = std::move(normal_view);
+    if (scale_framebuffer) {
+        views_retired.framebuffer_a = std::make_unique<Framebuffer>(std::move(*scale_framebuffer));
+        scale_framebuffer.reset();
+    }
+    if (normal_framebuffer) {
+        views_retired.framebuffer_b = std::make_unique<Framebuffer>(std::move(*normal_framebuffer));
+        normal_framebuffer.reset();
+    }
+    runtime->c13_retired.push_back(std::move(views_retired));
+
+    const bool tile_check = check && info.num_samples == 1 &&
+                            VideoCore::Surface::DefaultBlockWidth(info.format) == 1 &&
+                            VideoCore::Surface::DefaultBlockHeight(info.format) == 1;
+    const auto rebind_part = [&](vk::Image& slot, vk::Image& fresh, const ImageInfo& part_info,
+                                 std::optional<VkFormat> part_override,
+                                 VideoCommon::C10Vram::HostResidency& residency) {
+        const VkImageCreateInfo ci = MakeImageCreateInfo(device, part_info, part_override);
+        std::vector<VkImageCopy> copy_regions;
+        copy_regions.reserve(ci.mipLevels);
+        for (u32 level = 0; level < ci.mipLevels; ++level) {
+            const VkImageSubresourceLayers layers{
+                .aspectMask = aspect_mask,
+                .mipLevel = level,
+                .baseArrayLayer = 0,
+                .layerCount = ci.arrayLayers,
+            };
+            copy_regions.push_back(VkImageCopy{
+                .srcSubresource = layers,
+                .srcOffset = {0, 0, 0},
+                .dstSubresource = layers,
+                .dstOffset = {0, 0, 0},
+                .extent =
+                    {
+                        .width = (std::max)(ci.extent.width >> level, 1U),
+                        .height = (std::max)(ci.extent.height >> level, 1U),
+                        .depth = (std::max)(ci.extent.depth >> level, 1U),
+                    },
+            });
+        }
+        // CHECK: two tiles (corner, centre) of level 0 / layer 0, old then new.
+        std::vector<VkBufferImageCopy> old_tile_copies;
+        std::vector<VkBufferImageCopy> new_tile_copies;
+        StagingBufferRef check_ref{};
+        u64 compare_bytes = 0;
+        if (tile_check) {
+            VkImageAspectFlags copy_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+            u64 texel_bytes = (std::clamp)(BytesPerBlock(info.format), 1U, 16U);
+            if ((aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
+                copy_aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+                texel_bytes = info.format == PixelFormat::D16_UNORM ? 2 : 4;
+            } else if ((aspect_mask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
+                copy_aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+                texel_bytes = 1;
+            }
+            const u32 tile_width = (std::min)(ci.extent.width, C13::RelocCheckTile);
+            const u32 tile_height = (std::min)(ci.extent.height, C13::RelocCheckTile);
+            compare_bytes = u64{tile_width} * tile_height * texel_bytes;
+            const u64 stride = TextureCacheRuntime::C13CheckStride;
+            check_ref = runtime->DownloadStagingBuffer(static_cast<size_t>(stride * 4), true);
+            // Zeroed: bytes a copy leaves unwritten compare equal.
+            std::memset(check_ref.mapped_span.data(), 0,
+                        (std::min)(check_ref.mapped_span.size(), static_cast<size_t>(stride * 4)));
+            const std::array<VkOffset3D, 2> origins{
+                VkOffset3D{0, 0, 0},
+                VkOffset3D{static_cast<s32>((ci.extent.width - tile_width) / 2),
+                           static_cast<s32>((ci.extent.height - tile_height) / 2), 0},
+            };
+            for (u32 tile = 0; tile < 2; ++tile) {
+                const auto make = [&](u64 index) {
+                    return VkBufferImageCopy{
+                        .bufferOffset = check_ref.offset + index * stride,
+                        .bufferRowLength = 0,
+                        .bufferImageHeight = 0,
+                        .imageSubresource =
+                            {
+                                .aspectMask = copy_aspect,
+                                .mipLevel = 0,
+                                .baseArrayLayer = 0,
+                                .layerCount = 1,
+                            },
+                        .imageOffset = origins[tile],
+                        .imageExtent = {tile_width, tile_height, 1},
+                    };
+                };
+                old_tile_copies.push_back(make(tile));
+                new_tile_copies.push_back(make(2 + tile));
+            }
+        }
+        const VkImage src = *slot;
+        const VkImage dst = *fresh;
+        const VkBuffer check_buffer = check_ref.buffer;
+        const VkImageAspectFlags mask = aspect_mask;
+        scheduler->RequestOutsideRenderPassOperationContext();
+        scheduler->Record([src, dst, mask, regions = std::move(copy_regions),
+                           old_tiles = std::move(old_tile_copies),
+                           new_tiles = std::move(new_tile_copies),
+                           check_buffer](vk::CommandBuffer cmdbuf) {
+            const VkImageSubresourceRange range{
+                .aspectMask = mask,
+                .baseMipLevel = 0,
+                .levelCount = VK_REMAINING_MIP_LEVELS,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            };
+            const auto barrier = [&range](VkImage image, VkAccessFlags src_access,
+                                          VkAccessFlags dst_access, VkImageLayout old_layout,
+                                          VkImageLayout new_layout) {
+                return VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = src_access,
+                    .dstAccessMask = dst_access,
+                    .oldLayout = old_layout,
+                    .newLayout = new_layout,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = image,
+                    .subresourceRange = range,
+                };
+            };
+            constexpr VkAccessFlags any_write =
+                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                VK_ACCESS_MEMORY_WRITE_BIT;
+            const std::array pre{
+                barrier(src, any_write, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                barrier(dst, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, nullptr, pre);
+            cmdbuf.CopyImage(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, regions);
+            VkImageLayout dst_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            if (!old_tiles.empty()) {
+                const VkImageMemoryBarrier to_src =
+                    barrier(dst, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_src);
+                dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                cmdbuf.CopyImageToBuffer(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, check_buffer,
+                                         old_tiles);
+                cmdbuf.CopyImageToBuffer(dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, check_buffer,
+                                         new_tiles);
+                const VkBufferMemoryBarrier to_host{
+                    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .buffer = check_buffer,
+                    .offset = 0,
+                    .size = VK_WHOLE_SIZE,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                       0, to_host);
+            }
+            const std::array post{
+                barrier(src, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+                barrier(dst, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, dst_layout,
+                        VK_IMAGE_LAYOUT_GENERAL),
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, nullptr, post);
+        });
+        const u64 tick = scheduler->CurrentTick();
+        if (tile_check) {
+            runtime->c13_checks.push_back(TextureCacheRuntime::C13Check{
+                .tick = tick,
+                .ref = check_ref,
+                .compare_bytes = compare_bytes,
+                .tiles = 2,
+                .gpu_addr = gpu_addr,
+                .width = ci.extent.width,
+                .height = ci.extent.height,
+                .format = static_cast<u32>(info.format),
+            });
+        }
+        if (ENABLE_MSAA_RESOLVE_CONSUME) {
+            runtime->EraseResolveShadow(src);
+        }
+        if (runtime->device.HasDebuggingToolAttached()) {
+            fresh.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
+        }
+        TextureCacheRuntime::C13Retired retired{};
+        retired.tick = tick;
+        retired.image = std::move(slot);
+        runtime->c13_retired.push_back(std::move(retired));
+        slot = std::move(fresh);
+        residency.Reset(); // device-local now
+    };
+    if (original_host) {
+        rebind_part(original_image, new_original, original_info, original_override,
+                    original_residency);
+    }
+    if (scaled_host) {
+        rebind_part(scaled_image, new_scaled, scaled_info, std::nullopt, scaled_residency);
+    }
+    return Result::Done;
 }
 
 bool Image::BlitScaleHelper(bool scale_up) {
@@ -4320,7 +4818,8 @@ void CustomBorderColorBudget::Release() noexcept {
     held = 0;
 }
 
-Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc) {
+Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc)
+    : descriptor{tsc} {
     const auto& device = runtime.device;
     device_ptr = &device;
     border_color = tsc.BorderColor();
@@ -4835,6 +5334,9 @@ struct TextureCacheRuntime::AstcDiskCacheState {
     const Image* pending_image = nullptr;
     /// Reused for the cached copy of the guest bytes (hashing) and for file reads.
     std::vector<u8> scratch;
+    /// Cycle 11 V5 (EDEN_NX2_C11_RAMTIER, off by default): system-RAM LRU of BC bytes read from
+    /// or written to the cache, checked before the file read.
+    VideoCommon::C11Vram::RamTier ram_tier;
 };
 
 namespace {
@@ -4949,6 +5451,19 @@ bool TextureCacheRuntime::TryTranscodeFromDiskCache(
     };
     state.cache->NoteHash(guest_size, elapsed_ns(hash_start));
 
+    // Cycle 11 V5 (EDEN_NX2_C11_RAMTIER): the bytes may still be in system RAM.
+    const bool ram_tier = VideoCommon::C11Vram::RamTierOn();
+    if (ram_tier) {
+        boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+        const u64 total = AstcDiskCacheLayout(width, height, levels, layers, mode, copies);
+        if (state.ram_tier.Find({key.lo, key.hi}, total, state.scratch)) {
+            const auto staging = staging_buffer_pool.Request(total, MemoryUsage::Upload);
+            std::memcpy(staging.mapped_span.data(), state.scratch.data(), total);
+            image.UploadMemory(staging.buffer, staging.offset, copies);
+            return true;
+        }
+    }
+
     if (const std::optional<u64> cached_size = state.cache->Lookup(key)) {
         boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
         const u64 total = AstcDiskCacheLayout(width, height, levels, layers, mode, copies);
@@ -4959,6 +5474,10 @@ bool TextureCacheRuntime::TryTranscodeFromDiskCache(
             // UploadMemory records the layout transition and the buffer -> image copy.
             image.UploadMemory(staging.buffer, staging.offset, copies);
             state.cache->NoteHit(total, elapsed_ns(read_start));
+            if (ram_tier) {
+                state.ram_tier.Insert({key.lo, key.hi},
+                                      std::span<const u8>(state.scratch.data(), total));
+            }
             return true;
         }
     }
@@ -5070,6 +5589,9 @@ void TextureCacheRuntime::PollAstcDiskCache(bool new_frame) {
         done.buffer.Invalidate();
         const std::span<const u8> mapped = done.buffer.Mapped();
         std::vector<u8> payload(mapped.begin(), mapped.begin() + done.size);
+        if (VideoCommon::C11Vram::RamTierOn()) { // Cycle 11 V5
+            state.ram_tier.Insert({done.key.lo, done.key.hi}, payload);
+        }
         state.cache->Submit(done.key, std::move(payload));
         state.outstanding_bytes -= done.size;
         if (state.free_buffers.size() < AstcDiskCacheState::MaxFreeBuffers &&

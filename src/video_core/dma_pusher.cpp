@@ -24,6 +24,9 @@
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/mt/c11_front.h"
+#include "video_core/mt/c12_front.h"
+#include "video_core/mt/c13_front.h"
 #include "video_core/mt/gpuparam.h"
 #include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
@@ -54,6 +57,9 @@ void DumpGpuWrittenList(u64 address, std::span<const Tegra::CommandHeader> comma
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
+/// Maxwell3D const_buffer.buffer (CB_DATA): EDEN_NX2_C11_LISTRANGE.
+constexpr u32 C11CbData = 0x8E4;
+static_assert(offsetof(Engines::Maxwell3D::Regs, const_buffer.buffer) / sizeof(u32) == C11CbData);
 
 namespace {
 // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads. The
@@ -102,12 +108,23 @@ void DmaPusher::DispatchCalls() {
     [[maybe_unused]] const auto front2_guard = VideoCommon::MT::Front2Entry(*this);
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
     dma_state.is_last_call = true;
+    // EDEN_NX2_C11_ACQFWD: the release/add notes made from here on are this channel's.
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.C11SetChannel(channel_state.bind_id);
+        VideoCommon::MT::C11FrontStats::Get().MaybeLog();
+        VideoCommon::MT::C12FrontStats::Get().MaybeLog(); // cycle 12 W1 (mt/c12_front.h)
+        VideoCommon::MT::C13FrontStats::Get().MaybeLog(); // cycle 13 W3 (mt/c13_front.h)
+    }
     while (system.IsPoweredOn()) {
         if (!Step()) {
             break;
         }
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        // EDEN_NX2_C12_LISTWAIT (P3): verify a speculated list once its writers ran.
+        if (c12_list.pending.active) [[unlikely]] {
+            C12VerifyListSpec();
+        }
         // GPU params v2: a held group of draws goes out before the submission ends.
         split.ReleaseFrontHold(VideoCommon::GpuSplit::HoldDispatchEnd);
         split.Defer([gpu = &system.GPU()] {
@@ -294,9 +311,64 @@ bool DmaPusher::Step() {
                                (command_list.snapshot_suspensions & 1) == 0 &&
                                command_list.snapshot_suspensions ==
                                    suspensions.load(std::memory_order_acquire) &&
+                               !std::ranges::binary_search(
+                                   command_list.deferred_entries,
+                                   static_cast<u32>(dma_pushbuffer_subindex)) &&
                                !gpu_written &&
                                !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                                           header.size * sizeof(u32)));
+        if (gpuparam_extra < 0 && !submitted &&
+            dma_pushbuffer_subindex < command_list.submitted_offsets.size()) {
+            // An entry parsed from memory instead of its submit-time copy is the way a command
+            // ring the game already refilled gets read as this frame's commands (garbage methods,
+            // unbound subchannels, render targets of absurd size). Count how often the words
+            // differ, by the reason the copy was skipped. Bounded: the first entries only.
+            enum Reason : u32 { Resumed, SuspendedCopy, SuspensionsChanged, GpuWritten, SafeDirty, Count };
+            static std::array<std::atomic<u64>, Count> checked{};
+            static std::array<std::atomic<u64>, Count> differing{};
+            static std::atomic<u64> total_checked{};
+            static constexpr std::array<const char*, Count> names{
+                "resumed entry", "copied during a suspension", "suspension count changed",
+                "GPU-written page", "safe read of dirty memory"};
+            if (total_checked.load(std::memory_order_relaxed) < 50000) {
+                const Reason reason = command_resume_offset != 0                      ? Resumed
+                                      : (command_list.snapshot_suspensions & 1) != 0  ? SuspendedCopy
+                                      : command_list.snapshot_suspensions !=
+                                              suspensions.load(std::memory_order_acquire)
+                                          ? SuspensionsChanged
+                                      : gpu_written ? GpuWritten
+                                                    : SafeDirty;
+                std::vector<u32> live(header.size);
+                memory_manager.ReadBlockUnsafe(dma_state.dma_get, live.data(),
+                                               live.size() * sizeof(u32));
+                const CommandHeader* const copy = command_list.submitted_words.data() +
+                                                  command_list.submitted_offsets[dma_pushbuffer_subindex];
+                u32 first = ~0U, words = 0;
+                for (u32 i = 0; i < header.size; ++i) {
+                    if (copy[i].argument != live[i]) {
+                        first = std::min(first, i);
+                        ++words;
+                    }
+                }
+                ++checked[reason];
+                const u64 n = total_checked.fetch_add(1) + 1;
+                if (words != 0) {
+                    const u64 seen = differing[reason].fetch_add(1);
+                    if (seen < 4) {
+                        LOG_WARNING(HW_GPU,
+                                    "Entry {:#x}+{:#x} parsed from memory ({}) differs from its "
+                                    "submit-time copy in {} words, first at word {}",
+                                    u64{header.addr}, u64{header.size}, names[reason], words, first);
+                    }
+                }
+                if ((n % 10000) == 0) {
+                    for (u32 r = 0; r < Count; ++r) {
+                        LOG_INFO(HW_GPU, "Entries parsed from memory ({}): {} checked, {} differ from the submit-time copy",
+                                 names[r], checked[r].load(), differing[r].load());
+                    }
+                }
+            }
+        }
         if (gpuparam_extra >= 0) {
             dma_pushbuffer_subindex += static_cast<size_t>(gpuparam_extra);
         } else if (submitted) {
@@ -634,6 +706,8 @@ void DmaPusher::CallMethod(u32 argument) {
     auto& split = VideoCommon::GpuSplit::Get();
     // EDEN_NX2_C10_ACQ_SEQ: the notes the previous calls made have their triggers sent by now.
     split.C10ResolveNotes();
+    // EDEN_NX2_C11_LISTRANGE: what an earlier call described of compute writes is its own.
+    split.C11BeginCall();
     if (dma_state.method < non_puller_methods) {
         VideoCommon::Nx2Profile::Scope puller_scope{VideoCommon::Nx2Profile::Zone::PullerMethod};
         puller.CallPullerMethod(*this, Engines::Puller::MethodCall{
@@ -648,6 +722,20 @@ void DmaPusher::CallMethod(u32 argument) {
             ReportUnboundSubchannel();
             return;
         }
+        // EDEN_NX2_C11_LISTRANGE (F2): 3D constant buffer data the front does not range (only
+        // Maxwell3D::FrontNoteWrites, on the front macro path, sees its buffer).
+        const bool c11_cb_unranged =
+            VideoCommon::MT::C11ListRange() && split.Active() &&
+            subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+            dma_state.method - C11CbData < 16 &&
+            !(split.FrontMacros() && static_cast<Engines::Maxwell3D*>(subchannel)
+                                         ->GetNativeMacroEngine()
+                                         .native_turing);
+        SCOPE_EXIT {
+            if (c11_cb_unranged) {
+                split.C11NoteCbUnranged();
+            }
+        };
         // EDEN_NX2_MT_LITE_FCALL: the 3D front first (WritesMemory is false for Maxwell3D, so
         // nothing below applies to it but this call).
         if (VideoCommon::MT::LiteFrontCalls() &&
@@ -740,6 +828,8 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     auto& split = VideoCommon::GpuSplit::Get();
     // EDEN_NX2_C10_ACQ_SEQ: as in CallMethod.
     split.C10ResolveNotes();
+    split.C11BeginCall(); // EDEN_NX2_C11_LISTRANGE: as in CallMethod
+
     if (dma_state.method < non_puller_methods) {
         VideoCommon::Nx2Profile::Scope puller_scope{VideoCommon::Nx2Profile::Zone::PullerMethod};
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
@@ -749,6 +839,19 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             ReportUnboundSubchannel();
             return;
         }
+        // EDEN_NX2_C11_LISTRANGE (F2): as in CallMethod; the front multi-method path ranges a
+        // run only with its hook (docs/cycle11-hooks-W1.md).
+        const bool c11_cb_unranged =
+            VideoCommon::MT::C11ListRange() && split.Active() &&
+            subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+            dma_state.method - C11CbData < 16 &&
+            !(split.FrontMacros() && split.C11CbHooked() &&
+              static_cast<Engines::Maxwell3D*>(subchannel)->GetNativeMacroEngine().native_turing);
+        SCOPE_EXIT {
+            if (c11_cb_unranged) {
+                split.C11NoteCbUnranged();
+            }
+        };
         // EDEN_NX2_MT_LITE_FCALL: as in CallMethod.
         if (VideoCommon::MT::LiteFrontCalls() &&
             subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
@@ -813,6 +916,23 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
         memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
                                        entry.size * sizeof(u32));
     }
+    list.deferred_entries.clear();
+}
+
+void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+    for (const u32 i : list.deferred_entries) {
+        if (i >= list.command_lists.size() || i >= list.submitted_offsets.size()) {
+            continue;
+        }
+        const CommandListHeader& entry = list.command_lists[i];
+        const u32 offset = list.submitted_offsets[i];
+        if (offset + entry.size > list.submitted_words.size()) {
+            continue;
+        }
+        memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
+                                       entry.size * sizeof(u32));
+    }
+    list.deferred_entries.clear();
 }
 
 
@@ -904,6 +1024,10 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     if (VideoCommon::MT::ListDump::Enabled()) {
         list_dump.fetch.sampled = false;
     }
+    // EDEN_NX2_C12_LISTWAIT (P3): an earlier speculated list whose writers ran is verified first.
+    if (c12_list.pending.active) [[unlikely]] {
+        C12VerifyListSpec();
+    }
     const GPUVAddr end = address + u64{count} * sizeof(u32);
     bool written = false;
     bool new_page = false;
@@ -983,26 +1107,94 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     bool skipped = false;
     bool shortened = false;
     bool c10_shortened = false; // EDEN_NX2_C10_LIST_PRECISE: committer wait below L24's bound
+    bool c11_shortened = false; // EDEN_NX2_C11_LISTRANGE: sequencer wait below every writer
     bool waited = false;
+    // Cycle 12 W1 P3 (mt/c12_front.h): the writer census of the fetches that find their writers
+    // queued (last writer kind and compute program, wait time; with LISTWAIT_CHECK / LISTWAIT
+    // the list is also read before the wait: did the writer change it?) and EDEN_NX2_C12_LISTWAIT's
+    // speculation (a list found unchanged C12ListWaitTrust() times in a row skips the wait; the
+    // read is verified once its writers ran, C12VerifyListSpec).
+    const bool c12_census = mt && VideoCommon::MT::C12ListCensus() && !new_page && pages_fit;
+    const u8 c12_kind = c12_census ? split.LastWriterKind() : u8{6};
+    const u64 c12_program = c12_census ? split.C12LastWriterProgram() : 0;
+    const u64 c12_target = c12_census ? split.WritersTarget() : 0;
+    const bool c12_behind = c12_census && (split.ConsumedPosition() < c12_target ||
+                                           split.SettledPosition() < c12_target);
+    bool c12_pre = false;     // read before the wait
+    bool c12_pre_ok = false;
+    bool c12_trusted = false; // the census trusts this list (same content C12ListWaitTrust() times)
+    bool c12_spec = false;    // LISTWAIT: read without the writer wait
+    if (c12_behind && VideoCommon::MT::C12ListPreRead()) [[unlikely]] {
+        c12_pre = true;
+        c12_pre_headers.resize_destructive(count);
+        std::array<u8, 4> pre_results{};
+        c12_pre_ok = ReadGpuWrittenChunks(address, count,
+                                          reinterpret_cast<u8*>(c12_pre_headers.data()),
+                                          std::span<u8>{pre_results.data(), page_count});
+        c12_trusted = c12_pre_ok && c12_list.Trusted(address, count);
+        c12_spec = c12_trusted && VideoCommon::MT::C12ListWait() &&
+                   !VideoCommon::MT::C12ListWaitCheck() && !c12_list.pending.active;
+    }
+    const u64 c12_wait_begin = c12_behind ? VideoCommon::Nx2Profile::Now() : 0;
+    // Cycle 13 W3 (mt/c13_front.h): the compute writer census by shader hash (L1) and the
+    // learned writer programs of the early kick (L2), for fetches whose last writer is compute
+    // and that find the back behind it.
+    const bool c13_track = mt && VideoCommon::MT::C13FrontTrack() && !new_page && pages_fit &&
+                           split.LastWriterKind() == 1;
+    VideoCommon::MT::C13ListWaitSample c13_sample{};
+    bool c13_behind = false;
+    if (c13_track) {
+        const u64 target = split.WritersTarget();
+        const u64 consumed_now = split.ConsumedPosition();
+        const u64 settled_now = split.SettledPosition();
+        c13_behind = consumed_now < target || settled_now < target;
+        if (c13_behind) {
+            const u64 sent = split.SentPosition();
+            c13_sample.program = split.C12LastWriterProgram();
+            c13_sample.address_space = memory_manager.GetID();
+            c13_sample.since_ns = split.C13NsSinceWriter();
+            c13_sample.calls = split.C13CallsSinceWriter();
+            c13_sample.words = split.C13WordsSinceWriter();
+            c13_sample.backlog_seq = sent - std::min(consumed_now, sent);
+            c13_sample.backlog_settle = sent - std::min(settled_now, sent);
+            c13_sample.learned = split.C13WriterLearned();
+            c13_sample.kicked = split.C13WriterKicked();
+            const u64 kick = split.C13WriterKickTarget();
+            c13_sample.kick_behind =
+                c13_sample.kicked && (consumed_now < kick || settled_now < kick);
+        }
+    }
+    const u64 c13_wait_begin = c13_behind ? VideoCommon::Nx2Profile::Now() : 0;
+    bool c13_listpos = false; // the wait was WaitForListWriters (its seq/committer split)
     if (split.Active()) {
         if (mt && VideoCommon::MT::LiteListKnown() && !new_page && pages_fit && skip_policy &&
             std::ranges::all_of(list_pages,
                                 [this](u64 page) { return list_trust.Trusted(page >> 12); }) &&
             split.SettledPosition() >= page_bound()) {
             skipped = true;
+        } else if (c12_spec) {
+            // EDEN_NX2_C12_LISTWAIT: a list its writers kept unchanged: no writer wait.
         } else if (mt && VideoCommon::MT::LiteListPos() && !new_page && pages_fit) {
             // EDEN_NX2_MT_LITE_LISTPOS (L24): the committer only up to these pages' writers.
             // EDEN_NX2_C10_LIST_PRECISE (B2): the list's bytes, for the noted writes over them.
-            const auto wait =
-                split.WaitForListWriters(page_bound, address, u64{count} * sizeof(u32));
+            // EDEN_NX2_C11_LISTRANGE (F2): the list's address space for the writers' ranges.
+            const auto wait = split.WaitForListWriters(page_bound, address,
+                                                       u64{count} * sizeof(u32),
+                                                       memory_manager.GetID());
             waited = wait.waited;
+            c13_listpos = true;
             shortened = wait.shortened;
             c10_shortened = wait.c10_shortened;
+            c11_shortened = wait.c11_shortened;
         } else {
             waited = split.WaitForWriters();
         }
     }
 
+    const u64 c12_wait_ns = c12_behind ? VideoCommon::Nx2Profile::Now() - c12_wait_begin : 0;
+    if (c13_behind) {
+        c13_sample.wait_ns = VideoCommon::Nx2Profile::Now() - c13_wait_begin;
+    }
     const u64 wait_ns =
         dump ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now() - wait_start)
@@ -1074,7 +1266,8 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     }
 
     // L25 bookkeeping: a read with the writers waited for confirms or bans its pages.
-    if (mt && VideoCommon::MT::LiteListKnown() && !skipped && pages_fit) {
+    // (Not for a C12 speculated read: its writers had not run.)
+    if (mt && VideoCommon::MT::LiteListKnown() && !skipped && !c12_spec && pages_fit) {
         for (size_t i = 0; i < page_count; ++i) {
             const u64 page = pages[i] >> 12;
             if (ok && results[i] == 0) {
@@ -1114,8 +1307,35 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         }
     }
 
+    // EDEN_NX2_C11_LISTRANGE_CHECK: a fetch F2 read before the sequencer ran every writer is
+    // read again after WaitForWriters and compared; the second read is used.
+    if (ok && c11_shortened && VideoCommon::MT::C11ListRangeCheck()) {
+        split.WaitForWriters();
+        check_headers.resize_destructive(count);
+        std::array<u8, 4> check_results{};
+        if (ReadGpuWrittenChunks(address, count, reinterpret_cast<u8*>(check_headers.data()),
+                                 std::span<u8>{check_results.data(), page_count})) {
+            ++list_stats.c11_compared;
+            const bool c11_differs = std::memcmp(check_headers.data(), command_headers.data(),
+                                                 size_t{count} * sizeof(u32)) != 0;
+            // Cycle 12 P2 (EDEN_NX2_C12_LISTRANGE): the gate counts checks and stale reads.
+            VideoCommon::MT::C12ListRangeGate::Get().NoteCheck(c11_differs);
+            if (c11_differs) {
+                if (list_stats.c11_stale++ < 16) {
+                    LOG_ERROR(HW_GPU, "C11 list range check: stale GPU-written list {:#x} ({} "
+                              "words)", address, count);
+                }
+                std::memcpy(command_headers.data(), check_headers.data(),
+                            size_t{count} * sizeof(u32));
+            }
+        } else {
+            ++list_stats.c11_unverifiable;
+            ok = false;
+        }
+    }
+
     // EDEN_NX2_MT_LITE_LISTCHECK: read again after every writer ran and compare.
-    if (ok && VideoCommon::MT::LiteListCheck() && (skipped || shortened)) {
+    if (ok && VideoCommon::MT::LiteListCheck() && (skipped || shortened || c12_spec)) {
         split.WaitForWriters();
         check_headers.resize_destructive(count);
         std::array<u8, 4> check_results{};
@@ -1127,7 +1347,10 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
                 if (list_stats.check_stale++ < 16) {
                     LOG_WARNING(HW_GPU,
                                 "List check: stale GPU-written list {:#x} ({} words, {})",
-                                address, count, skipped ? "L25 skip" : "L24 short settle");
+                                address, count,
+                                skipped    ? "L25 skip"
+                                : c12_spec ? "C12 listwait"
+                                           : "L24 short settle");
                 }
                 std::memcpy(command_headers.data(), check_headers.data(),
                             size_t{count} * sizeof(u32));
@@ -1137,11 +1360,99 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
             ok = false;
         }
     }
-    if (stats || VideoCommon::MT::LiteListCheck() || VideoCommon::MT::C10ListCheck()) {
+    // Cycle 12 P3: census of this fetch (after the checks: the bytes the front parses).
+    if (c12_behind && !skipped) [[unlikely]] {
+        auto& c12 = VideoCommon::MT::C12FrontStats::Get();
+        if (c12_spec) {
+            if (ok) {
+                ++c12.spec_reads;
+                c12_list.pending = VideoCommon::MT::C12ListWaitState::Pending{
+                    true, address, count,
+                    VideoCommon::MT::C12ListWaitState::Hash(command_headers.data(),
+                                                            size_t{count} * sizeof(u32)),
+                    c12_target};
+            }
+        } else {
+            if (waited) {
+                c12.NoteWait(c12_kind, c12_program, c12_wait_ns);
+            }
+            if (c12_pre) {
+                const int result = !ok || !c12_pre_ok ? 2
+                                   : std::memcmp(c12_pre_headers.data(), command_headers.data(),
+                                                 size_t{count} * sizeof(u32)) == 0
+                                       ? 0
+                                       : 1;
+                c12.NoteContent(c12_kind, result);
+                // Cycle 13 L0: the run totals for the LISTWAIT decision (C13 line).
+                if (VideoCommon::MT::C13FrontStatsOn()) {
+                    VideoCommon::MT::C13FrontStats::Get().NoteListContent(result, c12_trusted);
+                }
+                if (c12_trusted) {
+                    ++c12.spec_would;
+                    c12.spec_would_differ += result != 0 ? 1 : 0;
+                }
+                if (result != 2 && c12_list.NoteCensus(address, count, result == 0)) {
+                    ++c12.trusted_new;
+                }
+            }
+        }
+    }
+    // Cycle 13 W3: census (L1) and learning (L2) of a fetch that waited for its compute writer
+    // (not a C12 speculated read; the waited case only: L25 skips and fallbacks are not).
+    if (c13_behind && waited && !skipped && !c12_spec) [[unlikely]] {
+        c13_sample.seq_ns = c13_listpos ? split.C13LastSeqNs() : 0;
+        c13_sample.settle_ns = c13_listpos ? split.C13LastSettleNs() : 0;
+        VideoCommon::MT::C13WriterLearn::Get().NoteWait(c13_sample.program);
+        if (VideoCommon::MT::C13FrontStatsOn()) {
+            VideoCommon::MT::C13FrontStats::Get().NoteWait(c13_sample,
+                                                           VideoCommon::MT::C13KickCheck());
+        }
+    }
+    if (stats || VideoCommon::MT::LiteListCheck() || VideoCommon::MT::C10ListCheck() ||
+        VideoCommon::MT::C11ListRangeCheck()) {
         list_stats.MaybeLog(stats);
     }
     (void)waited;
     return ok;
+}
+
+void DmaPusher::C12VerifyListSpec() {
+    auto& pending = c12_list.pending;
+    if (!pending.active) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active()) {
+        pending.active = false;
+        return;
+    }
+    // Every writer queued at the read has run (sequencer and committer).
+    if (split.ConsumedPosition() < pending.target || split.SettledPosition() < pending.target) {
+        return;
+    }
+    pending.active = false;
+    auto& c12 = VideoCommon::MT::C12FrontStats::Get();
+    // A writer sent after the read may have changed the list since: a difference then only bans.
+    const bool later_writer = split.WritersTarget() != pending.target;
+    check_headers.resize_destructive(pending.count);
+    std::array<u8, 4> results{};
+    const bool readable =
+        ReadGpuWrittenChunks(pending.address, pending.count,
+                             reinterpret_cast<u8*>(check_headers.data()),
+                             std::span<u8>{results.data(), results.size()});
+    const bool same =
+        readable && VideoCommon::MT::C12ListWaitState::Hash(
+                        check_headers.data(), size_t{pending.count} * sizeof(u32)) == pending.hash;
+    if (same) {
+        ++c12.spec_verified;
+        return;
+    }
+    c12_list.Ban(pending.address, pending.count);
+    if (readable && !later_writer) {
+        c12.NoteSpecMismatch(pending.address, pending.count);
+    } else {
+        ++c12.spec_inconclusive;
+    }
 }
 
 void DmaPusher::RecordListDump(const CommandListHeader& header,

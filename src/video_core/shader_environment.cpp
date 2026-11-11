@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -36,6 +37,8 @@
 #include "video_core/memory_manager.h"
 #include "video_core/mkw_wave_workaround.h"
 #include "video_core/mt/gpuparam3.h"
+#include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_diag.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -48,8 +51,22 @@ constexpr size_t INST_SIZE = sizeof(u64);
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
+// The shader hash of lowered native code (frame dump "shaders", pipeline cache keys), with a
+// version tag that isolates this experimental ABI.
+static u64 NativeShaderHash(std::span<const u64> code) {
+    return Common::CityHash64(reinterpret_cast<const char*>(code.data()),
+                              code.size() * sizeof(u64)) ^
+           0x4f554e4345000002ULL;
+}
+
 static u64 MakeCbufKey(u32 index, u32 offset) {
     return (static_cast<u64>(index) << 32) | offset;
+}
+
+// Pointer-table entries share the classification map with plain constant buffer pointers.
+static u64 MakeIndirectCbufKey(u32 index, u32 offset, u32 indirect) {
+    return (u64{1} << 63) | (static_cast<u64>(indirect & 0x3fffff) << 40) |
+           MakeCbufKey(index, offset);
 }
 
 static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& entry) {
@@ -231,11 +248,29 @@ void FileEnvironment::StoragePointerSlots(std::vector<u64>& pointers,
     CollectStoragePointerSlots(storage_pointer_types, cbuf_values, pointers, null_slots);
 }
 
+bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    const u64 key = MakeIndirectCbufKey(index, offset, indirect);
+    if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
+        return it->second != 0;
+    }
+    bool mapped = false;
+    if (IsCbufStorageBufferPointer(index, offset)) {
+        const u64 holder =
+            u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
+        if (gpu_memory->IsFullyMappedRange(holder + indirect, sizeof(u64))) {
+            const u64 address = gpu_memory->Read<u64>(holder + indirect);
+            mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+                     gpu_memory->IsFullyMappedRange(address, 1);
+        }
+    }
+    storage_pointer_types.emplace(key, static_cast<u8>(mapped));
+    return mapped;
+}
+
 std::optional<u64> GenericEnvironment::Analyze() {
     if (native_source_size) {
         // Include the converted header and a version tag to isolate this experimental ABI.
-        return Common::CityHash64(reinterpret_cast<const char*>(code.data()),
-                                  code.size() * sizeof(u64)) ^ 0x4f554e4345000002ULL;
+        return NativeShaderHash(code);
     }
     const std::optional<u64> size{TryFindSize()};
     if (!size) {
@@ -507,6 +542,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     auto lowered = Shader::Ampere::LowerToMaxwell(
         native, {.geometry = geometry,
                  .tensor = native_tensor,
+                 .compact_tensor = native_compact_tensor,
                  .native_code_address = program_base + native_header_size});
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
@@ -517,6 +553,10 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         !reject_list.empty() &&
         reject_list.find(fmt::format(",{:x},", program_base)) != std::string::npos) {
         throw Shader::RuntimeError("Native shader at {:#x} rejected by EDEN_NX2_REJECT", program_base);
+    }
+    if (VideoCommon::Nx2Diag::Active()) {
+        VideoCommon::Nx2Diag::Diagnostics::Get().RegisterProgram(
+            program_base, Shader::Ampere::NativeProgramKey(native));
     }
     // EDEN_NX2_SHADER_DUMP=<dir>: keep every captured native program (named by its key) so the
     // lowering can be tested offline against all of a game's shaders.
@@ -617,6 +657,42 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     // unreachable data. Existing disk-cache serialization carries it with code.
     lowered_code.push_back(0);
     Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
+    // What Analyze returns for this program once the environment holds the lowered code.
+    const u64 shader_hash = NativeShaderHash(lowered_code);
+    if (VideoCommon::Nx2Diag::Active()) {
+        VideoCommon::Nx2Diag::Diagnostics::Get().RegisterProgram(
+            program_base, result->native_program_key, shader_hash);
+    }
+    // EDEN_NX2_REJECT_HASH=<hash>,...: like EDEN_NX2_REJECT, but by native program key (shader
+    // dump file names) or shader hash (frame dump "shaders"), which stay the same between runs.
+    if (static const std::string reject_hashes =
+            [] {
+                const char* text = std::getenv("EDEN_NX2_REJECT_HASH");
+                std::string list = text ? "," + std::string{text} + "," : std::string{};
+                std::ranges::transform(list, list.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                return list;
+            }();
+        !reject_hashes.empty()) {
+        for (const u64 hash : {result->native_program_key, shader_hash}) {
+            if (reject_hashes.find(fmt::format(",{:016x},", hash)) != std::string::npos) {
+                throw Shader::RuntimeError(
+                    "Native shader at {:#x} ({:016x}) rejected by EDEN_NX2_REJECT_HASH",
+                    program_base, hash);
+            }
+        }
+    }
+    // The same list, changed at runtime by the debug server (docs/nx2/debug-mcp.md).
+    if (VideoCore::Nx2Debug::AnyRejected()) {
+        for (const u64 hash : {result->native_program_key, shader_hash}) {
+            if (VideoCore::Nx2Debug::IsRejected(hash)) {
+                throw Shader::RuntimeError(
+                    "Native shader at {:#x} ({:016x}) rejected by the debug server", program_base,
+                    hash);
+            }
+        }
+    }
     LOG_DEBUG(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
               program_base, result->source_size, lowered.instructions.size());
     return result;
@@ -905,6 +981,7 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
         initial_offset = sizeof(sph);
         is_proprietary_driver = true;
         native_tensor = kepler_compute->EmulatesNativeTensorPrograms();
+        native_compact_tensor = kepler_compute->UsesCompactTensorPrograms();
         InitializeNativeCode(std::move(lowered_native_), 0);
         start_address = sizeof(sph);
     }
@@ -1048,6 +1125,14 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
         throw Shader::LogicError("Uncached storage pointer classification");
+    }
+    return it->second != 0;
+}
+
+bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
+    if (it == storage_pointer_types.end()) {
+        throw Shader::LogicError("Uncached storage pointer table classification");
     }
     return it->second != 0;
 }

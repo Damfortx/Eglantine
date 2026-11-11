@@ -26,6 +26,8 @@
 #include <ranges>
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/mt/c10_vram.h"
+#include "video_core/mt/c11_vram.h"
+#include "video_core/mt/c13_vram.h"
 #include "video_core/mt/lite8_vram.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -252,6 +254,9 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     const bool huge = texels > (u64{1} << 28);
     VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     bool placed = false;
+    // Cycle 13 V1: a device-full failure of this image, recorded once its size is known.
+    bool c13_full = false;
+    const u64 c13_estimate = texels * 4;
     if (!huge && VideoCommon::C10Vram::GuardOn()) {
         // Cycle 10 A (EDEN_NX2_VRAM_GUARD): with DEVICE_LOCAL only preferred, a full device heap
         // sent images to system memory without a word (MKW at 2x: 26-32 fps instead of ~50).
@@ -270,6 +275,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                 VideoCommon::C10Vram::g_counters.device_full.fetch_add(1,
                                                                        std::memory_order_relaxed);
                 pressure_events.fetch_add(1, std::memory_order_relaxed);
+                c13_full = true;
             }
         }
         placed = result == VK_SUCCESS;
@@ -289,6 +295,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
         pressure_events.fetch_add(1, std::memory_order_relaxed);
+        c13_full = true; // without the guard: the first failure past the budget check
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = CreateImageAllocation(ci, relaxed, handle, allocation, alloc_info);
@@ -317,6 +324,10 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
         // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
         // nothing bound, so views and copies still work, instead of aborting.
+        if (c13_full || !huge) {
+            C13NoteDeviceFull(c13_estimate);
+            c13_full = false;
+        }
         if (vk::Image sparse = CreateUnbackedImage(ci)) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an "
@@ -332,6 +343,9 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                      ci.arrayLayers, static_cast<u32>(ci.format), static_cast<int>(result));
     }
     vk::Check(result);
+    if (c13_full) {
+        C13NoteDeviceFull(alloc_info.size != 0 ? alloc_info.size : c13_estimate);
+    }
     if (NoteHostPlacement(true, alloc_info) && host_bytes != nullptr) {
         *host_bytes = alloc_info.size;
     }
@@ -635,6 +649,7 @@ VkResult MemoryAllocator::CreateGuardedBuffer(const VkBufferCreateInfo& ci,
         if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
             VideoCommon::C10Vram::g_counters.device_full.fetch_add(1, std::memory_order_relaxed);
             pressure_events.fetch_add(1, std::memory_order_relaxed);
+            C13NoteDeviceFull(ci.size);
         }
     }
     if (result != VK_SUCCESS) {
@@ -642,6 +657,43 @@ VkResult MemoryAllocator::CreateGuardedBuffer(const VkBufferCreateInfo& ci,
         result = create(alloc_ci);
     }
     return result;
+}
+
+void MemoryAllocator::C13NoteDeviceFull(u64 bytes) const {
+    if (!VideoCommon::C13Vram::OomRecording()) {
+        return;
+    }
+    // The texture cache's terms: all of this process' device memory against the main heap's
+    // budget (Device::GetDeviceMemoryUsage / GetDeviceMemoryBudget), read now.
+    VideoCommon::C13Vram::NoteDeviceFull(device.GetDeviceMemoryUsage(),
+                                         device.GetDeviceMemoryBudget(), bytes);
+}
+
+vk::Image MemoryAllocator::C13CreateDeviceImage(const VkImageCreateInfo& ci) const {
+    const VmaAllocationCreateInfo alloc_ci = {
+        .flags = static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                                                       VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT),
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        .memoryTypeBits = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+        .priority = 0.f,
+    };
+    VkImage handle{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo alloc_info{};
+    if (CreateImageAllocation(ci, alloc_ci, handle, allocation, alloc_info) != VK_SUCCESS) {
+        return vk::Image{};
+    }
+    if (IsHostMemoryType(alloc_info.memoryType)) {
+        // Cannot happen with DEVICE_LOCAL required; never hand out host memory here.
+        vmaDestroyImage(allocator, handle, allocation);
+        return vk::Image{};
+    }
+    return vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                     device.GetDispatchLoader());
 }
 
 bool MemoryAllocator::NoteHostPlacement(bool image, const VmaAllocationInfo& alloc_info) const {
@@ -813,11 +865,13 @@ void TickVramStats(const Device& device, const VramCacheFigures& cache) {
     const auto properties =
         device.GetPhysical().GetMemoryProperties(has_budget ? &budget : nullptr).memoryProperties;
     std::string heaps;
+    u64 device_alloc_bytes = 0; // Cycle 11 V3: for the category line
     for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
         if ((properties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
             continue;
         }
         const VmaStatistics& stats = vma_budgets[heap].statistics;
+        device_alloc_bytes += stats.allocationBytes;
         const u64 slack = stats.blockBytes - (std::min)(stats.blockBytes, stats.allocationBytes);
         // usage: the driver's figure for this process; budget: what the driver lets it use
         // (other programs' VRAM already taken out); size: the heap.
@@ -883,6 +937,80 @@ void TickVramStats(const Device& device, const VramCacheFigures& cache) {
                  guard.relocated - guard_previous.relocated,
                  (guard.relocated_bytes - guard_previous.relocated_bytes) >> 20);
         guard_previous = guard;
+    }
+    // Cycle 11 W3: per-category device memory and the VRAM diet counters (mt/c11_vram.h).
+    VideoCommon::C11Vram::LogStats(device_alloc_bytes);
+    // Cycle 13 V4 (EDEN_NX2_C13_STAGING_TRIM_CHECK / EDEN_NX2_C13_STATS): what the
+    // device-local VMA bytes are, beyond the texture cache's images.
+    if (VideoCommon::C13Vram::CensusOn() && allocator != nullptr) {
+        namespace C13 = VideoCommon::C13Vram;
+        VmaTotalStatistics total{};
+        vmaCalculateStatistics(allocator, &total);
+        std::string types;
+        u64 vma_alloc = 0;
+        u64 buffer_pool = 0;
+        u64 sparse_pool = 0;
+        for (u32 type = 0; type < properties.memoryTypeCount; ++type) {
+            const VkMemoryType& memory_type = properties.memoryTypes[type];
+            if ((properties.memoryHeaps[memory_type.heapIndex].flags &
+                 VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+                continue;
+            }
+            const VmaStatistics& st = total.memoryType[type].statistics;
+            if (st.blockCount == 0) {
+                continue;
+            }
+            vma_alloc += st.allocationBytes;
+            u64 pools[2]{};
+            for (const auto kind : {Device::SeparatePool::DeviceBuffers,
+                                    Device::SeparatePool::SparsePages}) {
+                if (const VmaPool pool = device.GetSeparatePool(kind, type)) {
+                    VmaStatistics pool_stats{};
+                    vmaGetPoolStatistics(allocator, pool, &pool_stats);
+                    pools[kind == Device::SeparatePool::DeviceBuffers ? 0 : 1] +=
+                        pool_stats.allocationBytes;
+                }
+            }
+            buffer_pool += pools[0];
+            sparse_pool += pools[1];
+            types += fmt::format("{}type {}{}: {} allocations {} MiB in {} blocks {} MiB (buffer "
+                                 "pool {}, sparse pool {})",
+                                 types.empty() ? "" : "; ", type,
+                                 (memory_type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                                     ? " host-visible"
+                                     : "",
+                                 st.allocationCount, st.allocationBytes >> 20, st.blockCount,
+                                 st.blockBytes >> 20, pools[0] >> 20, pools[1] >> 20);
+        }
+        const auto& g = C13::g_staging;
+        const auto load = [](const std::atomic<u64>& value) {
+            return value.load(std::memory_order_relaxed);
+        };
+        const auto& k = VideoCommon::C11Vram::g_categories;
+        const u64 images = C13::g_gauges.image_bytes;
+        const u64 staging_vram = load(g.device_vram_bytes) + load(g.upload_vram_bytes) +
+                                 load(g.download_vram_bytes);
+        const u64 stream_vram =
+            g.stream_vram.load(std::memory_order_relaxed) ? load(g.stream_bytes) : 0;
+        const u64 known = images + buffer_pool + staging_vram + stream_vram +
+                          k.decode_class_bytes + k.transcode_scratch_bytes;
+        LOG_INFO(Render_Vulkan,
+                 "C13 vram census (MiB): VMA device-local {} ({}); texture cache images {} "
+                 "(sparse pages {} of them), buffer pool {}; staging (frame {}) device-local {} "
+                 "in {} (idle >300 frames {}, in VRAM {}), upload {} in {} (idle {}, in VRAM "
+                 "{}), download {} in {} (idle {}, in VRAM {}), deferred {}; stream {} ({}); "
+                 "decode classes {}, transcode scratch {}; unattributed {}",
+                 vma_alloc >> 20, types, images >> 20, sparse_pool >> 20, buffer_pool >> 20,
+                 load(g.frame), load(g.device_bytes) >> 20, load(g.device_count),
+                 load(g.device_idle_bytes) >> 20, load(g.device_vram_bytes) >> 20,
+                 load(g.upload_bytes) >> 20, load(g.upload_count),
+                 load(g.upload_idle_bytes) >> 20, load(g.upload_vram_bytes) >> 20,
+                 load(g.download_bytes) >> 20, load(g.download_count),
+                 load(g.download_idle_bytes) >> 20, load(g.download_vram_bytes) >> 20,
+                 load(g.deferred), load(g.stream_bytes) >> 20,
+                 g.stream_vram.load(std::memory_order_relaxed) ? "VRAM" : "host",
+                 k.decode_class_bytes >> 20, k.transcode_scratch_bytes >> 20,
+                 (vma_alloc - (std::min)(vma_alloc, known)) >> 20);
     }
     frames = 0;
 }

@@ -18,6 +18,7 @@
 
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/mt/c10_vram.h"
+#include "video_core/mt/c13_vram.h"
 #include "video_core/mt/lite8_vram.h"
 
 #include "shader_recompiler/shader_info.h"
@@ -109,6 +110,16 @@ public:
     /// Cycle 10 A (EDEN_NX2_VRAM_GUARD): the image lives (partly) in host memory, so the
     /// collector may evict it to have it re-created in VRAM.
     [[nodiscard]] bool IsHostResident(const Image& image) const noexcept;
+
+    /// Cycle 13 V1 (EDEN_NX2_C13_OOM): driver allocation bytes since start (the
+    /// EDEN_NX2_VRAM_TIMING wrappers' counter; 0 with them off), the episode's load signal.
+    [[nodiscard]] u64 C13AllocatedBytes() const noexcept {
+        return Lite8Vram::g_counters.alloc_bytes.load(std::memory_order_relaxed);
+    }
+
+    /// Cycle 13 V1: VMA allocation and block bytes of the device-local heaps (the floor's
+    /// non-texture part).
+    void C13DeviceVmaBytes(u64& alloc_bytes, u64& block_bytes) const;
 
     void LogMemoryStatistics() const;
 
@@ -325,6 +336,36 @@ public:
     };
     std::unordered_map<u64, PersistentDecode> persistent_decodes;
     u64 vram_frame{}; ///< Batch 8 U4: TickVram calls
+    /// Cycle 11 V1 (EDEN_NX2_C11_DROP1X, mt/c11_vram.h): 1x originals rescaled images dropped,
+    /// destroyed in TickFrame once the GPU is past the tick (first).
+    std::deque<std::pair<u64, vk::Image>> c11_dropped_originals;
+    /// Cycle 13 V2 (EDEN_NX2_C13_RELOC): host-memory backings an Image::C13Rebind replaced and
+    /// the views / framebuffers made on them, destroyed in TickFrame once the GPU is past `tick`.
+    struct C13Retired {
+        u64 tick{};
+        vk::Image image;
+        std::vector<vk::ImageView> views;
+        std::unique_ptr<ImageView> view_a;
+        std::unique_ptr<ImageView> view_b;
+        std::unique_ptr<Framebuffer> framebuffer_a;
+        std::unique_ptr<Framebuffer> framebuffer_b;
+    };
+    std::deque<C13Retired> c13_retired;
+    /// EDEN_NX2_C13_RELOC_CHECK: tiles of the old and the new backing read back by a rebind
+    /// (old tiles at [0, tiles), new at [2, 2 + tiles) times C13CheckStride), compared in
+    /// TickFrame once the GPU is past `tick`.
+    struct C13Check {
+        u64 tick{};
+        StagingBufferRef ref{};
+        u64 compare_bytes{};
+        u32 tiles{};
+        u64 gpu_addr{};
+        u32 width{};
+        u32 height{};
+        u32 format{};
+    };
+    static constexpr u64 C13CheckStride = u64{64} * 64 * 16;
+    std::deque<C13Check> c13_checks;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;
@@ -523,7 +564,38 @@ public:
 
     /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
-        return original_image.GetMemoryBlock();
+        // Cycle 11 V1: a rescaled image whose 1x original was dropped lives in its scaled copy.
+        return original_image ? original_image.GetMemoryBlock() : scaled_image.GetMemoryBlock();
+    }
+
+    /// Cycle 11 V1 (EDEN_NX2_C11_DROP1X): frees the 1x original of a rescaled image that has not
+    /// needed it for `min_age` runtime frames (once the GPU is done with it). Returns the bytes
+    /// freed, 0 when refused (not eligible; see mt/c11_vram.h). ScaleDown re-creates it.
+    u64 C11DropOriginal(u64 min_age);
+
+    /// Cycle 11 V1: the 1x original is dropped (the image is rescaled, its scaled copy holds it).
+    [[nodiscard]] bool C11OriginalDropped() const noexcept {
+        return c11_original_dropped;
+    }
+
+    /// Cycle 13 V2 (EDEN_NX2_C13_RELOC): gives every host-resident part (1x original, scaled
+    /// copy) a new device-local backing within the budget, filled by a GPU copy of the old one
+    /// (retired once the GPU is done); helper and storage views made on the old handles are
+    /// retired too (re-created on demand). The caller drops the cache's views and framebuffers
+    /// (TextureCache::InvalidateScale). `check`: also read back two tiles of both backings.
+    VideoCommon::C13Vram::RebindResult C13Rebind(bool check);
+
+    /// Cycle 13: bytes of this image's memory in host memory (0 = all in VRAM).
+    [[nodiscard]] u64 C13HostBytes() const noexcept {
+        return original_residency.Bytes() + scaled_residency.Bytes();
+    }
+
+    /// Cycle 11 V3: device memory of the 1x original (0 when dropped / none) and scaled copy.
+    [[nodiscard]] u64 C11OriginalBytes() const noexcept {
+        return original_image ? original_image.GetMemoryBlock().size : 0;
+    }
+    [[nodiscard]] u64 C11ScaledBytes() const noexcept {
+        return scaled_image ? scaled_image.GetMemoryBlock().size : 0;
     }
 
     /// Returns true when the image is already initialized and mark it as initialized
@@ -583,6 +655,12 @@ private:
     bool BlitScaleHelper(bool scale_up);
 
     bool NeedsScaleHelper() const;
+
+    /// Cycle 11 V1: makes the dropped 1x original again and blits the scaled contents into it.
+    void C11RecreateOriginal(bool for_upload);
+
+    /// Cycle 11 V1: notes that the 1x original was just needed (runtime frame).
+    void C11Note1xUse() noexcept;
 
     Scheduler* scheduler{};
     TextureCacheRuntime* runtime{};
@@ -702,6 +780,11 @@ private:
     std::optional<Framebuffer> normal_framebuffer;
     std::unique_ptr<ImageView> scale_view;
     std::unique_ptr<ImageView> normal_view;
+
+    /// Cycle 11 V1 (EDEN_NX2_C11_DROP1X): original_image was freed while rescaled.
+    bool c11_original_dropped = false;
+    /// Runtime frame (TextureCacheRuntime::vram_frame) the 1x original was last needed.
+    u64 c11_last_1x_frame = 0;
 };
 
 class ImageView : public VideoCommon::ImageViewBase {
@@ -749,6 +832,10 @@ public:
 
     [[nodiscard]] VkImage ImageHandle() const noexcept {
         return image_handle;
+    }
+
+    [[nodiscard]] const Image* BackingImage() const noexcept {
+        return slot_images && image_id ? &(*slot_images)[image_id] : nullptr;
     }
 
     [[nodiscard]] VkImageView RenderTarget() const noexcept {
@@ -883,6 +970,15 @@ public:
     /// HandleFor without creating a variant (any thread): VK_NULL_HANDLE when it is missing.
     [[nodiscard]] VkSampler TryHandleFor(const ImageView& image_view, bool is_depth) const noexcept;
 
+    /// The guest descriptor and the host state built from it, for the frame dump.
+    [[nodiscard]] const Tegra::Texture::TSCEntry& Descriptor() const noexcept {
+        return descriptor;
+    }
+
+    [[nodiscard]] const VkSamplerCreateInfo& CreateInfo() const noexcept {
+        return base_ci;
+    }
+
 private:
     struct VariantKey {
         bool reduce_anisotropy;
@@ -923,6 +1019,7 @@ private:
     static inline std::mutex variant_mutex;
 
     const Device* device_ptr{nullptr};
+    Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};
     std::array<float, 4> border_color{};

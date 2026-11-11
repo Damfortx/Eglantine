@@ -175,7 +175,7 @@ public:
         });
     }
 
-    /// Call 'func' for each range the guest CPU has read back (Preflushable), keeping the marks
+    /// Call 'func' for each range marked Preflushable
     template <typename Func>
     void ForEachPreflushableRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
         IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {

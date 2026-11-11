@@ -40,6 +40,8 @@
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/mt/c10_vram.h"
+#include "video_core/mt/c11_vram.h"
+#include "video_core/mt/c13_vram.h"
 #include "video_core/mt/concurrent_map.h"
 #include "video_core/mt/page_counter.h"
 #include "video_core/mt/stable_slot_vector.h"
@@ -60,6 +62,10 @@ struct ChannelState;
 } // namespace Tegra
 
 namespace VideoCommon {
+
+/// Set around a 2D blit to read its source as this format instead of the surface's (for formats the
+/// 2D engine has no surface format for, e.g. E5B9G9R9 by the NX2 upscale stand-in). GPU thread only.
+inline thread_local std::optional<VideoCore::Surface::PixelFormat> g_blit_source_format;
 
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
@@ -156,6 +162,17 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Batch 9 U2 (EDEN_NX2_TC_BUDGET_AUTO): thresholds come from the driver budget, so
     /// ApplyThresholdOverrides leaves out the MaxCriticalMemory cap.
     bool budget_auto_caps{};
+    /// Cycle 13 W1 (mt/c13_vram.h). V1 EDEN_NX2_C13_OOM: episode state of the out-of-memory
+    /// margin, the cycle 12 rule's margin while it is a shadow, the last driver budget read, the
+    /// measured non-evictable floor and (CHECK) both rules' critical thresholds.
+    C13Vram::OomState c13_oom;
+    u64 c13_old_margin{};
+    u64 c13_budget{};
+    u64 c13_floor{};
+    u64 c13_old_critical{};
+    u64 c13_new_critical{};
+    /// V2 EDEN_NX2_C13_RELOC: no relocation attempt before this frame (allocation failed).
+    u64 c13_reloc_backoff_until{};
     /// EDEN_NX2_TC_CHURN (Lite9Vram::ChurnStatsOn): 10 s eviction / ASTC re-decode counters.
     struct ChurnStats {
         u64 evictions{};
@@ -298,6 +315,12 @@ public:
     [[nodiscard]] u64 FrameTick() const noexcept {
         return frame_tick;
     }
+    /// Cycle 11 (W3 for W4's EDEN_NX2_C11_REPEAT): advances whenever WriteMemory, UnmapMemory or
+    /// UnmapGPUMemory marked (or deleted) any image as CPU modified, so a memo whose epoch is
+    /// unchanged knows no image needs RefreshContents for CPU writes since it was taken.
+    [[nodiscard]] u64 CpuModifiedEpoch() const noexcept {
+        return cpu_modified_epoch.load(std::memory_order_acquire);
+    }
 
     /// For a memo with the same channel, view epoch and bindings serial: whether FillImageViews
     /// and GetSamplerId would return memo_views / memo_samplers for these handles while doing
@@ -312,6 +335,15 @@ public:
                                                 std::span<const u32> sampler_handles,
                                                 std::span<const SamplerId> memo_samplers,
                                                 bool blacklist, u64& touch_tick);
+
+    /// EDEN_NX2_C11_REPEAT: TryReuseGraphicsBindings for a draw whose TIC/TSC table addresses,
+    /// limits, handles and entry bytes the sequencer found byte-identical to the capture that
+    /// set the memo (same channel, view epoch and bindings serial: checked by the caller). The
+    /// entries need no reading then; only the images are checked: no CPU writes to upload, no
+    /// aliases, no rescaled image under a blacklisted view. `apply` false: the check only.
+    [[nodiscard]] bool TryRepeatGraphicsBindings(std::span<ImageViewInOut> views,
+                                                 std::span<const ImageViewId> memo_views,
+                                                 bool blacklist, bool apply, u64& touch_tick);
 
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
@@ -342,6 +374,10 @@ public:
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
+
+    [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
+        return render_targets;
+    }
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
@@ -553,6 +589,10 @@ private:
     /// last) while under critical, so they are re-created in VRAM on their next use.
     void RelocateHostImages();
 
+    /// Cycle 11 W3 (mt/c11_vram.h), once a frame from TickFrame: V1 DROP1X sweep (frees the 1x
+    /// originals of rescaled render targets) and V3 category walk (EDEN_NX2_VRAM_STATS).
+    void C11VramTick();
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
@@ -704,6 +744,7 @@ private:
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
     u64 view_epoch = 0; ///< See ViewEpoch
+    std::atomic<u64> cpu_modified_epoch{0}; ///< Cycle 11, see CpuModifiedEpoch
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

@@ -27,7 +27,7 @@ shared file. nx2.h is read-only for everyone (switches go to each piece's own he
 | W2 REGDEDUP | new mt/regdedup.h; dma_pusher.cpp: CallMethod, CallMultiMethod, ProcessCommands; maxwell_3d.cpp: FrontWrite, FrontWriteRun, FrontCallMethod, FrontCallMultiMethod, FrontRunMacro, CallMethod, CallMultiMethod, ProcessMethodCall; macro JIT/interpreter write callbacks (macro*.cpp/h) |
 | W3 drains | new mt/lite6_drain_switches.h; puller.cpp, gpu_split.cpp, gpu_split.h (everything except W1's hold lines), maxwell_3d.cpp: FrontDmaRead, FrontNoteWrites; kepler_compute.cpp, maxwell_dma.cpp, kepler_memory.cpp |
 | W4 FRONT2 | new mt/front2.h; design section of this doc; code hooks only if a clean design exists (DispatchCalls entry, single call site) |
-| W5 split-screen bench | /home/appo/src/eglantine-buildenv/tools/splitscreen/ only (README + scripts); no src edits |
+| W5 split-screen bench | $HOME/src/eglantine-buildenv/tools/splitscreen/ only (README + scripts); no src edits |
 | coordinator | this doc, build, integration fixes, commits, docs/mt-pending-runtime-checks.md |
 
 ## W1 GPUPARAM v2 (EDEN_NX2_MT_LITE_GPUPARAM2, on under MT_LITE; EDEN_NX2_GPUPARAM2 without MT)
@@ -202,7 +202,7 @@ channel every 10 s (lists, entries, headers, records, data/puller words, GPU-wri
 entries, barriers, words between barriers histogram, dry decode us/s). Revisit only if barriers
 < ~2k/s and dry decode > ~60 ms/s. EDEN_NX2_MT_LITE_FRONT2=1 only logs a warning.
 
-## W5 split-screen bench (/home/appo/src/eglantine-buildenv/tools/splitscreen/)
+## W5 split-screen bench ($HOME/src/eglantine-buildenv/tools/splitscreen/)
 eden-cli cannot play TAS scripts (only the Qt frontend drives Tas::UpdateThread / Ctrl+F5), so the
 default route uses eden-cli's existing EDEN_NX2_KEY_SCRIPT (key presses by present count) with a
 config copy where player 2 is a second Pro Controller on its own keyboard keys (mkconfig.py; the

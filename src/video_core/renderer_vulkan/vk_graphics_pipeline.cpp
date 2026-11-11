@@ -5,10 +5,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <optional>
+#include <cstddef>
 #include <span>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -20,8 +24,10 @@
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/gpu_split.h"
+#include "video_core/mt/c11_commit.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -424,8 +430,60 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
     transitions.push_back(transition);
 }
 
+bool GraphicsPipeline::C13SelectTextureWay(u64 repeat_of) {
+    // EDEN_NX2_C13_MEMO_WAYS (cycle 13 W4, video_core/mt/c13_memo.h). tex_memo is the active
+    // way (the one ConfigureImpl uses and fills); c13_tex_ways the kept ones, most recent first.
+    // Every way keeps its own packet_seq, channel, epochs and layout: the repeat path checks
+    // them as it checks the single memo, so a way that is not this draw's is a miss.
+    namespace M13 = VideoCommon::MT;
+    const u32 ways = M13::C13MemoWaysNow();
+    if (ways <= 1) {
+        return false;
+    }
+    const size_t kept = static_cast<size_t>(ways - 1);
+    if (c13_tex_ways.size() < kept) {
+        c13_tex_ways.resize(kept);
+    }
+    M13::C13MemoCounters& c13c = M13::g_c13_memo;
+    if (repeat_of != 0) {
+        M13::C13Add(c13c.tex_lookups);
+        if (tex_memo.valid && tex_memo.packet_seq == repeat_of) {
+            M13::C13Add(c13c.tex_active);
+            return true;
+        }
+        for (size_t k = 0; k < kept; ++k) {
+            TextureMemo& way = c13_tex_ways[k];
+            if (!way.valid || way.packet_seq != repeat_of) {
+                continue;
+            }
+            // Swap it in; the old active memo becomes the most recent kept way.
+            std::swap(tex_memo, way);
+            std::rotate(c13_tex_ways.begin(), c13_tex_ways.begin() + static_cast<std::ptrdiff_t>(k),
+                        c13_tex_ways.begin() + static_cast<std::ptrdiff_t>(k + 1));
+            M13::C13Add(c13c.tex_spare);
+            return true;
+        }
+        M13::C13Add(c13c.tex_missing);
+    }
+    // This draw fills tex_memo: keep the active memo of a packet as the most recent way and
+    // overwrite the least recent one instead.
+    if (tex_memo.valid && tex_memo.packet_seq != 0) {
+        std::swap(tex_memo, c13_tex_ways[kept - 1]);
+        std::rotate(c13_tex_ways.begin(),
+                    c13_tex_ways.begin() + static_cast<std::ptrdiff_t>(kept - 1),
+                    c13_tex_ways.begin() + static_cast<std::ptrdiff_t>(kept));
+        tex_memo.valid = false;
+        tex_memo.packet_seq = 0;
+        M13::C13Add(c13c.tex_rotate);
+    }
+    return true;
+}
+
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+    // EDEN_NX2_C13_COMMIT_PROFILE (cycle 13 W4c): the committer's sampled draws are timed by
+    // phase (no-ops on other threads and unsampled draws).
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::PreConfigure);
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -436,11 +494,29 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // memo on, sampler handles are resolved after reading (GetSamplerId only on a miss).
     static const char tex_memo_mode = Tegra::Nx2EnvMode("EDEN_NX2_TEX_MEMO");
     const MtResolvedTextures* const resolved_textures = mt_resolved_textures;
-    const bool use_memo = num_image_elements != 0 && resolved_textures == nullptr &&
+    // EDEN_NX2_C11_REPEAT: a draw packet's Configure keeps the memo too (tagged with its seq);
+    // only TEX_MEMO tries TryReuseGraphicsBindings on it.
+    const MtRepeatDraw* const mt_repeat = mt_repeat_draw;
+    // EDEN_NX2_C12_COMMIT_REPEAT: a draw with only the buffer half on keeps no packet memo.
+    const MtRepeatDraw* const repeat_draw =
+        mt_repeat != nullptr && mt_repeat->textures ? mt_repeat : nullptr;
+    const bool memo_try = num_image_elements != 0 && resolved_textures == nullptr &&
                           Tegra::Nx2Switch(tex_memo_mode, false);
+    const bool use_memo = memo_try || (num_image_elements != 0 && resolved_textures == nullptr &&
+                                       repeat_draw != nullptr);
     if (!use_memo) {
         tex_memo.valid = false; // The switch may come back on: whatever happened meanwhile
+        for (TextureMemo& way : c13_tex_ways) {
+            way.valid = false;
+        }
+    } else if (repeat_draw != nullptr && !memo_try) {
+        // EDEN_NX2_C13_MEMO_WAYS (cycle 13 W4): the texture memo by packet keeps one entry per
+        // way, so repeat_of may name the other view's packet (tex_memo becomes that way).
+        C13SelectTextureWay(repeat_draw->repeat_of);
     }
+    // Set again below once this draw kept or used the memo (an exception leaves it 0).
+    const u64 memo_packet_seq = tex_memo.packet_seq;
+    tex_memo.packet_seq = 0;
     boost::container::small_vector<u32, 96> sampler_handles;
     if (use_memo) {
         sampler_handles.reserve(num_textures);
@@ -453,6 +529,101 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
 
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+
+    // EDEN_NX2_C11_REPEAT: the sequencer found this draw's texture inputs byte-identical to the
+    // capture that set the memo: no handle reads, TIC/TSC reads or descriptor pushes, only the
+    // image checks (TryRepeatGraphicsBindings). With EDEN_NX2_C11_REPEAT_CHECK the full path runs
+    // instead and is compared with the memo (repeat_check).
+    bool repeat_hit = false;
+    bool repeat_check = false;
+    std::optional<TextureMemo> repeat_saved;
+    if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers) {
+        if (use_memo && repeat_draw != nullptr && repeat_draw->repeat_of != 0) {
+            auto& c11 = VideoCommon::MT::g_c11_commit;
+            const bool c11_stats = VideoCommon::MT::C11RepeatStats();
+            if (c11_stats) {
+                c11.packets_flagged.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!tex_memo.valid || memo_packet_seq != repeat_draw->repeat_of) {
+                if (c11_stats) {
+                    c11.refused_seq.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else if (tex_memo.channel != texture_cache.ChannelStateTag() ||
+                       tex_memo.view_epoch != texture_cache.ViewEpoch() ||
+                       tex_memo.bindings_serial != texture_cache.TextureBindingsSerial() ||
+                       tex_memo.layout_gen != repeat_draw->layout_gen ||
+                       tex_memo.view_ids.size() != num_image_elements ||
+                       tex_memo.view_handles.size() != num_image_elements ||
+                       tex_memo.view_blacklist.size() != num_image_elements ||
+                       tex_memo.sampler_ids.size() != num_textures ||
+                       tex_memo.sampler_handles.size() != num_textures) {
+                if (c11_stats) {
+                    c11.refused_state.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                for (size_t i = 0; i < num_image_elements; ++i) {
+                    views.push_back({
+                        .index = tex_memo.view_handles[i],
+                        .blacklist = tex_memo.view_blacklist[i] != 0,
+                        .id = {},
+                    });
+                }
+                const bool check = VideoCommon::MT::C11RepeatCheck();
+                const bool clean = texture_cache.TryRepeatGraphicsBindings(
+                    std::span(views.data(), views.size()), tex_memo.view_ids, Spec::has_images,
+                    !check, tex_memo.touch_tick);
+                if (!clean) {
+                    views.clear();
+                    if (c11_stats) {
+                        c11.refused_image.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else if (check) {
+                    views.clear();
+                    repeat_check = true;
+                    repeat_saved.emplace(tex_memo);
+                } else {
+                    repeat_hit = true;
+                    sampler_handles.assign(tex_memo.sampler_handles.begin(),
+                                           tex_memo.sampler_handles.end());
+                    if (c11_stats) {
+                        c11.taken.fetch_add(1, std::memory_order_relaxed);
+                        if (tex_memo.cpu_epoch != texture_cache.CpuModifiedEpoch()) {
+                            c11.cpu_epoch_moved.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::TexResolve);
+    // EDEN_NX2_C12_COMMIT_REPEAT, buffer half (cycle 12 W2, video_core/mt/c12_commit.h): the
+    // pipeline's buffer memo instead of resolving every uniform/storage binding again
+    // (BufferCache::C12UpdateGraphicsBuffers, which also refuses transform feedback and indirect
+    // draws). Not with texture buffers (bound from the views) or a resolver's result.
+    bool c12_buffers = false;
+    if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers) {
+        c12_buffers = mt_repeat != nullptr && mt_repeat->c12_buffers &&
+                      resolved_textures == nullptr;
+    }
+    const auto update_graphics_buffers = [&] {
+        if (c12_buffers) {
+            // EDEN_NX2_C13_MEMO_WAYS, M2: the memo's ways (way 0 is c12_buffer_memo); set (or
+            // cleared) before every call, so a throw can't leave another pipeline's set behind.
+            const u32 buffer_ways = VideoCommon::MT::C13MemoWaysNow();
+            if (buffer_ways > 1) {
+                c13_buffer_ways.Ensure();
+                c13_buffer_ways.active = buffer_ways;
+                VideoCommon::MT::t_c13_buffer_ways = &c13_buffer_ways;
+            } else {
+                VideoCommon::MT::t_c13_buffer_ways = nullptr;
+            }
+            buffer_cache.C12UpdateGraphicsBuffers(c12_buffer_memo, is_indexed);
+            VideoCommon::MT::t_c13_buffer_ways = nullptr;
+        } else {
+            buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        }
+    };
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
@@ -469,7 +640,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 for (const auto& desc : info.storage_buffers_descriptors) {
                     ASSERT(desc.count == 1);
                     buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                           desc.cbuf_offset, desc.is_written);
+                                                           desc.cbuf_offset, desc.is_written,
+                                                           desc.indirect_offset);
                     ++ssbo_index;
                 }
             }
@@ -579,7 +751,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers) {
             auto& helper = VideoCommon::BackHelper::Get();
             if (num_image_elements != 0 && regs.transform_feedback_enabled == 0 &&
-                resolved_textures == nullptr && helper.Enabled()) {
+                resolved_textures == nullptr && !repeat_hit && helper.Enabled()) {
                 static const bool fork_stats = std::getenv("EDEN_NX2_FORK_STATS") != nullptr;
                 u64 job_ns = 0;
                 auto texture_job = [&] {
@@ -607,9 +779,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
                 {
                     Profile::Scope update_scope{Profile::Zone::UpdateBuffers};
-                    buffer_cache.UpdateGraphicsBuffers(is_indexed);
+                    update_graphics_buffers();
                     buffer_cache.BindHostGeometryBuffers(is_indexed);
                 }
+                VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::BufResolve);
                 const auto join_begin = fork_stats ? std::chrono::steady_clock::now()
                                                    : std::chrono::steady_clock::time_point{};
                 helper.Join();
@@ -641,6 +814,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 samplers.assign(resolved_textures->samplers.begin(),
                                 resolved_textures->samplers.end());
                 views_clean = true;
+            } else if (repeat_hit) {
+                config_stages(1); // EDEN_NX2_C11_REPEAT: the views came from the memo
             } else {
                 config_stages(3);
             }
@@ -681,8 +856,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             window = std::chrono::steady_clock::now();
         }
     }
-    bool memo_hit = false;
-    if (use_memo) {
+    bool memo_hit = repeat_hit;
+    if (use_memo && !repeat_hit) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         const auto same_view_handles = [&] {
             if (tex_memo.view_handles.size() != views.size()) {
@@ -696,7 +871,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             return true;
         };
         // Handles first (cheap), then every TIC/TSC entry and image state in the cache.
-        memo_hit = tex_memo.valid && tex_memo.channel == texture_cache.ChannelStateTag() &&
+        memo_hit = memo_try && !repeat_check && tex_memo.valid &&
+                   tex_memo.channel == texture_cache.ChannelStateTag() &&
                    tex_memo.view_epoch == texture_cache.ViewEpoch() &&
                    tex_memo.bindings_serial == texture_cache.TextureBindingsSerial() &&
                    same_view_handles() &&
@@ -718,6 +894,32 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
+    }
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::TexResolve);
+    if (RecordingSampledTextures()) {
+        sampled_images.clear();
+        size_t view_index{};
+        size_t sampler_index{};
+        for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {
+            if (!Spec::enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            if constexpr (Spec::has_texture_buffers) {
+                view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            }
+            if constexpr (Spec::has_image_buffers) {
+                view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+            }
+            const u32 textures = Shader::NumDescriptors(info.texture_descriptors);
+            for (u32 texture = 0; texture < textures; ++texture, ++view_index, ++sampler_index) {
+                sampled_images.push_back({static_cast<u32>(stage), views[view_index].index,
+                                          views[view_index].id, samplers[sampler_index]});
+            }
+            if constexpr (Spec::has_images) {
+                view_index += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }
     }
 
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
@@ -801,16 +1003,19 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
 
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::TexResolve); // texture buffers
     if (!forked) {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
-        buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        update_graphics_buffers();
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::BufResolve);
 
     {
         Profile::Scope scope{Profile::Zone::DescriptorAcquire};
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
     }
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::DescAcquire);
 
     if (MtShadowSink* const sink = mt_shadow_sink) [[unlikely]] {
         sink->filled = true;
@@ -845,6 +1050,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
             buffer_cache.BindHostStageBuffers(stage);
         }
+        VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::StageBind);
         // The stage's image entries follow its buffer entries in the payload: a memo hit
         // replays them at the same position.
         if (memo_hit) {
@@ -901,6 +1107,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
                                  static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
         }
+        VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::PushDescriptors);
     }};
     if constexpr (Spec::enabled_stages[0]) {
         prepare_stage(0);
@@ -938,18 +1145,56 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         tex_memo.sampler_handles.assign(sampler_handles.begin(), sampler_handles.end());
         tex_memo.sampler_ids.assign(samplers.begin(), samplers.end());
+        tex_memo.view_blacklist.resize(views.size());
+        for (size_t i = 0; i < views.size(); ++i) {
+            tex_memo.view_blacklist[i] = views[i].blacklist ? 1 : 0;
+        }
+        tex_memo.cpu_epoch = texture_cache.CpuModifiedEpoch();
         tex_memo.valid = true;
+        if (repeat_check) {
+            // EDEN_NX2_C11_REPEAT_CHECK: what the repeat path would have used vs the full path.
+            const TextureMemo& was = *repeat_saved;
+            const bool same =
+                was.view_ids == tex_memo.view_ids && was.sampler_ids == tex_memo.sampler_ids &&
+                was.rescaling == tex_memo.rescaling && was.stage_begin == tex_memo.stage_begin &&
+                was.stage_count == tex_memo.stage_count &&
+                was.written_images == tex_memo.written_images &&
+                was.entries.size() == tex_memo.entries.size() &&
+                (was.entries.empty() ||
+                 std::memcmp(was.entries.data(), tex_memo.entries.data(),
+                             was.entries.size() * sizeof(DescriptorUpdateEntry)) == 0);
+            auto& c11 = VideoCommon::MT::g_c11_commit;
+            c11.checks.fetch_add(1, std::memory_order_relaxed);
+            if (!same) {
+                c11.check_mismatches.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<u32> reported{};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_ERROR(Render_Vulkan,
+                              "C11 repeat check: draw {} (repeat of {}) differs from the memo "
+                              "({} views, {} samplers, {} entries)",
+                              repeat_draw->seq, repeat_draw->repeat_of, views.size(),
+                              samplers.size(), tex_memo.entries.size());
+                }
+            }
+        }
+    }
+    if (use_memo && repeat_draw != nullptr && tex_memo.valid) {
+        // EDEN_NX2_C11_REPEAT: the memo now describes this packet's texture inputs.
+        tex_memo.packet_seq = repeat_draw->seq;
+        tex_memo.layout_gen = repeat_draw->layout_gen;
     }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::PushDescriptors); // rescaling, texture memo fill
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
         texture_cache.CheckFeedbackLoop(
             std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
     }
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::RenderTargets);
     if (MtShadowSink* const sink = mt_shadow_sink) [[unlikely]] {
         const auto* const begin =
             static_cast<const DescriptorUpdateEntry*>(guest_descriptor_queue.UpdateData());
@@ -962,7 +1207,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
-    return ConfigureDraw(rescaling, render_area);
+    const bool configured = ConfigureDraw(rescaling, render_area);
+    VideoCommon::MT::C13ProfMark(VideoCommon::MT::C13Phase::ConfigureDraw);
+    return configured;
 }
 
 bool GraphicsPipeline::ConfigureResolved(bool is_indexed) {

@@ -1,6 +1,6 @@
 # Pending runtime checks (run with the PC idle)
 
-From /home/appo/src/eglantine-buildenv/tools; BIN=/home/appo/src/Eglantine-mt/build/pgo/bin/eden-cli.
+From $HOME/src/eglantine-buildenv/tools; BIN=$HOME/src/Eglantine-mt/build/pgo/bin/eden-cli.
 Results in runs/log-<tag>.txt and runs/cli-<tag>.out.
 
 ## Phase 4 (commits 05d55b8..e5ff281)
@@ -19,7 +19,7 @@ EDEN_NX2_MT_BATCH=N (16), EDEN_NX2_MT_EBR=0|1 (on with MT). `grep "MT resolvers/
 per-resolver draws/s, batch size, busy/wait %, sampler creations, ok/committed/slow (by
 reason)/missing, validation failures by reason, batches, commit wait ms, ring waits,
 barriers, shadow checks/mismatches/unvalidated and EBR pending.
-0. Standalone stress tests (no emulator, any time): `docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v /home/appo/src:/home/appo/src -w /home/appo/src/Eglantine-mt eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all` -> RESULT: ALL PASS, sanitizer_reports=0 (tsan and asan).
+0. Standalone stress tests (no emulator, any time): `docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v $HOME/src:$HOME/src -w $HOME/src/Eglantine-mt eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all` -> RESULT: ALL PASS, sanitizer_reports=0 (tsan and asan).
 1. Neutrality of S0-S4 (EBR deferral, packet v2, R1): `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_RESOLVERS=0 EDEN_NX2_MT_STATS=1 ./demo.sh $BIN 120 mt5-k0` vs `mt-free`: same fps, no new errors; packet B avg grows a little (v2 arrays). Also once with EDEN_NX2_MT unset (sampler variant array, ResolveInfo/ConfigureDraw split, erase_then order) vs `mt-off`.
 2. In-emulator selftest: `EDEN_NX2_MT=1 EDEN_NX2_MT_SELFTEST=1 ...`; `grep "MT selftest"`: all PASS incl. p5_t1..p5_t7.
 3. Shadow, lockstep (exact memory): `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_SHADOW=1 EDEN_NX2_MT_VERIFY=1 EDEN_NX2_MT_STATS=1 ./demo.sh $BIN 120 mt5-shadow-verify`; `grep "MT shadow\|MT verify\|MT resolvers" runs/cli-mt5-shadow-verify.out`. Expect 0 "MT shadow:" lines (fields: 1 view count, 2 view id, 3/4 samplers, 5-8 buffer ids by kind ubo/ssbo/vertex/index, 9 rescaling, 10/11 image descriptor entries), shadow checks > 0, slow mostly view-not-clean/view-map-miss/buffer-miss early then low; resolved ok % = ok/(ok+slow).
@@ -32,7 +32,7 @@ barriers, shadow checks/mismatches/unvalidated and EBR pending.
 Not implemented yet (no runtime check): resolver UBO ring/buffer half of the commit (RUBO), descriptor-buffer blocks (RDESC/S9), PIPE=resolver (S10), POD replay (5b, EDEN_NX2_MT_REPLAY is read but unused).
 
 ## Phases 6 and 7 (branch mkw-mt-seq, commits b2f6ae8..)
-BIN=/home/appo/src/Eglantine-mt2/build/pgo/bin/eden-cli. New switches (all inert with EDEN_NX2_MT unset):
+BIN=$HOME/src/Eglantine-mt2/build/pgo/bin/eden-cli. New switches (all inert with EDEN_NX2_MT unset):
 EDEN_NX2_MT_TRAPLOCK (on), EDEN_NX2_MT_LOCKSCOPE (on), EDEN_NX2_MT_COND (on), EDEN_NX2_MT_INDIRECT (on),
 EDEN_NX2_MT_DRAWTEX (on), EDEN_NX2_MT_DMA=packet (default serial), EDEN_NX2_MT_UBO_GEN=1 (default off),
 EDEN_NX2_GPU_TIMESTAMPS=1 (any MT mode).
@@ -75,7 +75,7 @@ All runs: 120 s, clean "committer stopped", no exit hang.
 Commits: a71c376 RBUF (+ epoch guard for the trap-path slot reads), 0a7f905 COMPACT, d9cec9a
 FLUSHCMD, 10a4d2d REPLAY (+ t9/t10 selftests), a37157d RREFRESH. Nothing below was run in the
 emulator yet (compile + standalone TSan/ASan only).
-BIN=/home/appo/src/Eglantine-mt/build/pgo/bin/eden-cli, from /home/appo/src/eglantine-buildenv/tools
+BIN=$HOME/src/Eglantine-mt/build/pgo/bin/eden-cli, from $HOME/src/eglantine-buildenv/tools
 (`./demo.sh $BIN 120 <tag>`, results in runs/cli-<tag>.out and runs/log-<tag>.txt). Every switch
 below is inert with EDEN_NX2_MT unset and ON by default under EDEN_NX2_MT=1:
 | switch | step | what =0 restores |
@@ -88,7 +88,7 @@ below is inert with EDEN_NX2_MT unset and ON by default under EDEN_NX2_MT=1:
 Older ones still worth flipping when bisecting: EDEN_NX2_MT_RCOMMIT, EDEN_NX2_MT_COMPUTE=serial,
 EDEN_NX2_MT_ADAPTIVE, EDEN_NX2_MT_RESOLVERS=0.
 
-0. Standalone (any time, already PASS at commit time): `docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v /home/appo/src:/home/appo/src -w /home/appo/src/Eglantine-mt eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all`
+0. Standalone (any time, already PASS at commit time): `docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v $HOME/src:$HOME/src -w $HOME/src/Eglantine-mt eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all`
    -> RESULT: ALL PASS, sanitizer_reports=0 for tsan and asan; new: t8_uniform_ring (resolver ring
    lifetime vs a simulated GPU), t9_packet_replica (compact TIC/TSC + uniform replicas, skipping
    reader), t10_replay_arena (replay blocks, elision, worker order).
@@ -140,8 +140,8 @@ EDEN_NX2_ALT_SECONDS A/B windows):
 | EDEN_NX2_MT_EBR_LAZY (alt) | P8 | epoch collection takes both cache mutexes every batch / 16 draws |
 | EDEN_NX2_MT_RALIAS (alt) | P9 | views of aliased images are view-not-clean (committer slow path) |
 | EDEN_NX2_MT_DMA_CONSUMED (alt) | P10 | MME DMA reads (WaitForWriters, the non-GPU-written Drain) wait for `settled` of everything sent |
-BIN=<mkw-mt build>/build/pgo/bin/eden-cli, from /home/appo/src/eglantine-buildenv/tools.
-0. Standalone (no emulator): `docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v /home/appo/src:/home/appo/src -w <tree> eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all` -> ALL PASS, sanitizer_reports=0 (new t11_lazy_wake).
+BIN=<mkw-mt build>/build/pgo/bin/eden-cli, from $HOME/src/eglantine-buildenv/tools.
+0. Standalone (no emulator): `docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v $HOME/src:$HOME/src -w <tree> eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all` -> ALL PASS, sanitizer_reports=0 (new t11_lazy_wake).
 1. fps, defaults: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_STATS=1 ./demo.sh $BIN 120 perf-free` + portal screenshot. Compare with the 35 fps baseline and MT unset (47.9-51.1).
    With EDEN_NX2_GPU_PROFILE=1 once (costs fps): "GPU split drains per second" dma read / writers (dma read) wait ms should drop sharply (P10).
    In the stats: "MT stats/s ... commands: uniform" ~0 (P2); "MT resolvers/s ... N per batch" >= 4 and "batches" well under draws/2 (P3/P4); "MT stages ms/s: sequencer draws" per draw packet (target <= ~5 us); "view-not-clean N (aliases A, buffer B, cpu C, sparse D, dead E, rescaled F, cpu+alias G)" tells what still takes the committer's slow path; committer idle.
@@ -151,8 +151,8 @@ BIN=<mkw-mt build>/build/pgo/bin/eden-cli, from /home/appo/src/eglantine-builden
 5. A/B of the "alt" ones in one run: e.g. `EDEN_NX2_ALT_RANDOM=1 EDEN_NX2_ALT_SECONDS=2 EDEN_NX2_MT_RALIAS=a` (3 runs, tools/alt.py).
 
 ## Round 6 (branch mkw-mt-lite, commits 6171e38..5e5a574, docs/mt-lite-plan6.md): one test round
-Compiled only (build/pgo rc=0); nothing below has run. BIN=/home/appo/src/Eglantine-mtB/build/pgo/bin/eden-cli,
-from /home/appo/src/eglantine-buildenv/tools, 2x attract demo (`./demo.sh $BIN 120 <tag>`; results in
+Compiled only (build/pgo rc=0); nothing below has run. BIN=$HOME/src/Eglantine-mtB/build/pgo/bin/eden-cli,
+from $HOME/src/eglantine-buildenv/tools, 2x attract demo (`./demo.sh $BIN 120 <tag>`; results in
 runs/cli-<tag>.out, runs/log-<tag>.txt). L = `EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1` (now includes
 GPUPARAM2, REGDEDUP and the W3 switches REPORTSIZE/OVERLAY64/SEQPOS/I2MPOS/PENDACQ/PENDPOLL by default).
 Note: REGDEDUP's commit also fixes a real bug (FrontRunMacro skipped repeated MME DMA reads 0x157/0x158
@@ -257,7 +257,7 @@ Compiled only (build rc=0); nothing below has run. BIN, demo.sh, L as in Round 6
 
 ## Batch 9 (branch mkw-mt-lite, docs/batch9-plan.md): one test round
 Compiled only (build rc=0); nothing below has run. BIN, demo.sh, L as in Round 6. Race benchmark:
-/home/appo/src/eglantine-buildenv/tools/race/ (README).
+$HOME/src/eglantine-buildenv/tools/race/ (README).
 0. Race benchmark calibration first (once): `CALIBRATE=<N> tools/race/race.sh <eden-cli> 240 calib`
    (screenshots every N s into runs/calib-calib/), `calibmap.py` to map them to frames, fix
    timeline.txt (title accept, default cursors Single Player / Grand Prix / Mushroom Cup, 24 A

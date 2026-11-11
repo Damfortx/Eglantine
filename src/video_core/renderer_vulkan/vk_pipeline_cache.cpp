@@ -30,6 +30,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/program_header.h"
+#include "common/env_gate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -76,7 +77,7 @@ using VideoCommon::GraphicsEnvironment;
 // translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
 // too only when the record layout (environment or key serialization) changes, which deletes older
 // caches. 20 changed the environment layout; the keys last changed before it.
-constexpr u32 CACHE_VERSION = 21;
+constexpr u32 CACHE_VERSION = 31;
 constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 20;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
@@ -589,6 +590,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+        .has_broken_spirv_fragment_shuffle =
+            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY &&
+            Common::EnvGate("EGLANTINE_AMD_FRAGMENT_SHUFFLE"),
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
@@ -835,6 +839,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
+        graphics_miss = "stage-rejected";
         return nullptr;
     }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
@@ -941,7 +946,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     const auto shader_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir)};
-    const auto base_dir{shader_dir / fmt::format("{:016x}", title_id)};
+    auto base_dir{shader_dir / fmt::format("{:016x}", title_id)};
+    if (title_id == 0x0400C3F00006E000ULL) {
+        base_dir /= "mkw_zero_depth_v1";
+    }
     if (!Common::FS::CreateDir(shader_dir) || !Common::FS::CreateDir(base_dir)) {
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         return;
@@ -1321,6 +1329,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     }
     auto& pipeline{it->second};
     if (!pipeline) {
+        graphics_miss = "creation-failed";
         return nullptr;
     }
     if (used_this_session.insert(pipeline.get()).second &&
@@ -1504,6 +1513,7 @@ bool PipelineCache::BuildNewGraphicsPipeline() {
         const std::shared_future<void> done{pending->second};
         if (CanSkipDraw()) {
             if (!WaitForGraphicsTranslation(done)) {
+                graphics_miss = "async-build";
                 return false;
             }
         } else {
@@ -1517,6 +1527,7 @@ bool PipelineCache::BuildNewGraphicsPipeline() {
     if (!pipeline && CanTranslateAsynchronously()) {
         if (const auto done{QueueGraphicsTranslation()}) {
             if (!WaitForGraphicsTranslation(*done)) {
+                graphics_miss = "async-build";
                 return false;
             }
             AdoptTranslatedGraphicsPipelines();

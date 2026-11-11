@@ -24,6 +24,7 @@
 #include "video_core/mt/lite5_list_switches.h"
 #include "video_core/mt/list_dump.h"
 #include "video_core/mt/front2.h"
+#include "video_core/mt/c12_front.h"
 
 namespace Core {
 class System;
@@ -126,6 +127,9 @@ struct CommandList final {
     /// executed instead of the memory, which the game may already be refilling for a later frame.
     std::vector<CommandHeader> submitted_words;
     std::vector<u32> submitted_offsets;
+    /// Entries (ascending) not copied when submitted, because a GPU map still queued covers them:
+    /// DmaPusher::Push copies them after the map, and until then they read memory.
+    std::vector<u32> deferred_entries;
     /// DmaPusher::suspensions when the words were copied. A list copied during a suspension, or
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
@@ -158,9 +162,13 @@ public:
     void Push(CommandList&& entries) {
         // Copied during a suspension, or behind one: copy again now, unless still suspended.
         const u64 now = suspensions.load(std::memory_order_acquire);
-        if (ResnapshotEnabled() && !entries.submitted_offsets.empty() && (now & 1) == 0 &&
-            entries.snapshot_suspensions != now) {
-            RefreshSnapshot(entries, now);
+        if (!entries.submitted_offsets.empty() && (now & 1) == 0) {
+            if (ResnapshotEnabled() && entries.snapshot_suspensions != now) {
+                RefreshSnapshot(entries, now);
+            } else if (!entries.deferred_entries.empty()) {
+                // Behind a GPU map when submitted: the map has run by now (GPU::MapInOrder).
+                RefreshDeferredEntries(entries);
+            }
         }
         dma_pushbuffer.push_back(std::move(entries));
     }
@@ -214,6 +222,8 @@ public:
     std::vector<u64> known_cpu_list_pages;
     /// Copies the list's words from memory again, as of suspension count `now`.
     void RefreshSnapshot(CommandList& list, u64 now);
+    /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
+    void RefreshDeferredEntries(CommandList& list);
 
     /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off.
     static bool ResnapshotEnabled() {
@@ -242,6 +252,13 @@ public:
     void RecordListDump(const CommandListHeader& header, std::span<const CommandHeader> commands,
                         u32 path);
     Common::ScratchBuffer<CommandHeader> check_headers;
+    /// Cycle 12 W1 P3 (mt/c12_front.h): the list writer census, EDEN_NX2_C12_LISTWAIT's trusted
+    /// lists and its speculated read waiting for verification.
+    VideoCommon::MT::C12ListWaitState c12_list;
+    Common::ScratchBuffer<CommandHeader> c12_pre_headers;
+    /// EDEN_NX2_C12_LISTWAIT: once the back has run the writers queued at the speculated read,
+    /// reads the list again and compares (mismatch: counted, ERROR, banned; not undone).
+    void C12VerifyListSpec();
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
     /// EDEN_NX2_MT_LITE_GPUPARAM (mt/gpuparam.h): when the current entry (and the next ones of

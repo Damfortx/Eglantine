@@ -20,6 +20,21 @@ namespace Common {
 /// load of this flag per lock.
 inline const bool g_lock_stats_enabled = std::getenv("EDEN_NX2_LOCK_STATS") != nullptr;
 
+/// EDEN_NX2_C11_LOCKRUN (cycle 11 W4b; on by default with EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1, '0'
+/// off, '1' or 'a' on): the lock's owner check compares a thread_local copy of the calling
+/// thread's id instead of calling std::this_thread::get_id() on every lock (the committer locks
+/// both cache mutexes a few times per draw, recursively under a run). The run itself is in
+/// video_core/mt/c11_commit.h.
+inline const bool g_lock_tls_id = [] {
+    const char* run = std::getenv("EDEN_NX2_C11_LOCKRUN");
+    if (run != nullptr && (run[0] == '0' || run[0] == '1' || run[0] == 'a')) {
+        return run[0] != '0';
+    }
+    const char* mt = std::getenv("EDEN_NX2_MT");
+    const char* lite = std::getenv("EDEN_NX2_MT_LITE");
+    return mt != nullptr && mt[0] == '1' && lite != nullptr && lite[0] == '1';
+}();
+
 /// Records the calling thread's name for the owner lookup (once per thread).
 inline void LockStatsRegisterThread();
 /// Adds a wait of the calling thread on the thread that owned the lock when it began.
@@ -37,7 +52,7 @@ public:
     explicit SpinRecursiveMutex(const char* name) : stats_name{name} {}
 
     void lock() {
-        const std::thread::id self = std::this_thread::get_id();
+        const std::thread::id self = SelfId();
         if (owner.load(std::memory_order_relaxed) == self) {
             ++depth;
             return;
@@ -59,7 +74,7 @@ public:
     }
 
     bool try_lock() {
-        const std::thread::id self = std::this_thread::get_id();
+        const std::thread::id self = SelfId();
         if (owner.load(std::memory_order_relaxed) == self) {
             ++depth;
             return true;
@@ -76,7 +91,13 @@ public:
 
     /// Whether the calling thread holds it (diagnostics: EDEN_NX2_MT_LITE7_CAPTURE_CHECK).
     [[nodiscard]] bool HeldByCurrentThread() const noexcept {
-        return owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
+        return owner.load(std::memory_order_relaxed) == SelfId();
+    }
+
+    /// Whether another thread is waiting for it now (spinning or asleep): a holder that keeps it
+    /// across several pieces of work (EDEN_NX2_C11_LOCKRUN) lets it go between them then.
+    [[nodiscard]] bool Contended() const noexcept {
+        return waiters.load(std::memory_order_relaxed) != 0;
     }
 
     void unlock() {
@@ -90,6 +111,19 @@ public:
     }
 
 private:
+    /// The calling thread's id (EDEN_NX2_C11_LOCKRUN: a thread_local copy; zero-initialized, so
+    /// reading it needs no TLS guard).
+    static std::thread::id SelfId() noexcept {
+        if (!g_lock_tls_id) {
+            return std::this_thread::get_id();
+        }
+        thread_local std::thread::id cached{};
+        if (cached == std::thread::id{}) {
+            cached = std::this_thread::get_id();
+        }
+        return cached;
+    }
+
     // About 10 microseconds of spinning before sleeping.
     static constexpr int SpinCount = 1024;
 
@@ -102,6 +136,13 @@ private:
     }
 
     void LockContended() {
+        waiters.fetch_add(1, std::memory_order_relaxed);
+        struct WaiterExit {
+            std::atomic<std::uint32_t>& count;
+            ~WaiterExit() {
+                count.fetch_sub(1, std::memory_order_relaxed);
+            }
+        } waiter_exit{waiters};
         if (g_lock_stats_enabled) [[unlikely]] {
             // The owner may not be stored yet (just taken) or may change while we wait: this is
             // the thread that held the lock when the wait began.
@@ -134,6 +175,7 @@ private:
 
     std::atomic<std::uint32_t> state{0}; ///< 0 free, 1 held, 2 held with sleepers
     std::atomic<std::thread::id> owner{};
+    std::atomic<std::uint32_t> waiters{0}; ///< Threads in LockContended (Contended())
     std::uint32_t depth{}; ///< Recursion depth, touched only by the owner
     const char* stats_name{};
 };

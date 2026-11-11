@@ -25,7 +25,11 @@
 #endif
 #include <windows.h>
 #endif
+#ifdef __GLIBC__
+#include <execinfo.h>
+#endif
 #include <cstdio>
+#include <string>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -257,9 +261,33 @@ void GpuSplit::CheckOwner(const char* where) {
     std::fflush(stderr);
 #else
     // EDEN_NX2_MT_CHECK: under the multithreaded back only the committer records and submits.
-    if (Get().MtActive() && !on_committer_thread) {
-        MT::ReportRoleViolation(where);
+    if (Get().MtActive()) {
+        if (!on_committer_thread) {
+            MT::ReportRoleViolation(where);
+        }
+        return;
     }
+    // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
+    if (on_back_thread || !instance.back_running.load(std::memory_order_acquire)) {
+        return;
+    }
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1) >= 12) {
+        return;
+    }
+    std::string stack;
+#ifdef __GLIBC__
+    void* frames[40];
+    const int count = backtrace(frames, 40);
+    if (char** const symbols = backtrace_symbols(frames, count)) {
+        for (int i = 1; i < count; ++i) {
+            stack += fmt::format("\n  {}", symbols[i]);
+        }
+        std::free(symbols);
+    }
+#endif
+    LOG_ERROR(HW_GPU, "GPU split owner check: {} on a thread other than the back; stack:{}", where,
+              stack);
 #endif
 }
 
@@ -341,6 +369,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
              state_blocks ? ", state writes in blocks" : "");
     if (MtActive()) {
         VideoCommon::MT::C10LogStart(); // cycle 10 front switches (mt/c10_front.h)
+        VideoCommon::MT::C11LogStart(); // cycle 11 W1 front switches (mt/c11_front.h)
+        VideoCommon::MT::C12LogStart(); // cycle 12 W1 front switches (mt/c12_front.h)
+        VideoCommon::MT::C13FrontLogStart(); // cycle 13 W3 front switches (mt/c13_front.h)
     }
 }
 
@@ -390,6 +421,9 @@ void GpuSplit::Stop() {
     state_engine = nullptr;
     state_count = 0;
     pending_releases.clear();
+    c13_kick_target = 0; // cycle 13 W3 (mt/c13_front.h)
+    c13_writer_kicked = false;
+    c13_kick_back.store(0, std::memory_order_relaxed);
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
@@ -650,7 +684,7 @@ bool GpuSplit::WaitForPosition(u64 position, u64 settle_position, DrainReason re
     if (MtActive() && settle_position != 0) {
         TimedWaitSettled(settle_target());
     }
-    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    C13EndWait(); // cycle 13 W3: was wait_target.store(~u64{0}); keeps a later kick
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
     return true;
 }
@@ -669,7 +703,7 @@ void GpuSplit::WaitSequencer(DrainReason reason) {
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     WaitConsumed(target);
-    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    C13EndWait(); // cycle 13 W3: was wait_target.store(~u64{0}); keeps a later kick
     publish_every = 8;
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
@@ -729,7 +763,7 @@ void GpuSplit::DrainToSettleTarget(DrainReason reason) {
     Publish();
     WaitConsumed(target);
     TimedWaitSettled(ReadSettleTarget(target, reason));
-    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    C13EndWait(); // cycle 13 W3: was wait_target.store(~u64{0}); keeps a later kick
     publish_every = 8;
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
 }
@@ -818,9 +852,210 @@ bool GpuSplit::C10WaitAcquireTarget(u64 target) {
     if (MtActive()) {
         TimedWaitSettled(ReadSettleTarget(target, DrainReason::Puller));
     }
-    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    C13EndWait(); // cycle 13 W3: was wait_target.store(~u64{0}); keeps a later kick
     CountWait(DrainReason::Puller, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
     return true;
+}
+
+// ---- Cycle 11 W1 (mt/c11_front.h) ----
+
+void GpuSplit::C11ResolvePositions() {
+    c11_unresolved = false;
+    const u64 now = write_position;
+    const auto resolve = [now](u64& position) {
+        if (position == C11Unresolved) {
+            position = now;
+        }
+    };
+    resolve(c11_unknown_compute_position);
+    resolve(c11_cb_unranged_position);
+    const u64 writers = std::min<u64>(c11_writer_count, c11_writers.size());
+    for (u64 i = c11_writer_count - writers; i < c11_writer_count; ++i) {
+        resolve(c11_writers[i % c11_writers.size()].position);
+    }
+    const u64 cbs = std::min<u64>(c11_cb_count, c11_cb.size());
+    for (u64 i = c11_cb_count - cbs; i < c11_cb_count; ++i) {
+        resolve(c11_cb[i % c11_cb.size()].position);
+    }
+}
+
+void GpuSplit::C11FinishWriterCall(u8 kind) {
+    // Copy/I2M/2D writers are covered by c10_range_writer_position (NoteWriter).
+    if (kind == 1) {
+        auto& stats = VideoCommon::MT::C11FrontStats::Get();
+        const u64 position = C11PositionNow();
+        if (!c11_call.described || c11_call.unknown) {
+            c11_unknown_compute_position = std::max(c11_unknown_compute_position, position);
+            ++stats.writer_unknown;
+        } else {
+            ++stats.writer_known;
+            if (c11_call.count != 0) {
+                if (c11_writer_count >= c11_writers.size()) {
+                    // The oldest goes: it counts as a writer of unknown ranges from now on.
+                    const C11Writer& dropped = c11_writers[c11_writer_count % c11_writers.size()];
+                    c11_unknown_compute_position =
+                        std::max(c11_unknown_compute_position, dropped.position);
+                }
+                C11Writer& writer = c11_writers[c11_writer_count % c11_writers.size()];
+                writer.position = position;
+                writer.count = c11_call.count;
+                writer.ranges = c11_call.ranges;
+                ++c11_writer_count;
+            }
+        }
+    }
+    c11_call = {};
+    c11_call_dirty = false;
+}
+
+GpuSplit::C11AcqPrediction GpuSplit::C11PredictAcquire(GPUVAddr address) {
+    using Stats = VideoCommon::MT::C11FrontStats;
+    FlushState();
+    const auto refuse = [](u32 why) { return C11AcqPrediction{why, 0, false}; };
+    if (pending_write_overflow) {
+        return refuse(Stats::RefOverflow);
+    }
+    const auto it = pending_releases.find(address);
+    if (it == pending_releases.end() || write_position - it->second.position > RingWords) {
+        return refuse(Stats::RefNoRelease);
+    }
+    const PendingRelease& release = it->second;
+    if (release.channel != c11_channel || c11_channel < 0) {
+        return refuse(Stats::RefOtherChannel);
+    }
+    // A copy/I2M/2D writer sent after the release: the copy engine's semaphore releases (and
+    // its writes) are not noted with addresses.
+    if (c10_range_writer_position > release.position) {
+        return refuse(Stats::RefRangeWriter);
+    }
+    // Adds noted after the release raise what it writes; one noted before it may land after
+    // it when the release is written earlier (a direct sequencer write vs a fence callback).
+    u64 adds_after = 0;
+    bool adds_before = false;
+    if (const auto adds = pending_adds.find(address); adds != pending_adds.end()) {
+        for (const PendingAdd& add : adds->second) {
+            if (add.channel != c11_channel) {
+                return refuse(Stats::RefOtherChannel);
+            }
+            if (add.order > release.order) {
+                adds_after += add.payload;
+            } else {
+                adds_before = true;
+            }
+        }
+    }
+    if (adds_after > 0xffffffffULL) {
+        return refuse(Stats::RefShort);
+    }
+    // Other noted writes over the word: only the release notes themselves (QMD release words,
+    // puller releases) may be there; a position-known one the release follows is overwritten.
+    const auto overlaps = [address](const PendingWrite& write) {
+        return address < write.end && write.begin < address + 4;
+    };
+    for (size_t i = 0; i < pending_write_count; ++i) {
+        const PendingWrite& write = pending_writes[i];
+        if (!overlaps(write)) {
+            continue;
+        }
+        if (write.known == WriteKnown::Drain) {
+            return refuse(Stats::RefOtherWrite);
+        }
+        // The release notes themselves (one word at the address: QMD releases, puller
+        // releases, 3D payload reports); a wider one starting elsewhere writes other bytes here.
+        if (write.begin == address && (write.tag == VideoCommon::MT::TagQmd ||
+                                       write.tag == VideoCommon::MT::TagPullerRelease ||
+                                       write.tag == VideoCommon::MT::TagPayloadReport)) {
+            continue;
+        }
+        if (write.known == WriteKnown::Position && write.position <= release.position) {
+            continue;
+        }
+        return refuse(Stats::RefOtherWrite);
+    }
+    if (open_i2m_active && overlaps(open_i2m)) {
+        return refuse(Stats::RefOpenI2m);
+    }
+    // Adds the back ran are dropped from the queue (PendingAddSum, by SettledPosition): exact
+    // only while the release itself has not settled (every add after it is still queued).
+    const bool exact =
+        !release.at_least && !adds_before && release.position >= SettledPosition();
+    return C11AcqPrediction{Stats::RefNone, u64{release.payload} + adds_after, exact};
+}
+
+GpuSplit::C11PastKnown GpuSplit::C11FindPastKnown(GPUVAddr address, u64 size) {
+    const u64 done = SettledPosition();
+    for (size_t i = 0; i < pending_write_count; ++i) {
+        const PendingWrite& write = pending_writes[i];
+        if (!(address < write.end && write.begin < address + size)) {
+            continue;
+        }
+        if (write.known == WriteKnown::Position && write.position <= done) {
+            continue;
+        }
+        const bool direct = (write.flags & WriteDirect64) != 0;
+        const u64 known_end = write.begin + (direct ? 8 : 4);
+        if (write.end - write.begin > 4 && address + size > known_end) {
+            return C11PastKnown{true, write.begin, write.end - write.begin, direct};
+        }
+    }
+    return C11PastKnown{false, 0, 0, false};
+}
+
+bool GpuSplit::C11CbufStale(u64 as, GPUVAddr begin, u64 size) {
+    // Committer writes (copies, buffer cache) included: the committer's position, not the
+    // sequencer's.
+    const u64 done = std::min(consumed.load(std::memory_order_acquire), SettledPosition());
+    const auto queued = [done](u64 position) { return position > done; }; // Unresolved: ~0
+    if (queued(c11_cb_unranged_position) || queued(c10_range_writer_position) ||
+        queued(c11_unknown_compute_position)) {
+        return true;
+    }
+    const GPUVAddr end = begin + size;
+    const u64 writers = std::min<u64>(c11_writer_count, c11_writers.size());
+    for (u64 i = c11_writer_count - writers; i < c11_writer_count; ++i) {
+        const C11Writer& writer = c11_writers[i % c11_writers.size()];
+        if (!queued(writer.position)) {
+            continue;
+        }
+        for (u32 r = 0; r < writer.count; ++r) {
+            const C11Range& range = writer.ranges[r];
+            if (range.as != as || (begin < range.end && range.begin < end)) {
+                return true;
+            }
+        }
+    }
+    const u64 cbs = std::min<u64>(c11_cb_count, c11_cb.size());
+    for (u64 i = c11_cb_count - cbs; i < c11_cb_count; ++i) {
+        const C11CbWrite& cb = c11_cb[i % c11_cb.size()];
+        if (queued(cb.position) && (cb.as != as || (begin < cb.end && cb.begin < end))) {
+            return true;
+        }
+    }
+    const ReadWait wait = PendingWritesFor(begin, size);
+    return wait.drain || wait.writers || wait.position > SettledPosition();
+}
+
+u64 GpuSplit::C11ListSeqTarget(u64 as, GPUVAddr address, u64 size) {
+    const u64 now = write_position;
+    const auto at = [now](u64 position) { return position == C11Unresolved ? now : position; };
+    u64 target = std::max(c10_range_writer_position, at(c11_unknown_compute_position));
+    const GPUVAddr end = address + size;
+    const u64 writers = std::min<u64>(c11_writer_count, c11_writers.size());
+    for (u64 i = c11_writer_count - writers; i < c11_writer_count; ++i) {
+        const C11Writer& writer = c11_writers[i % c11_writers.size()];
+        const u64 position = at(writer.position);
+        if (position <= target) {
+            continue;
+        }
+        for (u32 r = 0; r < writer.count; ++r) {
+            const C11Range& range = writer.ranges[r];
+            if (range.as != as || (address < range.end && range.begin < end)) {
+                target = position;
+                break;
+            }
+        }
+    }
+    return std::min(target, now);
 }
 
 bool GpuSplit::WaitForWriters(DrainReason reason) {
@@ -842,7 +1077,7 @@ bool GpuSplit::WaitForWriters(DrainReason reason) {
     if (MtActive()) {
         TimedWaitSettled(ReadSettleTarget(target, reason));
     }
-    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    C13EndWait(); // cycle 13 W3: was wait_target.store(~u64{0}); keeps a later kick
     CountWait(reason, true, Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
     return true;
 }
@@ -868,6 +1103,9 @@ void GpuSplit::FlushStateSlow() {
     entry[0] = static_cast<u64>(Kind::State) | (state_track ? IsLast : 0) | (u64{count} << 32);
     std::memcpy(entry + 1, state_pairs.data(), count * sizeof(u64));
     Commit(1 + count);
+    if (c11_unresolved) [[unlikely]] {
+        C11ResolvePositions();
+    }
 }
 
 void GpuSplit::FlushMacroList() {
@@ -878,6 +1116,9 @@ void GpuSplit::FlushMacroList() {
     entry[0] = static_cast<u64>(Kind::List) | (u64{count} << 32);
     std::memcpy(entry + 1, list.data(), count * sizeof(u64));
     Commit(1 + count);
+    if (c11_unresolved && state_count == 0) [[unlikely]] {
+        C11ResolvePositions();
+    }
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,

@@ -31,7 +31,10 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                    if (cbuf == 0) {
                        return 0U;
                    }
-                   const GPUVAddr base{MT::ReadCaptured<u64>(gpu_memory, cbuf + descriptor.cbuf_offset)};
+                   GPUVAddr base{MT::ReadCaptured<u64>(gpu_memory, cbuf + descriptor.cbuf_offset)};
+                   if (base != 0 && descriptor.indirect_offset != ~0U) {
+                       base = MT::ReadCaptured<u64>(gpu_memory, base + descriptor.indirect_offset);
+                   }
                    return base != 0 ? MT::ReadCaptured<u32>(gpu_memory, base + offset) : 0U;
                })
         .value_or(0U);

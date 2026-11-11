@@ -53,7 +53,7 @@ turns one off; front pieces (L19-L22) `=1` also on without the MT back; L23 need
 | L23 | EDEN_NX2_MT_LITE_SEQTARGET | the sequencer clears wait_target (CAS) once it stored `consumed` past it: one Mark at the target, not one per entry for the rest of the front's wait | gpu_split.cpp |
 | -- | (EDEN_NX2_PULLER_STATS / ACQUIRE_STATS) | new sites: "acquire nodrain" (L20), "acquire ledger" (L22 met), "acquire seq wait" (L22 first stage); ACQUIRE_STATS site 3 = L20 suspensions (met = memory already met), kind 4 = DMA semaphore target | puller.cpp |
 
-## What to measure (BIN=/home/appo/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
+## What to measure (BIN=$HOME/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
 Start line: `MT lite 4: overlay true, foreignacq true, asyncfences true, qmdledger true, seqtarget true`.
 1. fps: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 ./demo.sh $BIN 120 lite4-fps`
    vs MT unset (`lite4-off`), alternating, >= 3 each.

@@ -300,6 +300,14 @@ void TextureCache<P>::RunGarbageCollector() {
                 Collect();
             }
         } else {
+            // Cycle 11 V4 (EDEN_NX2_C11_VRAM_COORD): an emergency pass (costly images not
+            // spared) leaves images used in the last CoordHotFrames frames: evicting them only
+            // re-creates them next frame (another decode / disk read, more allocations).
+            if (vram_emergency && C11Vram::CoordOn() &&
+                ticks_to_destroy < C11Vram::CoordHotFrames()) {
+                ticks_to_destroy = C11Vram::CoordHotFrames();
+                C11Vram::g_counters.emergency_hot_passes.fetch_add(1, std::memory_order_relaxed);
+            }
             Collect();
         }
     }
@@ -317,46 +325,20 @@ void TextureCache<P>::RelocateHostImages() {
             counters.host_images.load(std::memory_order_relaxed) == 0) {
             return;
         }
-        // An image placed in host memory in the last 300 frames means the heap is still full:
-        // evicting now would only re-create them there (another upload / ASTC decode each).
-        const u64 placed = counters.images_placed_host.load(std::memory_order_relaxed);
-        if (placed != seen_host_images_placed) {
-            seen_host_images_placed = placed;
-            relocate_quiet_until = frame_tick + 300;
-            return;
-        }
-        if (frame_tick < relocate_quiet_until || vram_emergency ||
-            total_used_memory >= critical_memory) {
-            return;
-        }
-        u64 room = critical_memory - total_used_memory;
-        std::vector<ImageId> picked;
-        lru_cache.ForEachItemBelow(frame_tick - 2, [&](ImageId image_id) {
-            Image& image = slot_images[image_id];
-            if (!runtime.IsHostResident(image) || True(image.flags & ImageFlagBits::IsDecoding)) {
-                return false;
-            }
-            const u64 bytes = ImageMemoryBytes(image) +
-                              (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
-            if (bytes >= room) {
-                return false;
-            }
-            room -= bytes;
-            picked.push_back(image_id);
-            return picked.size() >= limit;
-        });
+        // Evicts one host-resident image so it is re-created in VRAM on its next use (cycle 10
+        // path). False when it was skipped (a second download this frame).
         bool downloaded = false;
-        for (const ImageId image_id : picked) {
+        const auto evict = [&](ImageId image_id) {
             Image& image = slot_images[image_id];
             if (False(image.flags & ImageFlagBits::Registered)) {
-                continue;
+                return false;
             }
             const bool must_download =
                 IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
             if (must_download) {
                 // Each download is a full GPU wait: one a frame.
                 if (downloaded || gpu_memory == nullptr) {
-                    continue;
+                    return false;
                 }
                 downloaded = true;
                 auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
@@ -375,6 +357,325 @@ void TextureCache<P>::RelocateHostImages() {
             DeleteImage(image_id, image.scale_tick > frame_tick + 5);
             counters.relocated.fetch_add(1, std::memory_order_relaxed);
             counters.relocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            return true;
+        };
+        // Cycle 13 V2 (EDEN_NX2_C13_RELOC): by real room under the driver budget, not the
+        // collector's critical (in 2P it never got under it: render targets stayed in host
+        // memory for the whole race), frame-hot images included, the largest first, one a
+        // frame. GPU-written images get a new device-local backing filled by a GPU copy (same
+        // ImageId; views and framebuffers dropped as on a rescale), the others are evicted.
+        if (C13Vram::RelocOn()) {
+            if (frame_tick < c13_reloc_backoff_until || c13_budget == 0) {
+                return;
+            }
+            ImageId best_id{};
+            u64 best_bytes = 0;
+            for (auto [image_id, image] : slot_images) {
+                if (!runtime.IsHostResident(*image) ||
+                    True(image->flags & ImageFlagBits::IsDecoding) ||
+                    False(image->flags & ImageFlagBits::Registered)) {
+                    continue;
+                }
+                u64 bytes = ImageMemoryBytes(*image) +
+                            (image->HasScaled() ? GetScaledImageSizeBytes(*image) : 0);
+                if constexpr (requires(const Image& i) { i.C13HostBytes(); }) {
+                    bytes = image->C13HostBytes();
+                }
+                if (bytes > best_bytes) {
+                    best_bytes = bytes;
+                    best_id = image_id;
+                }
+            }
+            if (!best_id) {
+                return;
+            }
+            if (total_used_memory + best_bytes + C13Vram::RelocPad >= c13_budget) {
+                C13Vram::g_counters.refused_room.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            Image& image = slot_images[best_id];
+            if constexpr (requires(Image& i) { i.C13Rebind(false); }) {
+                if (True(image.flags & ImageFlagBits::GpuModified) && maxwell3d != nullptr) {
+                    const C13Vram::RebindResult result = image.C13Rebind(C13Vram::RelocCheck());
+                    if (result == C13Vram::RebindResult::Done) {
+                        // New handles: views, framebuffers and resolved bindings go, as on a
+                        // rescale (version and view epoch bumped, render targets dirty).
+                        InvalidateScale(image);
+                        total_used_memory += best_bytes;
+                        counters.relocated.fetch_add(1, std::memory_order_relaxed);
+                        counters.relocated_bytes.fetch_add(best_bytes, std::memory_order_relaxed);
+                        C13Vram::g_counters.rebinds.fetch_add(1, std::memory_order_relaxed);
+                        C13Vram::g_counters.rebind_bytes.fetch_add(best_bytes,
+                                                                   std::memory_order_relaxed);
+                        return;
+                    }
+                    if (result == C13Vram::RebindResult::NoRoom) {
+                        C13Vram::g_counters.no_alloc.fetch_add(1, std::memory_order_relaxed);
+                        c13_reloc_backoff_until = frame_tick + C13Vram::RelocBackoffFrames;
+                        return;
+                    }
+                    C13Vram::g_counters.refused.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (evict(best_id)) {
+                C13Vram::g_counters.deletes.fetch_add(1, std::memory_order_relaxed);
+                C13Vram::g_counters.delete_bytes.fetch_add(best_bytes, std::memory_order_relaxed);
+                // Re-created on its next use: within the budget, or in host memory again (then
+                // the next attempt waits for the room check above).
+                c13_reloc_backoff_until = frame_tick + 2;
+            }
+            return;
+        }
+        // An image placed in host memory in the last 300 frames means the heap is still full:
+        // evicting now would only re-create them there (another upload / ASTC decode each).
+        const u64 placed = counters.images_placed_host.load(std::memory_order_relaxed);
+        if (placed != seen_host_images_placed) {
+            seen_host_images_placed = placed;
+            relocate_quiet_until = frame_tick + 300;
+            return;
+        }
+        if (frame_tick < relocate_quiet_until || vram_emergency ||
+            total_used_memory >= critical_memory) {
+            return;
+        }
+        // Cycle 11 V4 (EDEN_NX2_C11_VRAM_COORD): relocate only with CoordMargin left under
+        // critical after the picked images, so their re-creation does not make the collector
+        // evict frame-hot images.
+        const u64 coord_margin = C11Vram::CoordOn() ? C11Vram::CoordMargin() : 0;
+        if (total_used_memory + coord_margin >= critical_memory) {
+            C11Vram::g_counters.reloc_refused_margin.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        u64 room = critical_memory - coord_margin - total_used_memory;
+        std::vector<ImageId> picked;
+        lru_cache.ForEachItemBelow(frame_tick - 2, [&](ImageId image_id) {
+            Image& image = slot_images[image_id];
+            if (!runtime.IsHostResident(image) || True(image.flags & ImageFlagBits::IsDecoding)) {
+                return false;
+            }
+            const u64 bytes = ImageMemoryBytes(image) +
+                              (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
+            if (bytes >= room) {
+                return false;
+            }
+            room -= bytes;
+            picked.push_back(image_id);
+            return picked.size() >= limit;
+        });
+        for (const ImageId image_id : picked) {
+            (void)evict(image_id);
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::C11VramTick() {
+    // V1 (EDEN_NX2_C11_DROP1X): rescaled images that have not needed their 1x original for
+    // Drop1xAge frames free it (Image::C11DropOriginal checks the image itself; ScaleDown makes
+    // it again). Here: registered, not CPU modified, every alias rescaled too (an alias copy into
+    // a 1x image would scale this one down: re-creation churn).
+    if constexpr (requires(Image& image) { image.C11DropOriginal(u64{}); }) {
+        if (C11Vram::Drop1xOn() && frame_tick % C11Vram::Drop1xSweepFrames == 0 &&
+            Settings::values.resolution_info.active) {
+            const u64 age = C11Vram::Drop1xAge();
+            for (auto [image_id, image] : slot_images) {
+                if (False(image->flags & ImageFlagBits::Rescaled) ||
+                    False(image->flags & ImageFlagBits::Registered) ||
+                    True(image->flags & (ImageFlagBits::CpuModified | ImageFlagBits::Dead)) ||
+                    image->C11OriginalDropped()) {
+                    continue;
+                }
+                bool aliases_rescaled = true;
+                for (const AliasedImage& alias : image->aliased_images) {
+                    const Image& other = slot_images[alias.id];
+                    if (False(other.flags & ImageFlagBits::Rescaled) ||
+                        True(other.flags & ImageFlagBits::CpuModified)) {
+                        aliases_rescaled = false;
+                        break;
+                    }
+                }
+                if (!aliases_rescaled) {
+                    C11Vram::g_counters.refused.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                (void)image->C11DropOriginal(age);
+            }
+        }
+    }
+    // V3 (EDEN_NX2_VRAM_STATS): device memory of the cache's images by category.
+    if (C11Vram::StatsOn() && frame_tick % C11Vram::CategoryWalkFrames == 0) {
+        C11Vram::Categories& k = C11Vram::g_categories;
+        const C11Vram::Categories runtime_part = k;
+        k = {};
+        k.decode_class_bytes = runtime_part.decode_class_bytes;
+        k.decode_class_count = runtime_part.decode_class_count;
+        k.transcode_scratch_bytes = runtime_part.transcode_scratch_bytes;
+        k.msaa_scratch_count = runtime_part.msaa_scratch_count;
+        k.walk_frame = frame_tick;
+        for (const auto [image_id, image] : slot_images) {
+            ++k.images;
+            u64 original_bytes = ImageMemoryBytes(*image);
+            u64 scaled_bytes = image->HasScaled() ? GetScaledImageSizeBytes(*image) : 0;
+            if constexpr (requires(const Image& i) { i.C11OriginalBytes(); }) {
+                original_bytes = image->C11OriginalBytes();
+                scaled_bytes = image->C11ScaledBytes();
+            }
+            if constexpr (requires(const Image& i) { runtime.IsHostResident(i); }) {
+                if (runtime.IsHostResident(*image)) {
+                    k.host_bytes += original_bytes + scaled_bytes;
+                }
+            }
+            if (True(image->flags & (ImageFlagBits::Unbacked | ImageFlagBits::SparseLayers |
+                                     ImageFlagBits::SparseTiles))) {
+                k.sparse_bytes += original_bytes + scaled_bytes;
+                continue;
+            }
+            if (scaled_bytes != 0) {
+                k.rt_2x_bytes += scaled_bytes;
+                ++k.rt_2x_count;
+                bool dropped = false;
+                if constexpr (requires(const Image& i) { i.C11OriginalDropped(); }) {
+                    dropped = image->C11OriginalDropped();
+                }
+                if (dropped) {
+                    ++k.dropped_count;
+                } else {
+                    k.originals_bytes += original_bytes;
+                    ++k.originals_count;
+                }
+                continue;
+            }
+            if (IsPixelFormatASTC(image->info.format)) {
+                bool bc7 = false;
+                if constexpr (requires(const ImageInfo& i) { runtime.TranscodeBcMode(i); }) {
+                    bc7 = runtime.TranscodeBcMode(image->info) == 2U;
+                }
+                (bc7 ? k.astc_bc7_bytes : k.astc_bc1_bytes) += original_bytes;
+                ++(bc7 ? k.astc_bc7_count : k.astc_bc1_count);
+                continue;
+            }
+            if (True(image->flags & ImageFlagBits::GpuModified)) {
+                k.rt_1x_bytes += original_bytes;
+                ++k.rt_1x_count;
+            } else {
+                k.sampled_bytes += original_bytes;
+                ++k.sampled_count;
+            }
+        }
+    }
+    // Cycle 13 W1: V1 (EDEN_NX2_C13_OOM) non-evictable floor and V3 render-target census
+    // (EDEN_NX2_C13_STATS): device-resident GPU-written bytes and image bytes against the VMA
+    // device-local totals.
+    const bool c13_walk = (C13Vram::OomRecording() || C13Vram::StatsOn()) &&
+                          frame_tick % C13Vram::FloorWalkFrames == 0;
+    const bool c13_census =
+        C13Vram::CensusOn() && frame_tick != 0 && frame_tick % C13Vram::RtCensusFrames == 0;
+    if (c13_walk || c13_census) {
+        struct C13CensusEntry {
+            u64 bytes;
+            GPUVAddr addr;
+            u32 width;
+            u32 height;
+            u32 layers;
+            u32 format;
+            u64 age;
+            bool scaled;
+            bool diet;
+            bool host;
+        };
+        std::vector<C13CensusEntry> census;
+        u64 rt_bytes = 0;
+        u64 image_bytes = 0;
+        u64 diet_images = 0;
+        u64 diet_bytes = 0;
+        for (const auto [image_id, image] : slot_images) {
+            u64 original_bytes = ImageMemoryBytes(*image);
+            u64 scaled_bytes = image->HasScaled() ? GetScaledImageSizeBytes(*image) : 0;
+            if constexpr (requires(const Image& i) { i.C11OriginalBytes(); }) {
+                original_bytes = image->C11OriginalBytes();
+                scaled_bytes = image->C11ScaledBytes();
+            }
+            if (True(image->flags & ImageFlagBits::Unbacked)) {
+                original_bytes = ImageMemoryBytes(*image); // sparse pages bound to it
+            }
+            const u64 bytes = original_bytes + scaled_bytes;
+            u64 host_bytes = 0;
+            if constexpr (requires(const Image& i) { i.C13HostBytes(); }) {
+                host_bytes = image->C13HostBytes();
+            } else if constexpr (requires(const Image& i) { runtime.IsHostResident(i); }) {
+                host_bytes = runtime.IsHostResident(*image) ? bytes : 0;
+            }
+            const u64 device_bytes = bytes - (std::min)(bytes, host_bytes);
+            const bool gpu_written = True(image->flags & ImageFlagBits::GpuModified);
+            const bool diet = gpu_written && scaled_bytes == 0 && C13Vram::DietShape(image->info);
+            image_bytes += device_bytes;
+            if (gpu_written) {
+                rt_bytes += device_bytes;
+            }
+            if (diet) {
+                ++diet_images;
+                diet_bytes += bytes;
+            }
+            if (c13_census && gpu_written && (scaled_bytes != 0 || diet)) {
+                const u64 touched = image->last_touch_frame.load(std::memory_order_relaxed);
+                census.push_back(C13CensusEntry{
+                    .bytes = bytes,
+                    .addr = image->gpu_addr,
+                    .width = image->info.size.width,
+                    .height = image->info.size.height,
+                    .layers = static_cast<u32>(image->info.resources.layers),
+                    .format = static_cast<u32>(image->info.format),
+                    .age = frame_tick - (std::min)(frame_tick, touched),
+                    .scaled = scaled_bytes != 0,
+                    .diet = diet,
+                    .host = host_bytes != 0,
+                });
+            }
+        }
+        u64 vma_alloc = 0;
+        u64 vma_blocks = 0;
+        if constexpr (requires(u64& a, u64& b) { runtime.C13DeviceVmaBytes(a, b); }) {
+            runtime.C13DeviceVmaBytes(vma_alloc, vma_blocks);
+        }
+        C13Vram::Gauges& gauges = C13Vram::g_gauges;
+        gauges.rt_bytes = rt_bytes;
+        gauges.image_bytes = image_bytes;
+        gauges.vma_alloc = vma_alloc;
+        gauges.vma_blocks = vma_blocks;
+        gauges.diet_images = diet_images;
+        gauges.diet_bytes = diet_bytes;
+        if (vma_alloc != 0) {
+            // Non-evictable: GPU-written images (the collector keeps them: download cost, frame
+            // hot), every VMA byte that is not a texture cache image (buffers, staging, runtime
+            // images) and what the driver counts outside VMA's blocks (swapchain, internals).
+            const u64 non_texture = vma_alloc - (std::min)(vma_alloc, image_bytes);
+            const u64 outside = total_used_memory - (std::min)(total_used_memory, vma_blocks);
+            gauges.nonevictable = rt_bytes + non_texture + outside;
+            c13_floor = gauges.nonevictable + C13Vram::FloorPad;
+        }
+        if (c13_census) {
+            std::sort(census.begin(), census.end(),
+                      [](const C13CensusEntry& a, const C13CensusEntry& b) {
+                          return a.bytes > b.bytes;
+                      });
+            std::string text;
+            u64 census_bytes = 0;
+            for (size_t i = 0; i < census.size(); ++i) {
+                const C13CensusEntry& e = census[i];
+                census_bytes += e.bytes;
+                if (i >= 40) {
+                    continue;
+                }
+                text += fmt::format("{}{}x{}x{} f{} {} MiB {}{} age {} @{:#x}",
+                                    text.empty() ? "" : "; ", e.width, e.height, e.layers,
+                                    e.format, e.bytes >> 20,
+                                    e.scaled ? "2x" : (e.diet ? "1x-diet" : "1x"),
+                                    e.host ? " HOST" : "", e.age, e.addr);
+            }
+            LOG_INFO(HW_GPU,
+                     "C13 rt census (frame {}, {} images, {} MiB; diet {}): {}", frame_tick,
+                     census.size(), census_bytes >> 20,
+                     C13Vram::RtDietOn() ? "on" : "off", text);
         }
     }
 }
@@ -451,17 +752,50 @@ void TextureCache<P>::TickFrame() {
                 // thresholds sit too high for this card and driver: leave more room until the
                 // pressure has been gone for a while.
                 if (native_thresholds_applied) {
+                    // Cycle 13 V1 (EDEN_NX2_C13_OOM): with it on this rule only runs as the
+                    // CHECK's shadow (c13_old_margin) and the episode margin is applied below.
+                    const bool c13_oom_on = C13Vram::OomOn();
+                    u64& rule_margin = c13_oom_on ? c13_old_margin : pressure_margin;
                     const u32 events = runtime.MemoryPressureEvents();
                     if (events != seen_pressure_events) {
                         seen_pressure_events = events;
-                        pressure_margin = (std::min)(pressure_margin + 512_MiB, 3_GiB);
+                        // Cycle 11 analysis: EDEN_NX2_C11_PRESSURE_CAP_MB (default 3072,
+                        // unchanged) caps it; in the race it reached 3 GiB and put
+                        // critical ~2.6 GiB under the working set (permanent emergency).
+                        rule_margin = (std::min)(rule_margin + 512_MiB, C11Vram::PressureCap());
                         pressure_quiet_frames = 0;
-                        budget_check_frames = 0; // thresholds are recomputed below
-                        LOG_WARNING(HW_GPU, "Out of device memory: keeping {} MiB more free",
-                                    pressure_margin >> 20);
-                    } else if (pressure_margin != 0 && ++pressure_quiet_frames % 600 == 0) {
-                        pressure_margin -= (std::min)(pressure_margin, 128_MiB);
-                        budget_check_frames = 0;
+                        if (!c13_oom_on) {
+                            budget_check_frames = 0; // thresholds are recomputed below
+                            LOG_WARNING(HW_GPU, "Out of device memory: keeping {} MiB more free",
+                                        pressure_margin >> 20);
+                        }
+                    } else if (rule_margin != 0 && ++pressure_quiet_frames % 600 == 0) {
+                        rule_margin -= (std::min)(rule_margin, 128_MiB);
+                        if (!c13_oom_on) {
+                            budget_check_frames = 0;
+                        }
+                    }
+                    if (C13Vram::OomRecording()) {
+                        u64 c13_alloc_bytes = 0;
+                        if constexpr (requires { runtime.C13AllocatedBytes(); }) {
+                            c13_alloc_bytes = runtime.C13AllocatedBytes();
+                        }
+                        const u64 before = c13_oom_on ? pressure_margin : 0;
+                        const bool changed = c13_oom.Tick(frame_tick, total_used_memory,
+                                                          c13_budget, c13_alloc_bytes, rule_margin);
+                        if (c13_oom_on) {
+                            pressure_margin = c13_oom.Margin();
+                            if (changed || pressure_margin != before) {
+                                budget_check_frames = 0; // thresholds are recomputed below
+                                if (pressure_margin > before) {
+                                    LOG_WARNING(HW_GPU,
+                                                "Out of device memory (C13 episode): keeping {} "
+                                                "MiB more free",
+                                                pressure_margin >> 20);
+                                }
+                            }
+                        }
+                        C13Vram::g_gauges.loading = c13_oom.Loading();
                     }
                 }
             }
@@ -496,6 +830,41 @@ void TextureCache<P>::TickFrame() {
                         critical_memory = budget - (std::min)(margin + pressure_margin + slack_margin,
                                                               budget / 2);
                         expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    }
+                    // Cycle 13 V1 (EDEN_NX2_C13_OOM): critical never below the measured
+                    // non-evictable set (C11VramTick) + FloorPad, at most budget - 256 MiB: under
+                    // it the collector chases a target it cannot reach (an emergency pass every
+                    // frame). With the CHECK, the other rule's critical for the frame counts.
+                    c13_budget = budget;
+                    const auto c13_critical_for = [&](u64 oom_margin, bool with_floor) {
+                        u64 value = budget_auto_caps
+                                        ? Lite9Vram::DeriveCaps(budget, oom_margin, slack_margin)
+                                              .critical
+                                        : budget - (std::min)(margin + oom_margin + slack_margin,
+                                                              budget / 2);
+                        if (with_floor && c13_floor != 0) {
+                            value = (std::max)(value, (std::min)(c13_floor, budget - 256_MiB));
+                        }
+                        return value;
+                    };
+                    if (C13Vram::OomOn() && c13_floor != 0) {
+                        const u64 c13_floor_cap = (std::min)(c13_floor, budget - 256_MiB);
+                        if (critical_memory < c13_floor_cap) {
+                            const u64 raise = c13_floor_cap - critical_memory;
+                            critical_memory = c13_floor_cap;
+                            expected_memory = (std::min)(expected_memory + raise, critical_memory);
+                            C13Vram::g_counters.floor_raises.fetch_add(1,
+                                                                        std::memory_order_relaxed);
+                        }
+                    }
+                    if (C13Vram::OomCheck()) {
+                        if (C13Vram::OomOn()) {
+                            c13_new_critical = critical_memory;
+                            c13_old_critical = c13_critical_for(c13_old_margin, false);
+                        } else {
+                            c13_old_critical = critical_memory;
+                            c13_new_critical = c13_critical_for(c13_oom.Margin(), true);
+                        }
                     }
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time).
@@ -539,6 +908,23 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, bytes);
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+    }
+    // Cycle 11 W3: DROP1X sweep and the category walk, before the stats line below.
+    C11VramTick();
+    // Cycle 13 W1: per-frame accounting and the "C13 vram (10 s)" line.
+    if (C13Vram::StatsOn() || C13Vram::OomCheck()) {
+        C13Vram::NoteFrame(total_used_memory, critical_memory, c13_old_critical,
+                           c13_new_critical);
+        C13Vram::Gauges& c13_gauges = C13Vram::g_gauges;
+        c13_gauges.margin = pressure_margin;
+        c13_gauges.old_margin = C13Vram::OomOn() ? c13_old_margin : pressure_margin;
+        c13_gauges.new_margin = C13Vram::OomRecording() ? c13_oom.Margin() : 0;
+        c13_gauges.floor = c13_floor;
+        c13_gauges.budget = c13_budget;
+        c13_gauges.critical = critical_memory;
+        c13_gauges.old_critical = c13_old_critical;
+        c13_gauges.new_critical = c13_new_critical;
+        C13Vram::TickStats();
     }
     // Batch 8 U4: VRAM stats line (EDEN_NX2_VRAM_STATS) and decode image trim.
     if constexpr (requires { runtime.TickVram(u64{}, u64{}, u64{}); }) {
@@ -840,6 +1226,57 @@ bool TextureCache<P>::TryReuseGraphicsBindings(std::span<ImageViewInOut> views,
         }
     }
     // Pass 2: what FillImageViews does for clean hits besides returning the ids.
+    const bool touch = touch_tick != frame_tick;
+    for (size_t i = 0; i < views.size(); ++i) {
+        const ImageViewId id = memo_views[i];
+        views[i].id = id;
+        if (!id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[id];
+        if (image_view.IsBuffer()) {
+            continue;
+        }
+        Image& image = slot_images[image_view.image_id];
+        if (blacklist && views[i].blacklist) {
+            image.scale_rating = 0;
+        }
+        if (touch) {
+            lru_cache.Touch(image.lru_index, frame_tick);
+        }
+    }
+    touch_tick = frame_tick;
+    return true;
+}
+
+template <class P>
+bool TextureCache<P>::TryRepeatGraphicsBindings(std::span<ImageViewInOut> views,
+                                                std::span<const ImageViewId> memo_views,
+                                                bool blacklist, bool apply, u64& touch_tick) {
+    if (views.size() != memo_views.size()) {
+        return false;
+    }
+    // Pass 1, no side effects: what PrepareImage would do for each image besides an LRU touch
+    // (upload CPU writes, copy between aliases, scale a blacklisted view's image down).
+    for (size_t i = 0; i < views.size(); ++i) {
+        const ImageViewId id = memo_views[i];
+        if (!id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[id];
+        if (image_view.IsBuffer()) {
+            continue;
+        }
+        const Image& image = slot_images[image_view.image_id];
+        if (True(image.flags & ImageFlagBits::CpuModified) || !image.aliased_images.empty() ||
+            (blacklist && views[i].blacklist && True(image.flags & ImageFlagBits::Rescaled))) {
+            return false;
+        }
+    }
+    if (!apply) {
+        return true;
+    }
+    // Pass 2: TryReuseGraphicsBindings' pass 2.
     const bool touch = touch_tick != frame_tick;
     for (size_t i = 0; i < views.size(); ++i) {
         const ImageViewId id = memo_views[i];
@@ -1221,7 +1658,11 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
-    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
+    // Cycle 11 (for W4's EDEN_NX2_C11_REPEAT): any image under the write -> CpuModifiedEpoch.
+    bool touched = false;
+    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size, &touched](ImageId image_id,
+                                                                          Image& image) {
+        touched = true;
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -1245,6 +1686,9 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
             UntrackImage(image, image_id);
         }
     });
+    if (touched) {
+        cpu_modified_epoch.fetch_add(1, std::memory_order_release);
+    }
 }
 
 template <class P>
@@ -1348,6 +1792,9 @@ template <class P>
 void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
+    if (!deleted_images.empty()) {
+        cpu_modified_epoch.fetch_add(1, std::memory_order_release); // Cycle 11, see WriteMemory
+    }
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
         if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -1363,6 +1810,9 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegionGPU(as_id, gpu_addr, size,
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
+    if (!deleted_images.empty()) {
+        cpu_modified_epoch.fetch_add(1, std::memory_order_release); // Cycle 11, see WriteMemory
+    }
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
         if (False(image.flags & ImageFlagBits::CpuModified)) {
@@ -1445,7 +1895,15 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
     const std::optional src_base = src_image.TryFindBase(src.Address());
     const SubresourceRange src_range{.base = src_base.value(), .extent = {1, 1}};
     const ImageViewInfo src_view_info(ImageViewType::e2D, images.src_format, src_range);
-    const auto [src_framebuffer_id, src_view_id] = RenderTargetFromImage(src_id, src_view_info);
+    // Vulkan samples the source in a shader: a view is enough, and the source format need not be
+    // renderable (E5B9G9R9).
+    [[maybe_unused]] FramebufferId src_framebuffer_id;
+    ImageViewId src_view_id;
+    if constexpr (FRAMEBUFFER_BLITS) {
+        std::tie(src_framebuffer_id, src_view_id) = RenderTargetFromImage(src_id, src_view_info);
+    } else {
+        src_view_id = FindOrEmplaceImageView(src_id, src_view_info);
+    }
     const auto [src_samples_x, src_samples_y] = SamplesLog2(src_image.info.num_samples);
     Region2D src_region{
         Offset2D{.x = copy.src_x0 >> src_samples_x, .y = copy.src_y0 >> src_samples_y},
@@ -2557,6 +3015,12 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }
+    // Cycle 13 V3 (EDEN_NX2_C13_RT_DIET, off by default): shadow-map shaped targets (square
+    // depth / single-channel 32-bit, mt/c13_vram.h DietShape) stay at 1x; ScaleUp refuses them
+    // too, so none of them is ever rescaled and the aliases of one stay 1x with it.
+    if (C13Vram::RtDietOn() && C13Vram::DietShape(image.info)) {
+        return false;
+    }
     if (True(image.flags & (ImageFlagBits::Rescaled | ImageFlagBits::CheckingRescalable))) {
         return true;
     }
@@ -2830,6 +3294,10 @@ void TextureCache<P>::TickAsyncUnswizzle() {
 
 template <class P>
 bool TextureCache<P>::ScaleUp(Image& image) {
+    if (C13Vram::RtDietOn() && C13Vram::DietShape(image.info)) {
+        C13Vram::g_counters.diet_scaleups_refused.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     const bool has_copy = image.HasScaled();
     const bool rescaled = image.ScaleUp();
     if (!has_copy && image.HasScaled()) {
@@ -3238,6 +3706,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
     const GPUVAddr src_addr = src.Address();
     ImageInfo dst_info(dst);
     ImageInfo src_info(src);
+    if (g_blit_source_format) {
+        src_info.format = *g_blit_source_format;
+    }
     const bool can_be_depth_blit =
         dst_info.format == src_info.format && copy.filter == Tegra::Engines::Fermi2D::Filter::Point;
     ImageId dst_id;

@@ -15,9 +15,9 @@ fence waits.
 
 | piece | owns |
 |---|---|
-| U1 upstream | own worktree /home/appo/src/Eglantine-b9up, branch b9-upstream (from 91b569e); any file except CMakeLists.txt, no new .cpp; commits there; coordinator cherry-picks onto mkw-mt-lite after U2 |
+| U1 upstream | own worktree $HOME/src/Eglantine-b9up, branch b9-upstream (from 91b569e); any file except CMakeLists.txt, no new .cpp; commits there; coordinator cherry-picks onto mkw-mt-lite after U2 |
 | U2 VRAM budget | texture_cache/texture_cache.h + texture_cache_base.h (budget/GC functions), vulkan_common/vulkan_device.* (budget query), vk_texture_cache.cpp/.h (BC1 opaque selection in the ASTC BC7 path, budget getters), mt/astc_bc7.h, mt/lite8_vram.h, new header mt/lite9_vram.h |
-| U3 race benchmark | /home/appo/src/eglantine-buildenv/tools/race/ (new dir) only |
+| U3 race benchmark | $HOME/src/eglantine-buildenv/tools/race/ (new dir) only |
 | coordinator | this doc, build, integration, commits, docs/mt-pending-runtime-checks.md |
 
 ## U1 upstream development branches

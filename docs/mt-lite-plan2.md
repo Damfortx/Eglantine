@@ -44,7 +44,7 @@ RecordDraw) for one hold per draw; page test before the TrackerScope in IsRegion
 MtPageHoldsGpuData; translation cache for SeqRead<u32> (needs a MemoryManager syncpoint-shim
 getter); single-page WriteBlockCached fast path (1.8% of the sequencer).
 
-## What to measure (BIN=/home/appo/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
+## What to measure (BIN=$HOME/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
 Start line: `MT lite: true (...)` lists every switch above as true.
 1. fps: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 ./demo.sh $BIN 120 lite2-fps`
    vs MT unset (`lite2-off`). Target: >= 0.95 of MT unset, then above it.

@@ -54,7 +54,7 @@ Render-target / scratch reuse, staging/stream buffer sizes, texture cache budget
 "VRAM in 10 s" (VK_EXT_memory_budget usage/budget per heap, allocation count/latency, max).
 
 ## Coordinator log
-- 2026-11-09: U1 (worktree /home/appo/src/Eglantine-b8up, branch b8-upstream), U2, U3, U4 launched once each.
+- 2026-11-09: U1 (worktree $HOME/src/Eglantine-b8up, branch b8-upstream), U2, U3, U4 launched once each.
 
 ## U2 implementation notes
 - How it works (ENABLE_LSFG=ON by default -> HAS_LSFG in the Linux build): Composite blits the real

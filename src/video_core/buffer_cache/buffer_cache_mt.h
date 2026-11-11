@@ -65,9 +65,9 @@ bool BufferCache<P>::MtPrefersSparseSources() {
 template <class P>
 Binding BufferCache<P>::MtStorageBinding(GPUVAddr gpu_addr, u64 next_qword, u32 cbuf_index,
                                          bool is_written, bool native_pointer,
-                                         bool mapping_sized) const {
+                                         bool mapping_sized, bool table_pointer) const {
     return StorageBufferBindingFromDescriptor(gpu_addr, next_qword, cbuf_index, is_written,
-                                              native_pointer, mapping_sized);
+                                              native_pointer, mapping_sized, table_pointer);
 }
 
 template <class P>
@@ -151,6 +151,87 @@ void BufferCache<P>::MtApplyUploads(std::span<const MT::UploadEntry> uploads, co
             }
             first = last;
         }
+    }
+}
+
+template <class P>
+void BufferCache<P>::MtC13CaptureBank(DAddr device_addr, u32 size, u32 declared_size,
+                                      bool native_tiling) {
+    namespace Bank = MT::C13Bank;
+    const char reupload = Bank::ReuploadMode();
+    if (Bank::Mode() != '1' || reupload == '0' || !native_tiling || size == 0 ||
+        !MtHasHostBuffer(device_addr)) {
+        return;
+    }
+    if (reupload != '3' && declared_size != 0x10000) {
+        return;
+    }
+    const bool stats = Bank::StatsOn();
+    if (stats) {
+        Bank::Stats().seq_tests.fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool every_bind = reupload == '2' || reupload == '3';
+    // The committer's TickFrame epoch: at most one re-upload per frame, as on the committer.
+    const u32 epoch = VideoCommon::g_hot_page_epoch.load(std::memory_order_relaxed);
+    if (!every_bind && c13_seq_banks.Contains(device_addr, epoch)) {
+        return;
+    }
+    u64 marked = 0;
+    {
+        MT::TrackerScope tracker_scope{tracker_mutex};
+        if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+            // Not a native bank (GPU data): not taken into the set, as BindHostGraphicsUniform-
+            // Buffer does, so a later bind this frame asks again.
+            if (stats) {
+                Bank::Stats().seq_gpu_refused.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        if (!every_bind) {
+            c13_seq_banks.Insert(device_addr, epoch);
+        }
+        // The bank size is only an upper limit: stop at the end of the mapped memory.
+        u64 mapped_size = 0;
+        while (mapped_size < size &&
+               device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
+            mapped_size +=
+                Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
+        }
+        if (mapped_size == 0) {
+            return;
+        }
+        marked = (std::min<u64>)(mapped_size, size);
+        // As a guest write the sequencer heard of (MtTrapWrite): the SeqTakeUploads that follows
+        // takes the bytes into this packet; the generation bump makes the capture memos miss.
+        MT::BumpWriteGeneration(device_addr, marked, true);
+        memory_tracker.MarkRegionAsCpuModified(device_addr, marked);
+        MT::NoteGuestWrite(device_addr, marked);
+        if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
+            mt_stale_ranges.emplace_back(device_addr, marked);
+            mt_stale_pending.store(true, std::memory_order_release);
+        }
+    }
+    Bank::NoteMarked(true, device_addr, marked);
+}
+
+template <class P>
+void BufferCache<P>::MtC13ClaimCpuWrites(std::span<const std::pair<DAddr, std::size_t>> regions) {
+    if (!MT::C13Bank::ClaimOn() || regions.empty()) {
+        return;
+    }
+    boost::container::small_vector<std::pair<DAddr, u64>, 8> ranges;
+    for (const auto& [addr, size] : regions) {
+        if (addr != 0 && size != 0) {
+            ranges.emplace_back(addr, static_cast<u64>(size));
+        }
+    }
+    if (ranges.empty()) {
+        return;
+    }
+    ClaimCpuWrites(std::span<const std::pair<DAddr, u64>>(ranges.data(), ranges.size()));
+    if (MT::C13Bank::StatsOn()) {
+        MT::C13Bank::Stats().claim_calls.fetch_add(1, std::memory_order_relaxed);
+        MT::C13Bank::Stats().claim_ranges.fetch_add(ranges.size(), std::memory_order_relaxed);
     }
 }
 

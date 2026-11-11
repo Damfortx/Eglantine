@@ -11,7 +11,7 @@ Another agent is still editing these files, so line numbers will drift. **Use th
 as anchors.** The numbers given are from this snapshot. Paths are relative to `src/video_core/`.
 
 Rules carried over: never edit any `CMakeLists.txt`; new code goes in headers; keep the
-`EDEN_NX2_*` switches; commit as Daniel Medina; never push.
+`EDEN_NX2_*` switches; commit as Damfortx; never push.
 
 ---
 

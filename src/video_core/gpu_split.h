@@ -26,6 +26,9 @@
 #include "video_core/mt/lite5_list_switches.h"
 #include "video_core/mt/lite6_drain_switches.h"
 #include "video_core/mt/c10_front.h"
+#include "video_core/mt/c11_front.h"
+#include "video_core/mt/c12_front.h"
+#include "video_core/mt/c13_front.h"
 #include "video_core/mt/seq_diet.h"
 
 namespace Core {
@@ -457,8 +460,9 @@ public:
     void NoteRelease(GPUVAddr address, u32 payload, bool at_least = false) {
         if (PredictAcquires()) {
             FlushState();
-            pending_releases[address] =
-                PendingRelease{payload, write_position, at_least, C10NextNoteSeq()};
+            pending_releases[address] = PendingRelease{payload,          write_position,
+                                                       at_least,         C10NextNoteSeq(),
+                                                       ++c11_note_order, c11_channel};
         }
     }
     /// The value a release still on its way will write at `address`: one sent but not yet in
@@ -591,8 +595,11 @@ public:
         GPUVAddr address;
         u32 value;
     };
+    /// EDEN_NX2_C11_POSFWD (F1b): `front_ticks` set, a direct 16-byte payload release also lays
+    /// words 2-3 (the timestamp the sequencer writes) with that value.
     [[nodiscard]] bool KnownPendingWords(GPUVAddr address, u64 size, std::vector<KnownWord>& out,
-                                         u8* refusal = nullptr) {
+                                         u8* refusal = nullptr,
+                                         std::optional<u64> front_ticks = std::nullopt) {
         out.clear();
         if (pending_write_overflow) {
             return false;
@@ -624,7 +631,14 @@ public:
             // 1 (0, the payload's high half).
             if (overlay64 && (write.flags & WriteDirect64) != 0) {
                 if (address + size > write.begin + 8) {
-                    return refuse(2);
+                    if (!front_ticks || address + size > write.begin + 16) {
+                        return refuse(2);
+                    }
+                    out.push_back({write.begin, write.value});
+                    out.push_back({write.begin + 4, 0});
+                    out.push_back({write.begin + 8, static_cast<u32>(*front_ticks)});
+                    out.push_back({write.begin + 12, static_cast<u32>(*front_ticks >> 32)});
+                    continue;
                 }
                 out.push_back({write.begin, write.value});
                 out.push_back({write.begin + 4, 0});
@@ -637,6 +651,131 @@ public:
             out.push_back({write.begin, write.value});
         }
         return true;
+    }
+    /// EDEN_NX2_C12_POSADJ (cycle 12 W1 P1, mt/c12_front.h): KnownPendingWords with a per-byte
+    /// rule. A noted write only refuses the read when the read covers bytes OF THAT WRITE whose
+    /// value the front does not know; bytes of the read past its end are other notes' (laid in
+    /// note order) or memory's (no queued note over them: the plain no-wait read's rule, the
+    /// caller has refused writers, drain-known notes, overflow and GPU-written pages). A direct
+    /// 16-byte payload release (OVERLAY64) lays all 16 bytes: payload, 0, `front_ticks` (the
+    /// sequencer writes its own GetTicks(), later). `ts_mask` (optional): bit i = read word i
+    /// (i < 64) is such a timestamp word (C12_POSADJ_CHECK splits its mismatches). `refusal`: 1
+    /// a write without a value / not known by position / open I2M, 2 a wider write whose other
+    /// bytes the read covers.
+    [[nodiscard]] bool C12KnownPendingWords(GPUVAddr address, u64 size,
+                                            std::vector<KnownWord>& out, u8* refusal,
+                                            u64 front_ticks, u64* ts_mask = nullptr) {
+        out.clear();
+        if (ts_mask != nullptr) {
+            *ts_mask = 0;
+        }
+        if (pending_write_overflow) {
+            return false;
+        }
+        const u64 done = SettledPosition();
+        const bool overlay64 = VideoCommon::MT::Lite6Overlay64();
+        const GPUVAddr read_end = address + size;
+        const auto refuse = [&](u8 why) {
+            if (refusal != nullptr) {
+                *refusal = why;
+            }
+            return false;
+        };
+        if (open_i2m_active && address < open_i2m.end && open_i2m.begin < read_end &&
+            (open_i2m.known != WriteKnown::Position || open_i2m.position > done)) {
+            return refuse(1);
+        }
+        const auto mark_ts = [&](GPUVAddr word) {
+            if (ts_mask == nullptr || word < address || ((word - address) & 3) != 0) {
+                return;
+            }
+            const u64 index = (word - address) / 4;
+            if (index < 64 && word < read_end) {
+                *ts_mask |= u64{1} << index;
+            }
+        };
+        for (size_t i = 0; i < pending_write_count; ++i) {
+            const auto& write = pending_writes[i];
+            if (!(address < write.end && write.begin < read_end)) {
+                continue;
+            }
+            if (write.known == WriteKnown::Position && write.position <= done) {
+                continue;
+            }
+            if (!write.has_value || write.known != WriteKnown::Position) {
+                return refuse(1);
+            }
+            const bool direct = overlay64 && (write.flags & WriteDirect64) != 0 &&
+                                write.end - write.begin == 16;
+            const GPUVAddr known_end = (std::min)(write.end, write.begin + (direct ? 16 : 4));
+            // The read covers bytes of this write past its known words: their value is unknown.
+            if (known_end < write.end && known_end < read_end && address < write.end) {
+                return refuse(2);
+            }
+            out.push_back({write.begin, write.value});
+            if (direct) {
+                out.push_back({write.begin + 4, 0});
+                out.push_back({write.begin + 8, static_cast<u32>(front_ticks)});
+                out.push_back({write.begin + 12, static_cast<u32>(front_ticks >> 32)});
+                mark_ts(write.begin + 8);
+                mark_ts(write.begin + 12);
+            }
+        }
+        return true;
+    }
+    /// P1 stats: for a read the cycle 11 rule refuses as "past known", who writes the bytes past
+    /// the end of the first queued write it reaches beyond (cls 0: none such; 1 a queued note,
+    /// 2 a note the back already ran, 3 no note: guest memory as it is).
+    struct C12PastCensus {
+        u8 cls;
+        u8 tag;
+        bool direct;
+        bool same_channel;
+        bool adjacent; ///< The covering note starts where the first write ends
+    };
+    [[nodiscard]] C12PastCensus C12CensusPast(GPUVAddr address, u64 size) const {
+        const u64 done = SettledPosition();
+        const GPUVAddr read_end = address + size;
+        const auto queued = [done](const PendingWrite& write) {
+            return write.known != WriteKnown::Position || write.position > done;
+        };
+        size_t first = pending_write_count;
+        for (size_t i = 0; i < pending_write_count; ++i) {
+            const auto& write = pending_writes[i];
+            if (address < write.end && write.begin < read_end && queued(write) &&
+                read_end > write.end) {
+                first = i;
+                break;
+            }
+        }
+        if (first == pending_write_count) {
+            return C12PastCensus{0, 0, false, false, false};
+        }
+        const PendingWrite& head = pending_writes[first];
+        const GPUVAddr past = head.end;
+        for (size_t i = pending_write_count; i-- > 0;) {
+            if (i == first) {
+                continue;
+            }
+            const auto& write = pending_writes[i];
+            if (past < write.end && write.begin < read_end) {
+                return C12PastCensus{static_cast<u8>(queued(write) ? 1 : 2), write.tag,
+                                     (write.flags & WriteDirect64) != 0,
+                                     write.channel == head.channel, write.begin == past};
+            }
+        }
+        if (open_i2m_active && past < open_i2m.end && open_i2m.begin < read_end) {
+            return C12PastCensus{1, open_i2m.tag, false, false, open_i2m.begin == past};
+        }
+        return C12PastCensus{3, 0, false, false, false};
+    }
+    /// P3 census (kepler_compute.cpp QMD mirror): a dispatch of the current call runs `program`.
+    void C12NoteDispatchProgram(u64 program) {
+        c12_call_program = program;
+    }
+    /// P3 census: the program of the last writer call (0: not compute, or not mirrored).
+    [[nodiscard]] u64 C12LastWriterProgram() const {
+        return c12_writer_program;
     }
     /// EDEN_NX2_MT_LITE_PENDACQ (D5/D6): whether every write the front noted as still queued over
     /// the word at `address` has a known value there and `meets` none of them: no table overflow,
@@ -739,7 +878,8 @@ public:
             FlushState();
             auto& adds = pending_adds[address];
             if (adds.size() < 4096) {
-                adds.push_back({write_position, payload, C10NextNoteSeq()});
+                adds.push_back(
+                    {write_position, payload, C10NextNoteSeq(), ++c11_note_order, c11_channel});
             }
         }
     }
@@ -813,6 +953,17 @@ public:
         if (kind != 1) {
             c10_range_writer_position = write_position;
         }
+        // Cycle 12 P3 census: the program of this call's last dispatch (0: none mirrored).
+        c12_writer_program = kind == 1 ? c12_call_program : 0;
+        c12_call_program = 0;
+        // Cycle 13 W3 (mt/c13_front.h): census bookkeeping and the L2 early kick.
+        if (kind == 1 && VideoCommon::MT::C13FrontTrack()) {
+            C13NoteComputeWriter();
+        }
+        // EDEN_NX2_C11_LISTRANGE (F2): what the front learnt of this call's compute writes.
+        if (VideoCommon::MT::C11ListRange()) {
+            C11FinishWriterCall(kind);
+        }
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
@@ -832,6 +983,7 @@ public:
         bool waited;    ///< It found the back behind
         bool shortened; ///< The committer was not waited for up to every writer
         bool c10_shortened{}; ///< EDEN_NX2_C10_LIST_PRECISE: not up to L24's bound either
+        bool c11_shortened{}; ///< EDEN_NX2_C11_LISTRANGE: the sequencer not up to every writer
     };
     /// EDEN_NX2_MT_LITE_LISTPOS (L24): WaitForWriters before a command list on GPU-written pages,
     /// with the multithreaded back: the sequencer past every writer sent (it marks the pages they
@@ -851,9 +1003,12 @@ public:
     /// one over the list's bytes that is not known by position (QMD releases, drain-known) keeps
     /// L24's bound. Invariant: noted writes are only dropped by drains that settled every
     /// committer guest write queued before them (C10NotedWritesBound also covers a bulk-only one).
+    ///
+    /// EDEN_NX2_C11_LISTRANGE (F2, `list_as`: the list's address space id): the sequencer part
+    /// waits only for the writers C11ListSeqTarget keeps (with B2's noted bound).
     template <typename Bound>
     ListWait WaitForListWriters(const Bound& page_bound, GPUVAddr list_address = 0,
-                                u64 list_size = 0) {
+                                u64 list_size = 0, u64 list_as = ~u64{0}) {
         ReleaseFrontHold(HoldWait); // W1 GPUPARAM v2 front hold
         if (!MtActive()) {
             return ListWait{WaitForWriters(), false};
@@ -861,6 +1016,9 @@ public:
         FlushState();
         const u64 l24_target = std::min(last_writer_position, write_position);
         u64 target = l24_target;
+        // EDEN_NX2_C11_LISTRANGE (F2): the sequencer only past the writers that may write the
+        // list's bytes (seq_target <= target); the committer bounds below keep `target`.
+        u64 seq_target = l24_target;
         // B2: front-only state, read before the wait (no note is made or dropped meanwhile).
         const bool precise = list_size != 0 && VideoCommon::MT::C10ListPrecise();
         std::optional<u64> noted;
@@ -873,6 +1031,23 @@ public:
                 // A noted write over the list's bytes sent after the last writer (a 3D inline
                 // upload: not a NoteWriter writer) is waited for too.
                 target = std::max(target, std::min(*noted, write_position));
+                seq_target = target;
+                // Cycle 12 P2 (EDEN_NX2_C12_LISTRANGE): the gate may have turned F2 off.
+                if (VideoCommon::MT::C11ListRange() &&
+                    VideoCommon::MT::C12ListRangeGate::Get().Use()) {
+                    auto& c11 = VideoCommon::MT::C11FrontStats::Get();
+                    ++c11.list_calls;
+                    const u64 ranged = std::max(
+                        C11ListSeqTarget(list_as, list_address, list_size),
+                        std::min(*noted, write_position));
+                    if (ranged < seq_target) {
+                        seq_target = ranged;
+                        ++c11.list_shorter;
+                    } else {
+                        ++c11.list_same;
+                    }
+                    VideoCommon::MT::C12ListRangeGate::Get().NoteCall(ranged < target);
+                }
             }
         }
         // Read once `consumed` reached the target: the sequencer stores the committer write
@@ -891,35 +1066,141 @@ public:
                 std::max({page_bound(),
                           committer_bulk_write_position.load(std::memory_order_acquire), *noted}));
         };
+        // F2: the sequencer was not waited for up to `target` (re-read below once it is past
+        // seq_target: a writer F2 skipped may have been captured since and raise page_bound).
+        const bool c11 = seq_target < target;
         consumed_cache = consumed.load(std::memory_order_acquire);
-        if (consumed_cache >= target) {
+        c13_seq_ns = 0;
+        c13_settle_ns = 0;
+        if (consumed_cache >= seq_target) {
             const u64 settle = bound();
             const u64 now = settled.load(std::memory_order_acquire);
             if (now >= settle) {
                 const bool c10 = noted.has_value() && now < l24_bound();
                 c10_stats.list_nowait += c10 ? 1 : 0;
                 CountWait(DrainReason::WritersCommands, false, 0);
-                return ListWait{false, now < target, c10};
+                return ListWait{false, now < target, c10, c11 && consumed_cache < target};
             }
         }
         Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
         const u64 begin = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
-        if (consumed_cache < target) {
-            wait_target.store(target, std::memory_order_seq_cst);
+        // Cycle 13 W3 L1 census: the sequencer and committer parts of the wait.
+        const bool c13_time = VideoCommon::MT::C13FrontStatsOn();
+        const u64 c13_begin = c13_time ? Nx2Profile::Now() : 0;
+        if (consumed_cache < seq_target) {
+            wait_target.store(seq_target, std::memory_order_seq_cst);
             Publish();
-            WaitConsumed(target);
-            wait_target.store(~u64{0}, std::memory_order_relaxed);
+            WaitConsumed(seq_target);
+            C13EndWait(); // was: wait_target.store(~u64{0}); keeps a later kick pending
         }
+        const u64 c13_mid = c13_time ? Nx2Profile::Now() : 0;
         const u64 settle = bound();
         TimedWaitSettled(settle);
+        if (c13_time) {
+            c13_seq_ns = c13_mid - c13_begin;
+            c13_settle_ns = Nx2Profile::Now() - c13_mid;
+        }
         const u64 now = settled.load(std::memory_order_acquire);
         const bool shortened = now < target;
         const bool c10 = noted.has_value() && now < l24_bound();
         c10_stats.list_short += c10 ? 1 : 0;
         CountWait(DrainReason::WritersCommands, true,
                   Nx2Profile::Enabled() ? Nx2Profile::Now() - begin : 0);
-        return ListWait{true, shortened, c10};
+        return ListWait{true, shortened, c10,
+                        c11 && consumed.load(std::memory_order_acquire) < target};
     }
+
+    // ---- Cycle 13 W3 "front list writer waits" (mt/c13_front.h) ----
+    /// NoteWriter, compute writer call (front): census bookkeeping, and the L2 early kick of a
+    /// dispatch of a learned list writer program: published at once, its ring position becomes
+    /// the back's wait target (the sequencer Marks there and clears it, LITE_SEQTARGET).
+    void C13NoteComputeWriter() {
+        c13_writer_calls = c13_calls;
+        c13_writer_ns = Nx2Profile::Now();
+        c13_writer_position = last_writer_position;
+        c13_writer_kicked = false;
+        c13_writer_learned = VideoCommon::MT::C13WriterLearn::Get().IsWriter(c12_writer_program);
+        if (!c13_writer_learned || !MtActive()) {
+            return;
+        }
+        auto& stats = VideoCommon::MT::C13FrontStats::Get();
+        if (!VideoCommon::MT::C13Kick()) {
+            ++stats.kicks_off;
+            return;
+        }
+        FlushState();
+        const u64 target = write_position;
+        c13_writer_kicked = true;
+        c13_writer_kick = target;
+        c13_kick_target = target;
+        c13_kick_back.store(target, std::memory_order_relaxed);
+        // The front is not inside a wait here: the target is ~0 or an older kick's.
+        wait_target.store(target, std::memory_order_seq_cst);
+        Publish();
+        ++stats.kicks;
+    }
+    /// The front's waits, instead of clearing wait_target: a kick sent after the position just
+    /// waited for stays the back's target (the sequencer clears it once past it).
+    void C13EndWait() {
+        if (c13_kick_target != 0) [[unlikely]] {
+            if (consumed_cache < c13_kick_target) {
+                wait_target.store(c13_kick_target, std::memory_order_seq_cst);
+                ++VideoCommon::MT::C13FrontStats::Get().kick_restored;
+                return;
+            }
+            c13_kick_target = 0;
+        }
+        wait_target.store(~u64{0}, std::memory_order_relaxed);
+    }
+    /// DmaPusher census: the last compute writer and what was sent since.
+    [[nodiscard]] bool C13WriterLearned() const {
+        return c13_writer_learned;
+    }
+    [[nodiscard]] bool C13WriterKicked() const {
+        return c13_writer_kicked;
+    }
+    [[nodiscard]] u64 C13WriterKickTarget() const {
+        return c13_writer_kicked ? c13_writer_kick : 0;
+    }
+    [[nodiscard]] u64 C13CallsSinceWriter() const {
+        return c13_calls - c13_writer_calls;
+    }
+    [[nodiscard]] u64 C13NsSinceWriter() const {
+        const u64 now = Nx2Profile::Now();
+        return now > c13_writer_ns ? now - c13_writer_ns : 0;
+    }
+    [[nodiscard]] u64 C13WordsSinceWriter() {
+        FlushState();
+        return write_position - std::min(c13_writer_position, write_position);
+    }
+    [[nodiscard]] u64 C13LastSeqNs() const {
+        return c13_seq_ns;
+    }
+    [[nodiscard]] u64 C13LastSettleNs() const {
+        return c13_settle_ns;
+    }
+    /// Sequencer thread (hook in vk_mt_seq.h): the entry it runs is before a pending kick.
+    [[nodiscard]] bool C13SeqBeforeKick() const {
+        if (!VideoCommon::MT::C13KickSeq()) {
+            return false;
+        }
+        const u64 kick = c13_kick_back.load(std::memory_order_relaxed);
+        return kick != 0 && back_exec_position < kick;
+    }
+    /// Committer thread (hook in vk_mt_pipeline.h): a Mark at `position` is the first one at or
+    /// past the pending kick (clears it).
+    [[nodiscard]] bool C13KickMark(u64 position) {
+        u64 kick = c13_kick_back.load(std::memory_order_relaxed);
+        if (kick == 0 || position < kick) {
+            return false;
+        }
+        if (!c13_kick_back.compare_exchange_strong(kick, 0, std::memory_order_relaxed)) {
+            return false;
+        }
+        VideoCommon::MT::g_c13_kick_marks.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    // ---- end cycle 13 W3 ----
 
     // ---- Cycle 10 B1 (EDEN_NX2_C10_ACQ_SEQ, mt/c10_front.h) ----
     /// Front counters for the drains line (EDEN_NX2_GPU_PROFILE).
@@ -952,6 +1233,106 @@ public:
     /// wait. Clears no note. Returns whether the back was behind.
     bool C10WaitAcquireTarget(u64 target);
     // ---- end cycle 10 B1 ----
+
+    // ---- Cycle 11 W1 "front forwarding" (mt/c11_front.h), front thread only ----
+    /// DmaPusher::DispatchCalls: the channel whose commands the front runs now (the release and
+    /// add notes carry it; F1 refuses words another channel's queued releases target).
+    void C11SetChannel(s32 channel) {
+        c11_channel = channel;
+    }
+    [[nodiscard]] s32 C11Channel() const {
+        return c11_channel;
+    }
+    /// F1 (EDEN_NX2_C11_ACQFWD): what the word at `address` holds once the back ran everything
+    /// sent so far, as far as the front noted it: the last release noted for it plus the QMD
+    /// add releases noted after that release. Refused when an un-noted or valueless writer may
+    /// change it (C11FrontStats::Refusal).
+    struct C11AcqPrediction {
+        u32 refusal; ///< VideoCommon::MT::C11FrontStats::Refusal; RefNone: `lower` holds
+        u64 lower;   ///< The word holds at least this (release payload + adds after it)
+        bool exact;  ///< ... exactly this (plain release, unsettled, no add queued before it)
+    };
+    [[nodiscard]] C11AcqPrediction C11PredictAcquire(GPUVAddr address);
+
+    /// F1b (EDEN_NX2_C11_POSFWD stats): the noted write that makes KnownPendingWords refuse a
+    /// read of [address, address + size) as "past known words" (found: false, none).
+    struct C11PastKnown {
+        bool found;
+        GPUVAddr begin;
+        u64 size;
+        bool direct;
+    };
+    [[nodiscard]] C11PastKnown C11FindPastKnown(GPUVAddr address, u64 size);
+
+    /// F2 (EDEN_NX2_C11_LISTRANGE). DmaPusher, at the start of each method call: forget what an
+    /// earlier call that was no writer described.
+    void C11BeginCall() {
+        ++c13_calls; // Cycle 13 W3 census: method calls between a writer and its list fetch
+        if (c11_call_dirty) [[unlikely]] {
+            c11_call = {};
+            c11_call_dirty = false;
+        }
+    }
+    /// The QMD mirror handled a launch method of this call: its dispatches are described below.
+    void C11NoteComputeDescribed() {
+        c11_call.described = true;
+        c11_call_dirty = true;
+    }
+    /// A dispatch of this call writes [begin, end) of address space `as` (GPU addresses).
+    void C11NoteComputeRange(u64 as, GPUVAddr begin, GPUVAddr end) {
+        c11_call_dirty = true;
+        if (c11_call.count == c11_call.ranges.size()) {
+            c11_call.unknown = true;
+            return;
+        }
+        c11_call.ranges[c11_call.count++] = C11Range{as, begin, end};
+    }
+    /// A write of this call the front cannot range (a dispatch of an unknown program, a compute
+    /// method that writes memory and is no QMD launch, a mirror error...).
+    void C11NoteComputeUnknown() {
+        c11_call.unknown = true;
+        c11_call_dirty = true;
+    }
+    /// A 3D constant buffer data write (CB_DATA) into [begin, begin + size) of address space
+    /// `as` was just sent (or gathered). `multi`: from the multi-method path (its hook ran).
+    void C11NoteCbData(u64 as, GPUVAddr begin, u64 size, bool multi) {
+        if (!VideoCommon::MT::C11ListRange()) {
+            return;
+        }
+        c11_cb_hooked |= multi;
+        const u64 position = C11PositionNow();
+        if (c11_cb_count != 0) {
+            C11CbWrite& last = c11_cb[(c11_cb_count - 1) % c11_cb.size()];
+            if (last.as == as && last.begin == begin && last.end == begin + size) {
+                last.position = position;
+                return;
+            }
+        }
+        if (c11_cb_count >= c11_cb.size()) {
+            const C11CbWrite& dropped = c11_cb[c11_cb_count % c11_cb.size()];
+            c11_cb_unranged_position = std::max(c11_cb_unranged_position, dropped.position);
+        }
+        c11_cb[c11_cb_count % c11_cb.size()] = C11CbWrite{as, begin, begin + size, position};
+        ++c11_cb_count;
+    }
+    /// A 3D constant buffer data run whose buffer the front did not see (the multi-method path
+    /// without its hook): every constant buffer read counts as stale until the back ran it.
+    void C11NoteCbUnranged() {
+        c11_cb_unranged_position = std::max(c11_cb_unranged_position, C11PositionNow());
+    }
+    [[nodiscard]] bool C11CbHooked() const {
+        return c11_cb_hooked;
+    }
+    /// Whether memory may not yet hold what the back will read at [begin, begin + size) (a
+    /// dispatch's constant buffer words): a queued 3D CB_DATA write, noted write, copy/I2M/2D
+    /// writer, compute writer that may write it, not yet run.
+    [[nodiscard]] bool C11CbufStale(u64 as, GPUVAddr begin, u64 size);
+    /// F2: the ring position the sequencer must pass before a list at [address, address + size)
+    /// of address space `as` holds what the writers sent so far leave there: the copy/I2M/2D
+    /// writers, the compute writers the front could not describe and the described ones whose
+    /// ranges overlap (or are in another address space). Call after FlushState.
+    [[nodiscard]] u64 C11ListSeqTarget(u64 as, GPUVAddr address, u64 size);
+    // ---- end cycle 11 W1 ----
 
 private:
     /// EDEN_NX2_GPU_PROFILE: counts a front wait (`waited`: it found the back behind) and logs
@@ -1031,6 +1412,74 @@ private:
     /// committer writes (EDEN_NX2_MT_LITE_WRITERS reasons; none today, kept for safety).
     u64 c10_bulk_clear_position{};
 
+    // ---- Cycle 12 W1 (mt/c12_front.h), front thread only ----
+    u64 c12_call_program{};   ///< P3: program of the current call's last mirrored dispatch
+    u64 c12_writer_program{}; ///< P3: ... of the last writer call (0: not compute / unknown)
+
+    // ---- Cycle 13 W3 (mt/c13_front.h), front thread only unless noted ----
+    u64 c13_calls{};          ///< DmaPusher method calls (C11BeginCall)
+    u64 c13_writer_calls{};   ///< c13_calls at the last compute writer
+    u64 c13_writer_ns{};      ///< Nx2Profile::Now() at the last compute writer
+    u64 c13_writer_position{};///< write_position at the last compute writer
+    bool c13_writer_learned{};///< Its program was a learned list writer
+    bool c13_writer_kicked{}; ///< ... and it was kicked
+    u64 c13_writer_kick{};    ///< ... at this ring position (everything sent with it)
+    u64 c13_kick_target{};    ///< Pending kick (0: none): the wait target the front set
+    u64 c13_seq_ns{};         ///< Last WaitForListWriters: WaitConsumed part
+    u64 c13_settle_ns{};      ///< ... TimedWaitSettled part
+    /// Last kick target for the back hooks (sequencer reads, committer clears; 0: none).
+    std::atomic<u64> c13_kick_back{};
+
+    // ---- Cycle 11 W1 (mt/c11_front.h), front thread only ----
+    s32 c11_channel{-1};
+    u64 c11_note_order{};
+    /// A ring position not known yet (the entry is still gathered: FlushMacroList resolves it).
+    static constexpr u64 C11Unresolved = ~u64{0};
+    [[nodiscard]] u64 C11PositionNow() {
+        if (list_count == 0 && state_count == 0) {
+            return write_position;
+        }
+        c11_unresolved = true;
+        return C11Unresolved;
+    }
+    /// FlushMacroList / FlushStateSlow: gathered entries went out; positions noted meanwhile
+    /// become the position after them.
+    void C11ResolvePositions();
+    void C11FinishWriterCall(u8 kind);
+    bool c11_unresolved{};
+    struct C11Range {
+        u64 as;
+        GPUVAddr begin;
+        GPUVAddr end;
+    };
+    struct C11Call {
+        bool described{};
+        bool unknown{};
+        u32 count{};
+        std::array<C11Range, 8> ranges{};
+    };
+    C11Call c11_call{};
+    bool c11_call_dirty{};
+    struct C11Writer {
+        u64 position;
+        u32 count;
+        std::array<C11Range, 8> ranges;
+    };
+    std::array<C11Writer, 256> c11_writers{};
+    u64 c11_writer_count{};
+    /// Newest position of a compute writer whose writes the front could not range.
+    u64 c11_unknown_compute_position{};
+    struct C11CbWrite {
+        u64 as;
+        GPUVAddr begin;
+        GPUVAddr end;
+        u64 position;
+    };
+    std::array<C11CbWrite, 64> c11_cb{};
+    u64 c11_cb_count{};
+    u64 c11_cb_unranged_position{};
+    bool c11_cb_hooked{};
+
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
@@ -1109,6 +1558,7 @@ private:
         bool has_value; ///< A 4-byte write whose value the front knows (a fence release).
         u8 flags;       ///< WriteDirect64
         u64 seq;        ///< EDEN_NX2_C10_ACQ_SEQ: note sequence number (0: known by position)
+        s32 channel{-1}; ///< Cycle 12 P1 stats: the channel noting it (PushPendingWrite sets it)
     };
     std::array<PendingWrite, 256> pending_writes{};
     size_t pending_write_count{};
@@ -1133,7 +1583,9 @@ private:
                 return;
             }
         }
-        pending_writes[pending_write_count++] = write;
+        pending_writes[pending_write_count] = write;
+        pending_writes[pending_write_count].channel = c11_channel; // C12 P1 census
+        ++pending_write_count;
     }
     /// D4, at a drain (everything sent has run): an open note known only by drains becomes known
     /// by position (the data words sent from now on move it).
@@ -1165,12 +1617,16 @@ private:
         u64 position;
         bool at_least;
         u64 seq; ///< EDEN_NX2_C10_ACQ_SEQ (C10NextNoteSeq; 0: switch off)
+        u64 order;   ///< EDEN_NX2_C11_ACQFWD: note order among releases and adds
+        s32 channel; ///< EDEN_NX2_C11_ACQFWD: the channel whose commands noted it (-1: unknown)
     };
     std::unordered_map<GPUVAddr, PendingRelease> pending_releases;
     struct PendingAdd {
         u64 position;
         u32 payload;
         u64 seq; ///< EDEN_NX2_C10_ACQ_SEQ (C10NextNoteSeq; 0: switch off)
+        u64 order;   ///< EDEN_NX2_C11_ACQFWD (as PendingRelease::order)
+        s32 channel; ///< EDEN_NX2_C11_ACQFWD
     };
     std::unordered_map<GPUVAddr, std::deque<PendingAdd>> pending_adds;
     u64 predicted_acquires{};

@@ -166,6 +166,11 @@ public:
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
     size_t MaxContinuousRangeWalk(GPUVAddr gpu_addr, size_t size) const;
 
+    /// Bumped after each page table change: lookups cached under one value stay valid until then.
+    [[nodiscard]] u64 MapSerial() const {
+        return map_serial.load(std::memory_order_acquire);
+    }
+
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
     }
@@ -189,6 +194,7 @@ public:
 private:
     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
+
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
@@ -264,6 +270,8 @@ private:
     /// Bumped at the start and the end of every page table change: MaxContinuousRange and
     /// GetMemoryLayoutSize results computed under one value stay valid while it holds.
     std::atomic<u64> layout_generation{1};
+    /// Bumped after each page table change; MaxContinuousRange answers are kept until then.
+    std::atomic<u64> map_serial{};
 
     static constexpr size_t continuous_bits = 64;
 

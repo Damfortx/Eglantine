@@ -53,7 +53,7 @@ also without the MT back (plain split, MT unset), where every piece is off by de
 | L17 | EDEN_NX2_MT_LITE_DMAKNOWN | EDEN_NX2_DMA_READ_KNOWN defaults on | maxwell_3d.cpp |
 | L18 | EDEN_NX2_MT_LITE_EXECNODRAIN | EDEN_NX2_SEM_EXECUTE_NODRAIN defaults on | puller.cpp |
 
-## What to measure (BIN=/home/appo/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
+## What to measure (BIN=$HOME/src/Eglantine-mtB/build/pgo/bin/eden-cli, from tools/)
 1. fps: `env NOPROF=1 EDEN_NX2_VSYNC_HZ=240 EDEN_NX2_MT=1 EDEN_NX2_MT_LITE=1 ./demo.sh $BIN 120 lite3-fps`
    vs MT unset (`lite3-off`), alternating, >= 3 each. Target: MT lite > MT unset.
 2. Front-only pieces on the baseline (optional, tells what is MT-specific): MT unset +

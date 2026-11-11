@@ -21,6 +21,11 @@ struct EngineOverrides {
     };
     std::array<Pair, Max> pairs{};
     size_t count = 0;
+    /// EDEN_NX2_C11_CHANCMD (mt/c11_serial.h): the committer's current channel's mirror. While
+    /// set (and `count` != 0, so a Serial that clears `count` runs against the real engines), any
+    /// non-null pointer resolves to it: the sequencer switches the rasterizer's stored pointers
+    /// at a channel bind before the committer reaches it, so they may name the next channel.
+    T* pinned = nullptr;
 };
 
 template <class T>
@@ -44,6 +49,9 @@ public:
     [[nodiscard]] T* Get() const noexcept {
         const EngineOverrides<T>& overrides = g_engine_overrides<T>;
         if (overrides.count != 0) [[unlikely]] {
+            if (overrides.pinned != nullptr && ptr != nullptr) {
+                return overrides.pinned;
+            }
             for (size_t i = 0; i < overrides.count; ++i) {
                 if (overrides.pairs[i].real == ptr) {
                     return overrides.pairs[i].mirror;
@@ -80,6 +88,12 @@ public:
 private:
     T* ptr = nullptr;
 };
+
+/// EDEN_NX2_C11_CHANCMD: pins this thread's view of every engine of type T (null: unpinned).
+template <class T>
+inline void PinEngineView(T* mirror) noexcept {
+    g_engine_overrides<T>.pinned = mirror;
+}
 
 /// While alive, ThreadEnginePtr<T>s pointing at `real` resolve to `mirror` on this thread.
 template <class T>

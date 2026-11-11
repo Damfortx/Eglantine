@@ -9,7 +9,7 @@
 #
 # Output (binary + log) goes to $OUT (default /tmp/claude-1000/mt-selftest). Exit status is
 # non-zero when a test fails or the sanitizer reported anything. In the build image:
-#   docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v /home/appo/src:/home/appo/src -w /home/appo/src/Eglantine-mt \
+#   docker run --rm --security-opt seccomp=unconfined -u 1000:1000 -v $HOME/src:$HOME/src -w $HOME/src/Eglantine-mt \
 #       eglantine-build:pgo bash src/video_core/mt/selftest_standalone.sh all
 set -uo pipefail
 

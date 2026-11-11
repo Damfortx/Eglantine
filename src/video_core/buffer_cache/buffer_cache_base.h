@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -18,14 +19,14 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-#include "common/container/unordered_map.h"
-#include <boost/container/static_vector.hpp>
 #include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
+#include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
-#include "common/spin_recursive_mutex.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
@@ -34,16 +35,18 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/nx2.h"
+#include "common/spin_recursive_mutex.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/dirty_flags.h"
-#include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/mt/capture.h"
+#include "video_core/mt/c12_commit.h"
+#include "video_core/mt/c13_bank.h"
 #include "video_core/mt/lite2_tracker_switches.h"
 #include "video_core/mt/lite_switches.h"
 #include "video_core/mt/resolve_packet.h"
@@ -71,6 +74,8 @@ constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
 // Native compute shaders bind up to 18 global memory ranges; the enable masks are 32 bits wide.
 constexpr u32 NUM_STORAGE_BUFFERS = 32;
+// Compute programs can take pointer table entries beyond 32 bindings (Shader::Info::MAX_SSBOS).
+constexpr u32 NUM_COMPUTE_STORAGE_BUFFERS = 64;
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
 
@@ -120,6 +125,26 @@ static constexpr Binding NULL_BINDING{
     .buffer_id = NULL_BUFFER_ID,
 };
 
+/// EDEN_NX2_C12_COMMIT_REPEAT, buffer half (cycle 12 W2, video_core/mt/c12_commit.h): a graphics
+/// pipeline's last resolved uniform and storage bindings (in enabled-bit order, stage by stage).
+/// The ids are FindBuffer's (and ResolveStorageBinding's single-range) results for these
+/// (device address, size): while no buffer was created or deleted (deletion epoch, c12 buffer
+/// epoch) and the page table layout holds, the same inputs resolve to the same ids. Kept by the
+/// pipeline, used by BufferCache::C12UpdateGraphicsBuffers only (the committer).
+struct C12GraphicsBufferMemo {
+    bool valid{};
+    const void* channel{};
+    const void* gpu_memory{};
+    u64 generation{};     ///< odd page table layout generation of the save
+    u64 deletion_epoch{}; ///< buffer_deletion_epoch after the save's resolution
+    u64 c12_epoch{};      ///< c12_buffer_epoch after the save's resolution
+    std::array<u32, NUM_STAGES> uniform_masks{};
+    std::array<u32, NUM_STAGES> storage_masks{};
+    std::array<u32, NUM_STAGES> written_storage{};
+    boost::container::small_vector<Binding, 24> uniforms;
+    boost::container::small_vector<Binding, 8> storage;
+};
+
 template <typename Buffer>
 struct HostBindings {
     boost::container::static_vector<Buffer*, NUM_VERTEX_BUFFERS> buffers;
@@ -147,7 +172,7 @@ public:
     Binding indirect_buffer_binding;
 
     std::array<Binding, NUM_COMPUTE_UNIFORM_BUFFERS> compute_uniform_buffers;
-    std::array<Binding, NUM_STORAGE_BUFFERS> compute_storage_buffers;
+    std::array<Binding, NUM_COMPUTE_STORAGE_BUFFERS> compute_storage_buffers;
     std::array<TextureBufferBinding, NUM_TEXTURE_BUFFERS> compute_texture_buffers;
 
     std::array<u32, NUM_STAGES> enabled_uniform_buffer_masks{};
@@ -158,8 +183,8 @@ public:
 
     std::array<u32, NUM_STAGES> enabled_storage_buffers{};
     std::array<u32, NUM_STAGES> written_storage_buffers{};
-    u32 enabled_compute_storage_buffers = 0;
-    u32 written_compute_storage_buffers = 0;
+    u64 enabled_compute_storage_buffers = 0;
+    u64 written_compute_storage_buffers = 0;
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -264,7 +289,8 @@ public:
     [[nodiscard]] bool MtPrefersSparseSources();
     [[nodiscard]] Binding MtStorageBinding(GPUVAddr gpu_addr, u64 next_qword, u32 cbuf_index,
                                            bool is_written, bool native_pointer = false,
-                                           bool mapping_sized = false) const;
+                                           bool mapping_sized = false,
+                                           bool table_pointer = false) const;
     /// Takes the CPU-modified parts of the range out of the tracker (SynchronizeBuffer's walk):
     /// emit(device_addr, size) for each, whose bytes the caller copies now.
     template <typename Func>
@@ -273,6 +299,14 @@ public:
     void MtCaptureWrittenRange(DAddr device_addr, u32 size);
     /// Committer: copies captured bytes into the buffers that hold their ranges.
     void MtApplyUploads(std::span<const MT::UploadEntry> uploads, const u8* blob);
+    /// C13 W2 (EDEN_NX2_C13_BANK=1, sequencer): the native uniform bank re-upload, once per
+    /// frame, as a guest write marked before the bound range's uploads are taken (call right
+    /// before SeqTakeUploads of a non-streamed uniform). `declared_size` is the shader's size for
+    /// the slot (the 64 KiB test), `native_tiling` the channel's MemoryManager::UsesNativeTiling.
+    void MtC13CaptureBank(DAddr device_addr, u32 size, u32 declared_size, bool native_tiling);
+    /// C13 W2 B2 (EDEN_NX2_C13_CLAIM=1): ClaimCpuWrites for the MT sequencer's invalidations.
+    /// The caller holds `mutex` (as for the WriteMemory calls that follow).
+    void MtC13ClaimCpuWrites(std::span<const std::pair<DAddr, std::size_t>> regions);
     /// Defer slot erasure through `manager` (nullptr detaches). Only while no other thread uses
     /// the cache.
     void MtSetEpochManager(MT::EpochManager* manager) {
@@ -396,6 +430,12 @@ public:
 
     void UpdateGraphicsBuffers(bool is_indexed);
 
+    /// EDEN_NX2_C12_COMMIT_REPEAT (buffer half): UpdateGraphicsBuffers for a graphics pipeline
+    /// that keeps `memo`: takes the memo's uniform/storage buffer ids when every binding and key
+    /// matches (index and vertex buffers still update), else the full path and saves the memo.
+    /// Leaves the buffers updated either way. Committer only, under the buffer cache mutex.
+    void C12UpdateGraphicsBuffers(C12GraphicsBufferMemo& memo, bool is_indexed);
+
     void UpdateComputeBuffers();
 
     void BindHostGeometryBuffers(bool is_indexed);
@@ -412,7 +452,7 @@ public:
     void UnbindGraphicsStorageBuffers(size_t stage);
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written);
+                                   bool is_written, u32 indirect_offset = ~0U);
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -422,7 +462,7 @@ public:
     void UnbindComputeStorageBuffers();
 
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written);
+                                  bool is_written, u32 indirect_offset = ~0U);
 
     void UnbindComputeTextureBuffers();
 
@@ -437,6 +477,18 @@ public:
                                                           ObtainBufferSynchronize sync_info,
                                                           ObtainBufferOperation post_op);
     void FlushCachedWrites();
+
+    /// Where the CPU writes into GPU-written memory that were collected but not applied yet
+    /// (WriteMemory) come from: downloads must not write the GPU's older copy over them.
+    using PendingCpuWrites = std::function<void(const std::function<void(DAddr, size_t)>&)>;
+    void SetPendingCpuWrites(PendingCpuWrites source) {
+        pending_cpu_writes = std::move(source);
+    }
+
+    /// Takes CPU writes about to be applied one by one out of the GPU-written ranges first, so
+    /// applying one doesn't download the GPU's copy over another (WriteMemory keeps the GPU data
+    /// on the pages it writes).
+    void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges);
 
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
@@ -511,6 +563,59 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
+    /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
+    /// host buffer holding each range, if one does, for the frame dump. Nothing is created or
+    /// synchronized. Stage 5 is compute.
+    template <typename Func>
+    void ForEachBoundBuffer(bool compute, Func&& func) {
+        const auto visit = [&](u32 stage, bool storage, u32 index, bool written,
+                               const Binding& binding, u32 size) {
+            if (binding.device_addr == 0 || size == 0) {
+                return;
+            }
+            const Buffer* host = nullptr;
+            u32 offset = 0;
+            const u64 page = binding.device_addr >> CACHING_PAGEBITS;
+            if (const BufferId id = page < page_table.size() ? page_table[page] : BufferId{}) {
+                const Buffer& buffer = slot_buffers[id];
+                if (buffer.IsInBounds(binding.device_addr, size)) {
+                    host = &buffer;
+                    offset = buffer.Offset(binding.device_addr);
+                }
+            }
+            func(stage, storage, index, written, binding, size, host, offset);
+        };
+        if (compute) {
+            const auto* const sizes = channel_state->compute_uniform_buffer_sizes;
+            ForEachEnabledBit(channel_state->enabled_compute_uniform_buffer_mask, [&](u32 index) {
+                const Binding& binding = channel_state->compute_uniform_buffers[index];
+                visit(5, false, index, false, binding,
+                      sizes ? (std::min)(binding.size, (*sizes)[index]) : binding.size);
+            });
+            ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+                const Binding& binding = channel_state->compute_storage_buffers[index];
+                visit(5, true, index,
+                      ((channel_state->written_compute_storage_buffers >> index) & 1) != 0, binding,
+                      binding.size);
+            });
+            return;
+        }
+        const auto* const sizes = channel_state->uniform_buffer_sizes;
+        for (u32 stage = 0; stage < NUM_STAGES; ++stage) {
+            ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
+                const Binding& binding = channel_state->uniform_buffers[stage][index];
+                visit(stage, false, index, false, binding,
+                      sizes ? (std::min)(binding.size, (*sizes)[stage][index]) : binding.size);
+            });
+            ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+                const Binding& binding = channel_state->storage_buffers[stage][index];
+                visit(stage, true, index,
+                      ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0, binding,
+                      binding.size);
+            });
+        }
+    }
+
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
 
@@ -537,10 +642,14 @@ public:
     Common::SpinRecursiveMutex mutex{"buffer"};
     Runtime& runtime;
     bool any_buffer_uploaded = false;
+    /// Indirectly read banks of native programs already uploaded this frame.
+    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    /// C13 W2: the sequencer's own per-frame bank set (sequencer thread only).
+    MT::C13Bank::SeqFrameSet c13_seq_banks;
 
 private:
-    template <typename Func>
-    static void ForEachEnabledBit(u32 enabled_mask, Func&& func) {
+    template <typename Mask, typename Func>
+    static void ForEachEnabledBit(Mask enabled_mask, Func&& func) {
         for (u32 index = 0; enabled_mask != 0; ++index, enabled_mask >>= 1) {
             const int disabled_bits = std::countr_zero(enabled_mask);
             index += disabled_bits;
@@ -625,7 +734,8 @@ private:
 
     void UpdateComputeTextureBuffers();
 
-    void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
+    void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size,
+                           bool needs_sync = false);
 
     /// MarkWrittenBuffer's tracker half (tracker_mutex held).
     void MarkWrittenTracked(BufferId buffer_id, DAddr device_addr, u32 size);
@@ -645,8 +755,7 @@ private:
 
     void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
 
-    [[nodiscard]] BufferId CreateBuffer(DAddr device_addr, u32 wanted_size,
-                                        bool sparse_compatible);
+    [[nodiscard]] BufferId CreateBuffer(DAddr device_addr, u32 wanted_size, bool sparse_compatible);
 
     void Register(BufferId buffer_id);
 
@@ -678,13 +787,15 @@ private:
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                                bool is_written, bool native_pointer = false,
-                                               bool mapping_sized = false) const;
+                                               bool mapping_sized = false,
+                                               bool table_pointer = false) const;
 
     /// StorageBufferBinding's derivation from an already read descriptor (address, next qword).
     [[nodiscard]] Binding StorageBufferBindingFromDescriptor(GPUVAddr gpu_addr, u64 next_qword,
                                                              u32 cbuf_index, bool is_written,
                                                              bool native_pointer,
-                                                             bool mapping_sized) const;
+                                                             bool mapping_sized,
+                                                             bool table_pointer = false) const;
 
     /// Per-slot memo of a storage buffer binding and of its buffer resolution.
     struct StorageBufferMemo {
@@ -713,7 +824,8 @@ private:
     [[nodiscard]] Binding MemoStorageBufferBinding(StorageBufferMemo& memo, GPUVAddr ssbo_addr,
                                                    u32 cbuf_index, bool is_written,
                                                    bool native_pointer = false,
-                                                   bool mapping_sized = false);
+                                                   bool mapping_sized = false,
+                                                   bool table_pointer = false);
 
     /// Resolves a storage binding's buffer (FindBuffer + multi-range), reusing the memo's last
     /// single-range result when nothing it depends on changed.
@@ -743,6 +855,13 @@ private:
     void RefreshRepackedVertexBuffers();
 
     void ClearDownload(DAddr base_addr, u64 size);
+
+    /// CPU writes collected but not yet applied (SetPendingCpuWrites).
+    [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
+
+    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+    void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
+                               const u8* data, u64 size);
 
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
@@ -867,15 +986,65 @@ private:
         }
     }
 
+    /// Whether the range holds GPU-written data that no fence downloads (not Preflushable).
+    bool HasGpuWritesNotDownloadedAtFence(DAddr device_addr, u64 size) {
+        if (AsyncBufferDownloads()) {
+            return false;
+        }
+        bool found = false;
+        memory_tracker.ForEachDownloadRange(
+            device_addr, size, false, [&](u64 start, u64 range_size) {
+                if (found) {
+                    return;
+                }
+                u64 covered = 0;
+                memory_tracker.ForEachPreflushableRange(
+                    start, range_size, [&](u64 lower, u64 length) {
+                        const u64 begin = (std::max)(lower, start);
+                        const u64 end = (std::min)(lower + length, start + range_size);
+                        covered += end > begin ? end - begin : 0;
+                    });
+                found = covered < range_size;
+            });
+        return found;
+    }
+
+    /// A GPU write: queues its Preflushable parts for download at the next fence and traps reads
+    /// of the rest. Queuing the whole range when any page of it was Preflushable copied whole
+    /// written storage buffers (up to 8 MiB) back at every fence: ~5 GB/s in title 1's forest.
+    void QueueGpuWrite(DAddr device_addr, u64 size) {
+        if (AsyncBufferDownloads()) {
+            uncommitted_gpu_modified_ranges.Add(device_addr, size);
+            return;
+        }
+        const DAddr end = device_addr + size;
+        DAddr cursor = device_addr;
+        memory_tracker.ForEachPreflushableRange(
+            device_addr, size, [&](DAddr start, u64 range_size) {
+                const DAddr lower = (std::max)(start, cursor);
+                const DAddr upper = (std::min)(start + range_size, end);
+                if (lower >= upper) {
+                    return;
+                }
+                if (lower > cursor) {
+                    ArmReadTraps(cursor, lower - cursor);
+                }
+                uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
+                cursor = upper;
+            });
+        if (cursor < end) {
+            ArmReadTraps(cursor, end - cursor);
+        }
+    }
+
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
     /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
         u64 armed_bytes = 0;
-        read_trapped_ranges.ForEachInRange(begin, end - begin, [&](DAddr lower, DAddr upper) {
-            armed_bytes += upper - lower;
-        });
+        read_trapped_ranges.ForEachInRange(
+            begin, end - begin, [&](DAddr lower, DAddr upper) { armed_bytes += upper - lower; });
         if (armed_bytes == end - begin) {
             return;
         }
@@ -895,6 +1064,7 @@ private:
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+    PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
 
     std::deque<Async_Buffer> async_buffers_death_ring;
@@ -922,8 +1092,45 @@ private:
     /// Bumped whenever a buffer slot is freed. DeleteBuffer only clears the current channel's
     /// bindings, so memos holding a BufferId (which slots reuse) require this to be unchanged.
     u64 buffer_deletion_epoch = 1;
+    /// EDEN_NX2_C12_COMMIT_REPEAT: bumped by every page_table change (ChangeRegister: each buffer
+    /// creation, each deletion) under the buffer cache mutex. The c12 memos also require the
+    /// deletion epoch. CPU writes, uploads and GPU writes (MarkWrittenBuffer) do not change what
+    /// FindBuffer returns (without accurate GPU fences, where the memos are off) and on the
+    /// committer SynchronizeBuffer is a no-op (the packet carries the bytes), so they do not bump
+    /// it: the per-stage binds that depend on them (BindHostStageBuffers) run every draw.
+    u64 c12_buffer_epoch = 1;
+    /// EDEN_NX2_C12_UBIND_MEMO, per graphics uniform slot: the last bind's translation (gpu
+    /// address -> device address under one odd layout generation of one memory manager) and the
+    /// buffer UpdateUniformBuffers resolved for (device address, size) under both epochs.
+    struct C12UniformBindMemo {
+        const void* channel = nullptr;
+        const Tegra::MemoryManager* gpu_memory = nullptr;
+        u64 generation = 0; ///< 0: no translation kept
+        GPUVAddr gpu_addr = 0;
+        DAddr device_addr = 0;
+        const void* resolved_channel = nullptr;
+        u64 resolved_deletion_epoch = 0;
+        u64 resolved_c12_epoch = 0;
+        DAddr resolved_device_addr = 0;
+        u32 resolved_size = 0;
+        BufferId resolved_buffer_id{}; ///< empty: no resolution kept
+    };
+    std::array<std::array<C12UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        c12_ubind_memo{};
+    /// EDEN_NX2_C13_MEMO_WAYS (cycle 13 W4 M3, mt/c13_memo.h): the uniform bind memo's other
+    /// ways per slot (c12_ubind_memo is way 0, the most recent), most recent first.
+    std::array<std::array<std::array<C12UniformBindMemo, MT::kC13MaxWays - 1>,
+                          NUM_GRAPHICS_UNIFORM_BUFFERS>,
+               NUM_STAGES>
+        c13_ubind_ways{};
+
+    /// C12UpdateGraphicsBuffers' pieces.
+    [[nodiscard]] bool C12SameBindings(const C12GraphicsBufferMemo& memo) const;
+    void C12ApplyBindings(const C12GraphicsBufferMemo& memo);
+    void C12SaveGraphicsBuffers(C12GraphicsBufferMemo& memo, u64 generation);
+    void C12CheckGraphicsBuffers(C12GraphicsBufferMemo& memo, bool is_indexed, u64 generation);
     std::array<std::array<StorageBufferMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES> graphics_ssbo_memo{};
-    std::array<StorageBufferMemo, NUM_STORAGE_BUFFERS> compute_ssbo_memo{};
+    std::array<StorageBufferMemo, NUM_COMPUTE_STORAGE_BUFFERS> compute_ssbo_memo{};
     /// Index buffer memo (EDEN_NX2_INDEX_MEMO): FindBuffer(device_addr, size) returned buffer_id
     /// for size <= resolved_size; while the epoch and layout hold, any smaller size from the same
     /// start resolves to the same buffer (it is still the one in page_table and covers it).
@@ -968,7 +1175,7 @@ private:
         u64 copy_tick{};   ///< GPU tick that completes the copy
         /// `writes` when the front last flushed the page: guest memory holds it while equal
         u64 synced_writes{~u64{0}};
-        u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
+        u32 copy_begin{}; ///< Bytes of the page the copy holds (a buffer can end inside it)
         u32 copy_end{};
         /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
         /// once: the front can't tell from what it sent whether such a write is still queued, so

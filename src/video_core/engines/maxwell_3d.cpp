@@ -496,6 +496,11 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
 }
 
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+    // sync-nx2: only once the split stopped (the MT back's other threads run engines too).
+    if (front_macros && !VideoCommon::GpuSplit::OnBackThread() &&
+        !VideoCommon::GpuSplit::Get().Active()) [[unlikely]] {
+        ReleaseFront();
+    }
     // It is an error to write to a register other than the current macro's ARG register before
     // it has finished execution.
     if (executing_macro != 0 && method != executing_macro + 1) {
@@ -565,6 +570,11 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
 }
 
 void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
+    // sync-nx2: only once the split stopped (the MT back's other threads run engines too).
+    if (front_macros && !VideoCommon::GpuSplit::OnBackThread() &&
+        !VideoCommon::GpuSplit::Get().Active()) [[unlikely]] {
+        ReleaseFront();
+    }
     RecordWrite(method, amount ? base_start[0] : 0, amount, methods_pending);
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
@@ -973,6 +983,19 @@ void Maxwell3D::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs, u3
                                 u32 value, bool sent) {
     const auto known = sent ? VideoCommon::GpuSplit::WriteKnown::Position
                             : VideoCommon::GpuSplit::WriteKnown::Drain;
+    // EDEN_NX2_C11_LISTRANGE (F2, mt/c11_front.h): a constant buffer data word (CB_DATA) writes
+    // the buffer at const_buffer.address when the back runs it: compute constant buffer words
+    // under it are stale on the front until then (the offset was advanced past the word).
+    if (constexpr u32 c11_cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        method - c11_cb_data < 16 && VideoCommon::MT::C11ListRange()) [[unlikely]] {
+        const GPUVAddr cb_address =
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+        const u64 cb_size = std::max<u64>(fs.regs[MAXWELL3D_REG_INDEX(const_buffer.size)],
+                                          u64{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)]});
+        split.C11NoteCbData(memory_manager.GetID(), cb_address, std::max<u64>(cb_size, 4), false);
+        return;
+    }
     if (method == MAXWELL3D_REG_INDEX(launch_dma)) [[unlikely]] {
         // An inline upload (I2M): its destination is written as the back runs the data words.
         const auto& upload = reinterpret_cast<const Upload::Registers&>(
@@ -1060,6 +1083,19 @@ void Maxwell3D::RegDedupArm() {
             regdedup_front.draw_pending = &front->draw_pending;
         }
     }
+}
+
+// With the split on, engine methods run on its back only: one here on another thread means the
+// split stopped (accuracy settings changed mid-game). Hand the macros back: the front's copy
+// goes stale from now on, and a restart copies the registers again (Front).
+void Maxwell3D::ReleaseFront() {
+    executing_macro = front->executing_macro;
+    macro_params = std::move(front->parameters);
+    std::memcpy(shadow_state.reg_array.data(), front->shadow.data(), sizeof(front->shadow));
+    shadow_state.shadow_ram_control = front->control;
+    front.reset();
+    front_macros = false;
+    LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
@@ -1386,6 +1422,18 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    // EDEN_NX2_C11_LISTRANGE (W1 F2): a constant buffer data run writes the 3D constant buffer
+    // when the back runs it (C11NoteCbData; `true` tells DmaPusher this path is hooked).
+    if (method - MAXWELL3D_REG_INDEX(const_buffer.buffer) < 16 &&
+        VideoCommon::MT::C11ListRange()) [[unlikely]] {
+        split.C11NoteCbData(
+            memory_manager.GetID(),
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+                fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)],
+            std::max<u64>({4, fs.regs[MAXWELL3D_REG_INDEX(const_buffer.size)],
+                           fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)]}),
+            true);
+    }
     if (method == MAXWELL3D_REG_INDEX(inline_data) && VideoCommon::MT::Lite6I2mPosition())
         [[unlikely]] {
         split.NoteI2mData(); // EDEN_NX2_MT_LITE_I2MPOS: upload data words just sent
@@ -1485,7 +1533,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
             if (address == 0x157 || address == 0x158) {
-                FrontDmaRead(split, fs, address, value);
+                FrontDmaRead(system, split, fs, address, value);
             }
             return true;
         };
@@ -1597,7 +1645,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 #endif
 }
 
-void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+void Maxwell3D::FrontDmaRead(Core::System& system, VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                              u32 count) {
     VideoCommon::MT::Lite6LogOnce();
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
@@ -1650,11 +1698,39 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     static std::vector<VideoCommon::GpuSplit::KnownWord> known_words;
     known_words.clear();
     u8 overlay_refusal = 0; // EDEN_NX2_MT_LITE stats: why KnownPendingWords said no
+    // EDEN_NX2_C11_POSFWD (F1b): the timestamp words of direct 16-byte payload releases, as the
+    // front's clock reads now (the sequencer writes its own, later, GetTicks()).
+    const bool c11_posfwd = VideoCommon::MT::C11PosFwd();
+    const std::optional<u64> c11_ticks =
+        c11_posfwd ? std::optional<u64>{system.GPU().GetTicks()} : std::nullopt;
+    // EDEN_NX2_C12_POSADJ (cycle 12 W1 P1, mt/c12_front.h): the per-byte rule
+    // (GpuSplit::C12KnownPendingWords), read per call ('a' alternates). It lays the timestamp
+    // words of direct releases from the front's clock, as POSFWD does.
+    const bool c12_adj = VideoCommon::MT::C12PosAdj();
+    const bool c12_check = c12_adj && VideoCommon::MT::C12PosAdjCheck();
+    const u64 c12_ticks = !c12_adj ? 0 : c11_ticks ? *c11_ticks : system.GPU().GetTicks();
+    bool c12_served = false; // P1 let the read through where the cycle 11 rule refused it
+    u64 c12_ts_mask = 0;     // read words that are timestamp words (C12_POSADJ_CHECK)
+    const auto known_pending = [&]() -> bool {
+        if (!c12_adj) {
+            return split.KnownPendingWords(source, read_bytes, known_words, &overlay_refusal,
+                                           c11_ticks);
+        }
+        const bool ok = split.C12KnownPendingWords(source, read_bytes, known_words,
+                                                   &overlay_refusal, c12_ticks, &c12_ts_mask);
+        c12_served = false;
+        if (ok) {
+            static std::vector<VideoCommon::GpuSplit::KnownWord> old_words;
+            u8 old_refusal = 0;
+            c12_served = !split.KnownPendingWords(source, read_bytes, old_words, &old_refusal,
+                                                  c11_ticks);
+        }
+        return ok;
+    };
     const bool overlay_first =
         VideoCommon::MT::LiteOverlayFirst() && !always_drain && !on_gpu_written &&
         !pending.drain && !pending.writers && pending.position != 0 &&
-        Tegra::Nx2Switch(overlay_mode, true) &&
-        split.KnownPendingWords(source, read_bytes, known_words, &overlay_refusal);
+        Tegra::Nx2Switch(overlay_mode, true) && known_pending();
     if (!overlay_first) {
         known_words.clear();
     }
@@ -1670,9 +1746,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const bool overlay = overlay_first ||
                          (!always_drain && !on_gpu_written && !pending.drain && !pending.writers &&
                           pending.position != 0 && !partial &&
-                          Tegra::Nx2Switch(overlay_mode, true) &&
-                          split.KnownPendingWords(source, read_bytes, known_words,
-                                                  &overlay_refusal));
+                          Tegra::Nx2Switch(overlay_mode, true) && known_pending());
     if (!overlay) {
         known_words.clear();
     }
@@ -1760,6 +1834,57 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
         return true;
     };
+    // EDEN_NX2_C11_POSFWD (F1b): the reads still refused as "past known words" (which macro,
+    // where in the noted write, how many bytes) and the ones the timestamp words let through.
+    if ((why || VideoCommon::MT::C11Stats()) && !on_gpu_written && !pending.drain &&
+        !pending.writers && pending.position != 0) [[unlikely]] {
+        auto& c11 = VideoCommon::MT::C11FrontStats::Get();
+        if (overlay_refusal == 2) {
+            ++c11.pos_past_known;
+            if (const auto past = split.C11FindPastKnown(source, read_bytes); past.found) {
+                const u32 offset =
+                    source >= past.begin ? static_cast<u32>(source - past.begin) : 0;
+                if (c11.pos_shapes.size() < 64) {
+                    ++c11.pos_shapes[{fs.executing_macro, offset, static_cast<u32>(read_bytes),
+                                      static_cast<u32>(past.size), past.direct}];
+                }
+            }
+        } else if (overlay && c11_posfwd) {
+            for (const auto& word : known_words) {
+                if (!(source < word.address + 4 && word.address < source + read_bytes)) {
+                    continue;
+                }
+                if (const auto past = split.C11FindPastKnown(word.address, 4);
+                    past.found && past.direct && word.address >= past.begin + 8) {
+                    ++c11.pos_extended;
+                    break;
+                }
+            }
+        }
+    }
+    // EDEN_NX2_C12_STATS (P1): what the per-byte rule did, and who writes the bytes past the
+    // release for the reads the cycle 11 rule refuses as "past known".
+    if (VideoCommon::MT::C12Stats() && !on_gpu_written && !pending.drain && !pending.writers &&
+        pending.position != 0) [[unlikely]] {
+        auto& c12 = VideoCommon::MT::C12FrontStats::Get();
+        if (c12_adj) {
+            c12.adj_reads += overlay ? 1 : 0;
+            c12.adj_served += overlay && c12_served ? 1 : 0;
+            c12.adj_refused_value += !overlay && overlay_refusal == 1 ? 1 : 0;
+            c12.adj_refused_past += !overlay && overlay_refusal == 2 ? 1 : 0;
+        }
+        const bool past_known = c12_adj ? (overlay && c12_served) ||
+                                              (!overlay && overlay_refusal == 2)
+                                        : overlay_refusal == 2;
+        if (past_known) {
+            const auto census = split.C12CensusPast(source, read_bytes);
+            const std::tuple<u8, u8, bool, bool, bool> key{census.cls, census.tag, census.direct,
+                                                           census.same_channel, census.adjacent};
+            if (census.cls != 0 && (c12.adj_past.size() < 32 || c12.adj_past.contains(key))) {
+                ++c12.adj_past[key];
+            }
+        }
+    }
     // EDEN_NX2_GPU_PROFILE / EDEN_NX2_PULLER_STATS: position waits by kind (lite 6 line).
     const bool lite6_stats = VideoCommon::MT::Lite6Stats();
     if (lite6_stats) [[unlikely]] {
@@ -1885,6 +2010,31 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         overlaid.resize(words);
         memory_manager.ReadBlockUnsafe(source, overlaid.data(), read_bytes);
         apply_known(overlaid.data(), words);
+    }
+    // EDEN_NX2_C12_POSADJ_CHECK (P1): a read only the per-byte rule let through also waits for
+    // its writes (committer included) and compares every word; the waited words are used.
+    if (c12_check && overlay && c12_served && !known_words.empty()) [[unlikely]] {
+        split.WaitForPosition(pending.position, pending.position,
+                              VideoCommon::GpuSplit::DrainReason::Position);
+        static std::vector<u32> waited_words;
+        waited_words.resize(words);
+        memory_manager.ReadBlockUnsafe(source, waited_words.data(), read_bytes);
+        auto& c12 = VideoCommon::MT::C12FrontStats::Get();
+        ++c12.check_reads;
+        bool ts_differs = false;
+        for (u32 i = 0; i < words; ++i) {
+            if (overlaid[i] == waited_words[i]) {
+                continue;
+            }
+            if (i < 64 && ((c12_ts_mask >> i) & 1) != 0) {
+                ts_differs = true;
+            } else {
+                c12.NotePayloadMismatch(source + u64{i} * sizeof(u32), i, overlaid[i],
+                                        waited_words[i]);
+            }
+        }
+        c12.check_ts_mismatch += ts_differs ? 1 : 0;
+        overlaid = waited_words;
     }
     for (u32 i = 0; i < words; ++i) {
         const u32 word = known_words.empty()

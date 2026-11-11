@@ -17,6 +17,7 @@
 #include "common/literals.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/mt/c13_vram.h"
 #include "video_core/mt/lite8_vram.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -142,6 +143,136 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+    if (VideoCommon::C13Vram::StagingTrimOn() && frame % VideoCommon::C13Vram::TrimSweepFrames == 0) {
+        C13Trim();
+    }
+    if (VideoCommon::C13Vram::CensusOn() && frame % VideoCommon::C13Vram::CensusFrames == 0) {
+        C13Census();
+    }
+}
+
+void StagingBufferPool::C13Trim() {
+    namespace C13 = VideoCommon::C13Vram;
+    const auto is_free = [this](const StagingBuffer& entry) {
+        return !entry.deferred && scheduler.IsFree(entry.tick);
+    };
+    u64 trimmed = 0;
+    u64 trimmed_bytes = 0;
+    const auto erase_marked = [&](StagingBuffers& level, auto&& pred) {
+        const size_t before = level.entries.size();
+        std::erase_if(level.entries, [&](const StagingBuffer& entry) {
+            if (!pred(entry)) {
+                return false;
+            }
+            ++trimmed;
+            trimmed_bytes += u64{1} << entry.log2_level;
+            return true;
+        });
+        if (level.entries.size() != before) {
+            level.delete_index = 0;
+            level.iterate_index = 0;
+        }
+    };
+    // Idle buffers of every pool (the batch 8 sweep keeps them 600 frames, 16 per visit).
+    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (StagingBuffers& level : *cache) {
+            erase_marked(level, [&](const StagingBuffer& entry) {
+                return frame - entry.last_frame >= C13::TrimIdleFrames && is_free(entry);
+            });
+        }
+    }
+    // The device-local pool (VRAM) outside loads: at most StagingCap(), oldest first.
+    if (!C13::g_loading.load(std::memory_order_relaxed)) {
+        u64 held = 0;
+        std::vector<StagingBuffer*> candidates;
+        for (StagingBuffers& level : device_local_cache) {
+            for (StagingBuffer& entry : level.entries) {
+                held += u64{1} << entry.log2_level;
+                if (is_free(entry)) {
+                    candidates.push_back(&entry);
+                }
+            }
+        }
+        const u64 cap = C13::StagingCap();
+        if (held > cap) {
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const StagingBuffer* a, const StagingBuffer* b) {
+                          return a->last_frame < b->last_frame;
+                      });
+            for (StagingBuffer* const entry : candidates) {
+                if (held <= cap) {
+                    break;
+                }
+                entry->c13_trim = true;
+                held -= u64{1} << entry->log2_level;
+            }
+            for (StagingBuffers& level : device_local_cache) {
+                erase_marked(level, [](const StagingBuffer& entry) { return entry.c13_trim; });
+            }
+        }
+    }
+    if (trimmed != 0) {
+        C13::g_counters.staging_trimmed.fetch_add(trimmed, std::memory_order_relaxed);
+        C13::g_counters.staging_trimmed_bytes.fetch_add(trimmed_bytes, std::memory_order_relaxed);
+    }
+}
+
+void StagingBufferPool::C13Census() {
+    namespace C13 = VideoCommon::C13Vram;
+    const VkPhysicalDeviceMemoryProperties properties =
+        device.GetPhysical().GetMemoryProperties().memoryProperties;
+    const auto in_vram = [&properties](const vk::Buffer& buffer) {
+        const u32 type = buffer.Location().memory_type;
+        if (!buffer || buffer.Location().memory == VK_NULL_HANDLE ||
+            type >= properties.memoryTypeCount) {
+            return false;
+        }
+        return (properties.memoryTypes[type].propertyFlags &
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    };
+    struct Totals {
+        u64 count{}, bytes{}, idle{}, vram{};
+    };
+    u64 deferred_count = 0;
+    const auto sum = [&](const StagingBuffersCache& cache) {
+        Totals totals{};
+        for (const StagingBuffers& level : cache) {
+            for (const StagingBuffer& entry : level.entries) {
+                const u64 bytes = u64{1} << entry.log2_level;
+                ++totals.count;
+                totals.bytes += bytes;
+                if (frame - entry.last_frame >= C13::TrimIdleFrames) {
+                    totals.idle += bytes;
+                }
+                if (in_vram(entry.buffer)) {
+                    totals.vram += bytes;
+                }
+                deferred_count += entry.deferred ? 1 : 0;
+            }
+        }
+        return totals;
+    };
+    const Totals device_totals = sum(device_local_cache);
+    const Totals upload_totals = sum(upload_cache);
+    const Totals download_totals = sum(download_cache);
+    auto& g = C13::g_staging;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    g.frame.store(frame, relaxed);
+    g.device_count.store(device_totals.count, relaxed);
+    g.device_bytes.store(device_totals.bytes, relaxed);
+    g.device_idle_bytes.store(device_totals.idle, relaxed);
+    g.device_vram_bytes.store(device_totals.vram, relaxed);
+    g.upload_count.store(upload_totals.count, relaxed);
+    g.upload_bytes.store(upload_totals.bytes, relaxed);
+    g.upload_idle_bytes.store(upload_totals.idle, relaxed);
+    g.upload_vram_bytes.store(upload_totals.vram, relaxed);
+    g.download_count.store(download_totals.count, relaxed);
+    g.download_bytes.store(download_totals.bytes, relaxed);
+    g.download_idle_bytes.store(download_totals.idle, relaxed);
+    g.download_vram_bytes.store(download_totals.vram, relaxed);
+    g.deferred.store(deferred_count, relaxed);
+    g.stream_bytes.store(stream_buffer_size, relaxed);
+    g.stream_vram.store(in_vram(stream_buffer), relaxed);
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {

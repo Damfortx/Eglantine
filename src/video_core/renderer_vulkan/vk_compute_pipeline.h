@@ -10,6 +10,10 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <span>
+#include <vector>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/thread_worker.h"
@@ -57,11 +61,31 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    [[nodiscard]] u64 ShaderHash() const noexcept {
+        return shader_hash;
+    }
+
     /// Native constant buffer pointer slots taken as storage buffers, and the ones left out
     /// because they held null when this pipeline was built (rebuilt once one is filled).
     std::vector<u64> pointer_slots;
     std::vector<u64> null_pointer_slots;
     u32 pointer_rebuilds{};
+
+    /// Storage images written by the last configured dispatch, kept while a frame dump runs.
+    [[nodiscard]] std::span<const VideoCommon::ImageViewId> WrittenImages() const noexcept {
+        return written_images;
+    }
+
+    struct SampledImage {
+        u32 tic;
+        VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
+    };
+
+    /// The textures sampled by the last configured dispatch, kept while a sampled frame dump runs.
+    [[nodiscard]] std::span<const SampledImage> SampledImages() const noexcept {
+        return sampled_images;
+    }
 
     /// Immutable after construction (the multithreaded back's sequencer reads them).
     [[nodiscard]] const Shader::Info& GetInfo() const noexcept {
@@ -82,6 +106,8 @@ private:
     Shader::Info info;
     u64 shader_hash{};
     u32 num_descriptor_entries{};
+    boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
+    std::vector<SampledImage> sampled_images;
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 

@@ -113,6 +113,10 @@ namespace Vulkan {
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
                               u64* host_bytes = nullptr) const;
 
+        /// Cycle 13 V2 (EDEN_NX2_C13_RELOC): an image in DEVICE_LOCAL memory within the budget,
+        /// or a null image (no host fallback, no pressure event).
+        vk::Image C13CreateDeviceImage(const VkImageCreateInfo &ci) const;
+
         /// EDEN_NX2_VRAM_GUARD: the buffer's memory lacks DEVICE_LOCAL (false with the guard off).
         [[nodiscard]] bool IsHostResident(const vk::Buffer& buffer) const noexcept;
 
@@ -172,6 +176,10 @@ namespace Vulkan {
                                      VkDeviceSize min_alignment, VkBuffer& handle,
                                      VmaAllocation& allocation,
                                      VmaAllocationInfo& alloc_info) const;
+
+        /// Cycle 13 V1 (EDEN_NX2_C13_OOM): records a device-full failure of `bytes` with the
+        /// device usage and budget now (mt/c13_vram.h NoteDeviceFull).
+        void C13NoteDeviceFull(u64 bytes) const;
 
         /// Cycle 10 A: counts a resource placed in host memory; true when it was.
         bool NoteHostPlacement(bool image, const VmaAllocationInfo& alloc_info) const;

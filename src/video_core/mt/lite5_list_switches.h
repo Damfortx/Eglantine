@@ -17,6 +17,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "video_core/mt/c10_front.h"
+#include "video_core/mt/c11_front.h"
 #include "video_core/mt/lite_switches.h"
 
 /// MT lite iteration 5 (docs/mt-lite-plan5.md): the front's writer waits before command lists on
@@ -163,6 +164,10 @@ struct ListStats {
     u64 c10_compared{};
     u64 c10_stale{};
     u64 c10_unverifiable{};
+    // EDEN_NX2_C11_LISTRANGE_CHECK (cycle 11 F2): fetches F2 shortened, read again after every writer.
+    u64 c11_compared{};
+    u64 c11_stale{};
+    u64 c11_unverifiable{};
     std::unordered_map<u64, u32> waited_pages;
     std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
 
@@ -242,6 +247,13 @@ struct ListStats {
                      c10_compared, c10_stale, c10_unverifiable);
         }
         c10_compared = c10_stale = c10_unverifiable = 0;
+        if (C11ListRangeCheck()) {
+            LOG_INFO(HW_GPU,
+                     "C11 list range check: {} F2-shortened fetches compared, {} stale, {} "
+                     "unverifiable",
+                     c11_compared, c11_stale, c11_unverifiable);
+        }
+        c11_compared = c11_stale = c11_unverifiable = 0;
         fetches = waited = new_pages = multi_page = 0;
         state_before = {};
         state_before_waited = {};

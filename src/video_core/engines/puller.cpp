@@ -31,6 +31,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/mt/c10_front.h"
+#include "video_core/mt/c11_front.h"
 #include "video_core/mt/lite4_switches.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -62,6 +63,7 @@ enum class PullerSite : u32 {
     PendPollLazy,    ///< EDEN_NX2_MT_LITE_PENDPOLL: resume poll with a release pending, no drain
     PendCheckMet,    ///< EDEN_NX2_MT_LITE_PENDCHECK: a D5/D6 skip the drain found met
     C10AcqSeq,       ///< EDEN_NX2_C10_ACQ_SEQ: partial wait instead of the drain (B1)
+    C11AcqFwd,       ///< EDEN_NX2_C11_ACQFWD: forwarded, no wait (F1)
     Count,
 };
 void NotePullerSite(PullerSite site, bool run = false) {
@@ -83,7 +85,7 @@ void NotePullerSite(PullerSite site, bool run = false) {
         "acquire drain", "acquire fences", "resume poll",   "sem_execute drain",
         "sem_execute fences", "sem_execute skipped", "word flush", "legacy acquire",
         "acquire nodrain", "acquire ledger", "acquire seq wait", "pendacq nodrain",
-        "pendpoll lazy", "pendacq would meet", "c10 acq seq"};
+        "pendpoll lazy", "pendacq would meet", "c10 acq seq", "c11 acq forwarded"};
     std::string line;
     for (size_t i = 0; i < names.size(); ++i) {
         if (calls[i] != 0) {
@@ -357,6 +359,86 @@ bool C10AcquireWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) 
     return true;
 }
 
+// EDEN_NX2_C11_ACQFWD (F1, mt/c11_front.h): an acquire whose satisfying release is already
+// queued in the ring before it (GpuSplit::C11PredictAcquire: the last release noted for the word
+// plus the QMD adds noted after it meet it) passes without any wait: everything after it runs
+// behind that release (sequencer -> committer -> one Vulkan queue). `op`: 1 EQ, 4 GEQ (the
+// GpuSemaphoreOperation values); masks are refused. With EDEN_NX2_C11_ACQFWD_VERIFY the back
+// checks the word at the acquire's ring position in an ordered fence callback; with
+// EDEN_NX2_C11_ACQFWD_CHECK=1 the front also drains and reads it here (unmet: false, the old
+// path goes on). Returns true when the acquire passes.
+bool C11ForwardAcquire(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 op) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || !split.PredictAcquires() || !VideoCommon::MT::C11AcqFwd() ||
+        !split.HasPendingRelease(address)) {
+        return false;
+    }
+    using Stats = VideoCommon::MT::C11FrontStats;
+    auto& stats = Stats::Get();
+    ++stats.acq_tries;
+    const auto refuse = [&stats](u32 why) {
+        ++stats.acq_refused[why];
+        return false;
+    };
+    if (op != 1 && op != 4) {
+        return refuse(Stats::RefOp);
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Tegra::Nx2IsGpuWritten(*device)) {
+        return refuse(Stats::RefGpuWritten);
+    }
+    const auto prediction = split.C11PredictAcquire(address);
+    if (prediction.refusal != Stats::RefNone) {
+        return refuse(prediction.refusal);
+    }
+    if (op == 4) {
+        if (prediction.lower < value) {
+            return refuse(prediction.exact ? Stats::RefShort : Stats::RefMaxShort);
+        }
+    } else if (!prediction.exact || prediction.lower != value) {
+        return refuse(Stats::RefEqual);
+    }
+    if (VideoCommon::MT::C11AcqFwdCheck()) [[unlikely]] {
+        // The old way: everything sent has run, then the fence callbacks (QMD releases).
+        DrainBack();
+        u32 word = ReadSemaphoreWord(dma_pusher, address);
+        const auto met = [op, value](u32 current) {
+            return op == 4 ? current >= value : current == value;
+        };
+        if (!met(word)) {
+            ReleaseFences(dma_pusher);
+            word = ReadSemaphoreWord(dma_pusher, address);
+        }
+        if (!met(word)) {
+            if (stats.check_unmet++ < 16) {
+                LOG_ERROR(HW_GPU,
+                          "C11 acquire check: {:#x} op {} wants {:#x}, predicted {:#x}{}, "
+                          "holds {:#x} after the drain",
+                          address, op, value, prediction.lower,
+                          prediction.exact ? " exactly" : " or more", word);
+            }
+            return false;
+        }
+        ++stats.check_agree;
+    }
+    if (VideoCommon::MT::C11AcqFwdVerify()) {
+        // At the acquire's position in the ring; the fence callback runs after every release
+        // callback queued before it (in order on the committer / fence thread).
+        split.Defer([rasterizer = dma_pusher.rasterizer, memory = &dma_pusher.memory_manager,
+                     address, value, op] {
+            rasterizer->SignalFence([memory, address, value, op] {
+                const u32 word = memory->Read<u32>(address);
+                const bool met = op == 4 ? word >= value : word == value;
+                VideoCommon::MT::C11AcqVerifyStats::Get().Note(met, address, value, word, op);
+            });
+        });
+    }
+    ++stats.acq_forwarded;
+    NotePullerSite(PullerSite::C11AcqFwd);
+    split.NotePredictedAcquire();
+    return true;
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -392,6 +474,12 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         LedgerMeets(dma_pusher, pending_acquire->address, pending_acquire->value)) {
         NotePullerSite(PullerSite::AcquireLedger);
         VideoCommon::GpuSplit::Get().NotePredictedAcquire();
+        return true;
+    }
+    // EDEN_NX2_C11_ACQFWD (F1): a release queued since the suspension meets it.
+    if (C11ForwardAcquire(dma_pusher, pending_acquire->address, pending_acquire->value,
+                          pending_acquire->operation)) {
+        ++VideoCommon::MT::C11FrontStats::Get().acq_resumed;
         return true;
     }
     // Title 1 polled ~13,000 times a second, ~330 of them draining a busy back, for semaphores
@@ -466,6 +554,22 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         const char* value = std::getenv("EDEN_NX2_SUSPEND_LOG_MS");
         return std::chrono::milliseconds{value != nullptr ? std::atoll(value) : 2000};
     }();
+    // With delayed fence operations (Balanced or Accurate fences, accurate GPU), a release
+    // queued after the acquire released the fences waits in the caches for the next fence. With
+    // every channel waiting none comes: release them again now and then while waiting.
+    const bool delayed = Settings::IsGPUFenceBehaviorDefault()
+                             ? Settings::IsGPULevelHigh()
+                             : Settings::IsGPUFenceBehaviorBalanced() ||
+                                   Settings::IsGPUFenceBehaviorAccurate();
+    if (const auto now = std::chrono::steady_clock::now();
+        delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
+        pending_acquire->last_fences = now;
+        ReleaseFences(dma_pusher);
+        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
+            pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
+            return true;
+        }
+    }
     if (!pending_acquire->reported &&
         std::chrono::steady_clock::now() - pending_acquire->since > report_after) {
         pending_acquire->reported = true;
@@ -621,6 +725,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             .value = regs.semaphore_sequence,
             .operation = static_cast<u32>(op),
             .since = std::chrono::steady_clock::now(),
+            .last_fences = std::chrono::steady_clock::now(),
             .reported = false,
         };
         if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
@@ -691,6 +796,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             }
             NotePullerSite(PullerSite::PendAcquire);
             suspend_without_drain(4);
+            return;
+        }
+        // EDEN_NX2_C11_ACQFWD (F1): the satisfying release is queued before it: no wait at all.
+        if (C11ForwardAcquire(dma_pusher, acquire.address, acquire.value,
+                              static_cast<u32>(op))) {
+            NoteAcquireDrain(dma_pusher, 6, static_cast<u32>(op), acquire.address, acquire.value,
+                             true);
             return;
         }
         // EDEN_NX2_MT_LITE_QMDLEDGER: a word QMD max releases target, met after the drain without
